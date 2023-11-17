@@ -1,2 +1,2 @@
 # mo_dump
-Generate SQL statements capable of recreating database objects and data.
+MatrixOne supports logical backups through the mo_dump utility. mo_dump is a command-line utility designed to generate logical backups of the MatrixOne database. It produces SQL statements that can be used to recreate database objects and data.
