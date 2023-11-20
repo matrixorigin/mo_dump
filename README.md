@@ -38,7 +38,7 @@ __Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需�
     ```
     git clone https://github.com/matrixorigin/mo_dump.git
     cd mo_dump
-    make modump
+    make build
     ```
 
 2. 你可以在 mo_dump 文件夹中找到 `mo-dump` 可执行文件：*mo-dump*。
