@@ -119,6 +119,9 @@ func main() {
 			}
 		}
 	}
+	if opt.tables == nil {
+		opt.emptyTables = true
+	}
 
 	//replace : in username to #, because : is used as separator in dsn.
 	//password can have ":".
@@ -148,9 +151,6 @@ func main() {
 		opt.dbs, err = getDatabases(ctx)
 		if err != nil {
 			return
-		}
-		if opt.tables == nil {
-			opt.emptyTables = true
 		}
 	}
 
