@@ -60,6 +60,11 @@ func (t *Tables) Set(value string) error {
 	return nil
 }
 
+var usage = func() {
+	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [-csv] [-tbl <table>...] [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
+	flag.PrintDefaults()
+}
+
 func main() {
 	var (
 		err error
@@ -76,7 +81,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "modump error while close connection: %v\n", err)
 			}
 		}
-		if err == nil {
+		if err == nil && flag.NFlag() != 0 {
 			fmt.Fprintf(os.Stdout, "/* MODUMP SUCCESS, COST %v */\n", time.Since(dumpStart))
 			if opt.toCsv {
 				fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
@@ -91,12 +96,18 @@ func main() {
 	flag.IntVar(&opt.port, "P", defaultPort, "portNumber")
 	flag.IntVar(&opt.netBufferLength, "net-buffer-length", defaultNetBufferLength, "net_buffer_length")
 	flag.StringVar(&opt.database, "db", "", "databaseName, must be specified")
-	flag.StringVar(&opt.tbl, "tbl", "", "tableNameList, default all")
-	flag.BoolVar(&opt.toCsv, "csv", defaultCsv, "set export format to csv")
+	flag.StringVar(&opt.tbl, "tbl", "", "tableNameList (default all)")
+	flag.BoolVar(&opt.toCsv, "csv", defaultCsv, "set export format to csv (default false)")
 	flag.StringVar(&opt.csvFieldDelimiterStr, "csv-field-delimiter", string(defaultFieldDelimiter), "set csv field delimiter (only one utf8 character). enabled only when the option 'csv' is set.")
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
-	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data")
+	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
 	flag.Parse()
+
+	flag.Usage = usage
+	if flag.NFlag() == 0 {
+		flag.Usage()
+		return
+	}
 
 	if opt.netBufferLength < minNetBufferLength {
 		fmt.Fprintf(os.Stderr, "net_buffer_length must be greater than %d, set to %d\n", minNetBufferLength, minNetBufferLength)
