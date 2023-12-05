@@ -1,0 +1,16 @@
+.idea/
+*.o
+*.a
+*.exe
+*.lib
+*.swp
+bin/
+*.output
+**/.DS_Store
+**/cover.out
+.vscode
+*.iml
+vendor/
+*.test
+*.out
+/mo-dump

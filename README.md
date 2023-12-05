@@ -6,7 +6,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 ### 语法结构
 
 ```
-./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [-csv] [-tbl ${table}...] -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
+./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [-csv] [-no-data] [-tbl ${table}...] -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
 ```
 
 **参数释义**
@@ -19,7 +19,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-P [port]**：MatrixOne 服务器的端口。默认值：6001
 
-- **-db [数据库名称]**：必需参数。要备份的数据库的名称。
+- **-db [数据库名称]**：必需参数。要备份的数据库的名称。可以指定多个数据库，数据库名称之间用 `,` 分隔。
 
 - **-net-buffer-length [数据包大小]**：数据包大小，即 SQL 语句字符的总大小。数据包是 SQL 导出数据的基本单位，如果不设置参数，则默认 1048576 Byte（1M），最大可设置 16777216 Byte（16M）。假如这里的参数设置为 16777216 Byte（16M），那么，当要导出大于 16M 的数据时，会把数据拆分成多个 16M 的数据包，除最后一个数据包之外，其它数据包大小都为 16M。
 
@@ -28,6 +28,8 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 - **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。表示支持本地导出 *CSV* 文件。
 
 - **-tbl [表名]**：可选参数。如果参数为空，则导出整个数据库。如果要备份指定表，则可以在命令中指定多个 `-tbl` 和表名。
+
+- **-no-data**：默认值为 false。当设置为 true 时表示不导出数据，仅导出表结构。
 
 
 ### 构建 mo-dump 二进制文件
