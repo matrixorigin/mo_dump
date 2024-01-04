@@ -108,8 +108,6 @@ jobs:
           cache: false
       - name: Build normal
         run: |
-          git tag ${{ steps.get_release.outputs.tag_name }}
-          git checkout ${{ steps.get_release.outputs.tag_name }}
           make build
       - name: Import Code-Signing Certificates
         uses: Apple-Actions/import-codesign-certs@v1
@@ -187,8 +185,6 @@ jobs:
           go version
       - name: Build normal
         run: |
-          git tag ${{ steps.get_release.outputs.tag_name }}
-          git checkout ${{ steps.get_release.outputs.tag_name }}
           make build
       - name: Remove Code-Signing Certificates
         run: |
