@@ -1,0 +1,13 @@
+{
+  "source" : ["./mo-dump"],
+  "bundle_id" : "com.matrixorigin.mo-dump",
+  "apple_id": {
+    "username" : "shuqi.qin@matrixorigin.cn"
+  },
+  "sign" :{
+    "application_identity" : "90818D98626B020D66D306D5FD8311E98A41C596"
+  },
+  "zip" :{
+    "output_path" : "mo-dump.zip"
+  }
+}
