@@ -201,7 +201,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			fmt.Println(createDb, ";")
 			fmt.Printf("USE `%s`;\n\n\n", db)
 		}
-		opt.tables, err = getTables(db, opt.tables)
+		opt.tables, err = getTables(ctx, db, opt.tables)
 		if err != nil {
 			return err
 		}
@@ -343,7 +343,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 	fmt.Printf("%s%s\n", createSql, suffix)
 }
 
-func getTables(db string, tables Tables) (Tables, error) {
+func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
 	if len(tables) > 0 {
 		sql += " and relname in ("
@@ -365,6 +365,7 @@ func getTables(db string, tables Tables) (Tables, error) {
 		tables = Tables{}
 	}
 	tables = tables[:0]
+	isEmptySet := true
 	for r.Next() {
 		var table string
 		var kind string
@@ -376,10 +377,16 @@ func getTables(db string, tables Tables) (Tables, error) {
 			continue
 		}
 		tables = append(tables, Table{table, kind})
+		isEmptySet = false
 	}
 	if err := r.Err(); err != nil {
 		return nil, err
 	}
+
+	if isEmptySet {
+		return nil, moerr.NewInvalidInput(ctx, "table not found")
+	}
+
 	return tables, nil
 }
 
