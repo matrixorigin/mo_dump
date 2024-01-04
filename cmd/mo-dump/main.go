@@ -74,11 +74,13 @@ func main() {
 	defer func() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "modump error: %v\n", err)
+			os.Exit(1)
 		}
 		if conn != nil {
 			err := conn.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "modump error while close connection: %v\n", err)
+				os.Exit(1)
 			}
 		}
 		if err == nil && flag.NFlag() != 0 {
