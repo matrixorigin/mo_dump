@@ -252,7 +252,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			default:
-				err = moerr.NewNotSupported(ctx, "table type %s", tbl.Kind)
+				err = moerr.NewNotSupported(ctx, "table: %s table type: %s", tbl.Name, tbl.Kind)
 				return err
 			}
 		}
