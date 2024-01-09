@@ -516,9 +516,9 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		return err
 	}
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '\\t' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl)
+		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '\\t' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl)
+		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
 	}
 	return nil
 }
