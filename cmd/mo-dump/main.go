@@ -345,6 +345,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 
 func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
+	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
 		sql += " and relname in ("
 		for i, tbl := range tables {
@@ -352,6 +353,7 @@ func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 				sql += ","
 			}
 			sql += "'" + tbl.Name + "'"
+			tableNames[tbl.Name] = false
 		}
 		sql += ")"
 	}
@@ -365,7 +367,6 @@ func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 		tables = Tables{}
 	}
 	tables = tables[:0]
-	isEmptySet := true
 	for r.Next() {
 		var table string
 		var kind string
@@ -377,14 +378,16 @@ func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 			continue
 		}
 		tables = append(tables, Table{table, kind})
-		isEmptySet = false
+		tableNames[table] = true
 	}
 	if err := r.Err(); err != nil {
 		return nil, err
 	}
 
-	if isEmptySet {
-		return nil, moerr.NewInvalidInput(ctx, "table not found")
+	for k, v := range tableNames {
+		if !v {
+			return nil, moerr.NewInvalidInput(ctx, "table %s not exists", k)
+		}
 	}
 
 	return tables, nil
