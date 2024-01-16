@@ -548,6 +548,9 @@ func toCsvFields(rowResults []any, cols []*Column, line []string) {
 	for i, v := range rowResults {
 		dt, format := convertValue2(v, cols[i].Type)
 		str := fmt.Sprintf(format, dt)
+		if len(str) > 0 && str[0] == '#' {
+			str = "\"" + str + "\""
+		}
 		line[i] = str
 	}
 }
