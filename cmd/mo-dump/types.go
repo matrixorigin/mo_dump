@@ -38,6 +38,8 @@ const (
 	blobPrefix                 = "0x"
 	zeroByte                   = '\x00'
 	lineByte                   = '\n'
+	carriageByte               = '\r'
+	tabularByte                = '\t'
 )
 
 const (

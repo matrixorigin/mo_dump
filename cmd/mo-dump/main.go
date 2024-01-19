@@ -479,7 +479,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 						curBuf.WriteString("NULL")
 					}
 					for _, b := range ret {
-						if b == zeroByte || b == lineByte {
+						if b == zeroByte || b == lineByte || b == carriageByte || b == tabularByte {
 							curBuf.WriteString(fmt.Sprintf("%X", zeroByte))
 						}
 						curBuf.WriteString(fmt.Sprintf("%X", b))
