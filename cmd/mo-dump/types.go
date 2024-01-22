@@ -36,10 +36,10 @@ const (
 	//default Field delimiter (set to ',')
 	defaultFieldDelimiter rune = ','
 	blobPrefix                 = "0x"
-	zeroByte                   = '\x00'
-	lineByte                   = '\n'
-	carriageByte               = '\r'
-	tabularByte                = '\t'
+	// zeroByte                   = '\x00'
+	// lineByte                   = '\n'
+	// carriageByte               = '\r'
+	// tabularByte                = '\t'
 )
 
 const (
