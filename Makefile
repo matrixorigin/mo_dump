@@ -80,8 +80,7 @@ clean:
 	$(info [Clean up])
 	$(info Clean go test cache)
 	@go clean -testcache
-	rm -f $(BIN_NAME)
-	rm -rf $(ROOT_DIR)/vendor
+	rm -f $(MO_DUMP)
 
 
 ###############################################################################
