@@ -622,6 +622,18 @@ func convertValue(v any, typ string) string {
 		return string(ret)
 	case "vecf32", "vecf64":
 		return string(ret)
+	case "bit":
+		var builder strings.Builder
+		builder.WriteString("_binary '")
+		for _, b := range ret {
+			if b == byte(0) {
+				builder.WriteString("\\0")
+			} else {
+				builder.WriteByte(b)
+			}
+		}
+		builder.WriteString("'")
+		return builder.String()
 	default:
 		str := strings.Replace(string(ret), "\\", "\\\\", -1)
 		return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
