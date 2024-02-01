@@ -76,8 +76,18 @@ __Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需�
 ./mo-dump -u root -p 111 -db t -tbl t1 > t1.sql
 ```
 
-* `mo-dump`  不仅支持导出单个数据库的备份，还支持导出多个表。
+* `mo-dump`  支持导出多个数据库。[在 -db后接数据库名]
+例如
+```mysql
+mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db db1,db2,db3 > /tm/db1-db2-db3.sql
+mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db all > /tm/all-dbs.sql
+```
 
+* `mo-dump`  不仅支持导出多个数据库，还支持导出多个数据库表。
+例如
+```mysql
+mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db db1 -tbl tbl1,tbl2,tbl3 > /tm/all-dbs.sql
+```
 
 ## 限制
 * `mo-dump` 暂不支持只导出数据库的结构或数据。如果你想在没有数据库结构的情况下生成数据的备份，或者仅想导出数据库结构，那么，你需要手动拆分 `.sql` 文件。
