@@ -560,6 +560,9 @@ func toCsvFields(rowResults []any, cols []*Column, line []string) {
 		if len(str) > 0 && str[0] == '#' {
 			str = "'" + str + "'"
 		}
+		if strings.ToLower(cols[i].Type) == "text" {
+			str = strings.Replace(str, ",", "\\,", -1)
+		}
 		line[i] = str
 	}
 }
@@ -653,6 +656,8 @@ func convertValue2(v any, typ string) (sql.RawBytes, string) {
 		return ret, defaultFmt
 	case "json":
 		return ret, jsonFmt
+	case "text":
+		return ret, defaultFmt
 	case "vecf32", "vecf64":
 		return ret, defaultFmt
 	default:
