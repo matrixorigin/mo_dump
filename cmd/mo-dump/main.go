@@ -558,7 +558,7 @@ func toCsvFields(rowResults []any, cols []*Column, line []string) {
 		dt, format := convertValue2(v, cols[i].Type)
 		str := fmt.Sprintf(format, dt)
 		if len(str) > 0 && str[0] == '#' {
-			str = "'" + str + "'"
+			str = "\\" + str
 		}
 		if strings.ToLower(cols[i].Type) == "text" {
 			str = strings.Replace(str, ",", "\\,", -1)
