@@ -345,8 +345,6 @@ func TestGetCreateDB(t *testing.T) {
 	}
 	defer db.Close()
 
-	ctx := context.Background()
-
 	rows := sqlmock.NewRows([]string{"Database", "Create"}).
 		AddRow("db1", "CREATE DATABASE db1").
 		AddRow("db2", "CREATE DATABASE db2").
@@ -356,7 +354,7 @@ func TestGetCreateDB(t *testing.T) {
 	conn = db
 
 	// check the results
-	createDB, err := getCreateDB(ctx, "db1")
+	createDB, err := getCreateDB("db1")
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}

@@ -193,7 +193,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			opt.tables = nil
 		}
 		if len(opt.tables) == 0 { //dump all tables
-			createDb, err = getCreateDB(ctx, db)
+			createDb, err = getCreateDB(db)
 			if err != nil {
 				return err
 			}
@@ -207,10 +207,28 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		}
 		createTable = make([]string, len(opt.tables))
 		for i, tbl := range opt.tables {
-			createTable[i], err = getCreateTable(db, tbl.Name)
-			if err != nil {
+			var createTableSql string
+			switch tbl.Kind {
+			case catalog.SystemOrdinaryRel:
+				createTableSql, err = getCreateTable(db, tbl.Name)
+				if err != nil {
+					return err
+				}
+			case catalog.SystemExternalRel:
+				createTableSql, err = getCreateTable(db, tbl.Name)
+				if err != nil {
+					return err
+				}
+			case catalog.SystemViewRel:
+				createTableSql, err = getCreateView(db, tbl.Name)
+				if err != nil {
+					return err
+				}
+			default:
+				err = moerr.NewNotSupported(ctx, "table: %s table type: %s", tbl.Name, tbl.Kind)
 				return err
 			}
+			createTable[i] = createTableSql
 		}
 		bufPool := &sync.Pool{
 			New: func() any {
@@ -393,7 +411,7 @@ func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 	return tables, nil
 }
 
-func getCreateDB(ctx context.Context, db string) (string, error) {
+func getCreateDB(db string) (string, error) {
 	r := conn.QueryRow("show create database `" + db + "`")
 	var create string
 	err := r.Scan(&db, &create)
@@ -431,6 +449,18 @@ func getCreateTable(db, tbl string) (string, error) {
 	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
 	var create string
 	err := r.Scan(&tbl, &create)
+	if err != nil {
+		return "", err
+	}
+	return create, nil
+}
+
+func getCreateView(db, tbl string) (string, error) {
+	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
+	var create string
+	var character_set_client string
+	var collation_connection string
+	err := r.Scan(&tbl, &create, &character_set_client, &collation_connection)
 	if err != nil {
 		return "", err
 	}
