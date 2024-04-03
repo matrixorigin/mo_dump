@@ -399,3 +399,33 @@ func TestGetCreateTable(t *testing.T) {
 		t.Errorf("Unfulfilled expectations: %s", err)
 	}
 }
+
+func TestGetCreateView(t *testing.T) {
+	// create mock database
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Failed to create mock database: %v", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"Table", "Create"}).
+		AddRow("table1_view", "CREATE VIEW table1_view as SELECT * FROM table1")
+
+	mock.ExpectQuery("show create table").WillReturnRows(rows)
+	conn = db
+
+	// check the results
+	createTable, err := getCreateTable("db1", "table1_view")
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	expectedCreateTable := "CREATE VIEW table1_view as SELECT * FROM table1"
+	if createTable != expectedCreateTable {
+		t.Errorf("Unexpected create table statement. Expected: %s, Got: %s", expectedCreateTable, createTable)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled expectations: %s", err)
+	}
+}
