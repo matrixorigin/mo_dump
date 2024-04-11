@@ -192,21 +192,40 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	fmt.Println("SET foreign_key_checks = 0;")
 
 	for _, db := range opt.dbs {
+		var dbStruct Db
+		dbStruct, err = getDatabaseType(ctx, db)
+		if err != nil {
+			return err
+		}
+
 		if opt.emptyTables {
 			opt.tables = nil
 		}
 		if len(opt.tables) == 0 { //dump all tables
-			createDb, err = getCreateDB(db)
-			if err != nil {
-				return err
+			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
+				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`;", db)
+				fmt.Printf("/* DUMP SUBSCRIPTION DATABASE  %s */; \n", db)
+			} else {
+				createDb, err = getCreateDB(db)
+				if err != nil {
+					return err
+				}
 			}
 			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
 			fmt.Println(createDb, ";")
 			fmt.Printf("USE `%s`;\n\n\n", db)
 		}
-		opt.tables, err = getTables(ctx, db, opt.tables)
-		if err != nil {
-			return err
+
+		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
+			opt.tables, err = opt.getSubScriptionTables(ctx, db, opt.tables)
+			if err != nil {
+				return err
+			}
+		} else {
+			opt.tables, err = getTables(ctx, db, opt.tables)
+			if err != nil {
+				return err
+			}
 		}
 		createTable = make([]string, len(opt.tables))
 		for i, tbl := range opt.tables {
@@ -364,6 +383,28 @@ func showCreateTable(createSql string, withNextLine bool) {
 		suffix += "\n\n"
 	}
 	fmt.Printf("%s%s\n", createSql, suffix)
+}
+func getDatabaseType(ctx context.Context, db string) (Db, error) {
+	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
+	r, err := conn.Query(sql)
+	if err != nil {
+		return Db{}, err
+	}
+	defer r.Close()
+	dbs := make([]Db, 0)
+	for r.Next() {
+		var dbName string
+		var dbType string
+		err = r.Scan(&dbName, &dbType)
+		if err != nil {
+			return Db{}, err
+		}
+		dbs = append(dbs, Db{dbName, dbType})
+	}
+	if len(dbs) != 1 {
+		return Db{}, moerr.NewInvalidInput(ctx, "database %s not exists", db)
+	}
+	return dbs[0], nil
 }
 
 func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
@@ -716,4 +757,61 @@ func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 	} else {
 		return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter is invalid utf8 character")
 	}
+}
+
+func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables Tables) (Tables, error) {
+	var err error
+	var hasTableOpt bool
+	conn, err = opt.openDBConnection(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+
+	tableNames := make(map[string]bool, len(tables))
+	if len(tables) > 0 {
+		for _, tbl := range tables {
+			tableNames[tbl.Name] = false
+		}
+		hasTableOpt = true
+	}
+
+	r, err := conn.QueryContext(ctx, "SHOW TABLES")
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	if tables == nil {
+		tables = Tables{}
+	}
+	tables = tables[:0]
+	for r.Next() {
+		var table string
+		err = r.Scan(&table)
+		if err != nil {
+			return nil, err
+		}
+
+		if hasTableOpt {
+			if _, ok := tableNames[table]; ok {
+				tables = append(tables, Table{table, catalog.SystemOrdinaryRel})
+				tableNames[table] = true
+			}
+		} else {
+			tables = append(tables, Table{table, catalog.SystemOrdinaryRel})
+			tableNames[table] = true
+		}
+
+	}
+	if err := r.Err(); err != nil {
+		return nil, err
+	}
+
+	for k, v := range tableNames {
+		if !v {
+			return nil, moerr.NewInvalidInput(ctx, "table %s not exists", k)
+		}
+	}
+
+	return tables, nil
 }

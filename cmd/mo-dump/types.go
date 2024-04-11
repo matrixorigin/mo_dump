@@ -70,3 +70,8 @@ type csvConfig struct {
 	enable         bool
 	fieldDelimiter rune
 }
+
+type Db struct {
+	Name   string
+	DBType string
+}
