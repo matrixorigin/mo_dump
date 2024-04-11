@@ -188,6 +188,9 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		defer conn.Close()
 	}
 
+	// add foreign_key_checks variable to dump file
+	fmt.Println("SET foreign_key_checks = 0;")
+
 	for _, db := range opt.dbs {
 		if opt.emptyTables {
 			opt.tables = nil
@@ -275,7 +278,9 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	// reset foreign_key_checks variable to dump file
+	fmt.Println("SET foreign_key_checks = 1;")
+	return err
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
