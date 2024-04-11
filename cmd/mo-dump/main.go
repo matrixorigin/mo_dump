@@ -96,7 +96,7 @@ func main() {
 	flag.StringVar(&opt.password, "p", defaultPassword, "password")
 	flag.StringVar(&opt.host, "h", defaultHost, "hostname")
 	flag.IntVar(&opt.port, "P", defaultPort, "portNumber")
-	flag.IntVar(&opt.netBufferLength, "net-buffer-length", defaultNetBufferLength, "net_buffer_length")
+	flag.IntVar(&opt.netBufferLength, "net-buffer-length", defaultNetBufferLength, "net-buffer-length used to set the buffer size for network connections")
 	flag.StringVar(&opt.database, "db", "", "databaseName, must be specified")
 	flag.StringVar(&opt.tbl, "tbl", "", "tableNameList (default all)")
 	flag.BoolVar(&opt.toCsv, "csv", defaultCsv, "set export format to csv (default false)")
