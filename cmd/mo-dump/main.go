@@ -119,13 +119,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "net_buffer_length must be less than %d, set to %d\n", maxNetBufferLength, maxNetBufferLength)
 		opt.netBufferLength = maxNetBufferLength
 	}
-	opt.dbs = strings.Split(opt.database, ",")
-	if len(opt.dbs) == 0 {
+
+	if len(opt.database) == 0 {
 		err = moerr.NewInvalidInput(ctx, "database must be specified")
 		return
-	}
-	for i, db := range opt.dbs {
-		opt.dbs[i] = strings.TrimSpace(db)
+	} else {
+		dbs := strings.Split(opt.database, ",")
+		for _, db := range dbs {
+			db = strings.TrimSpace(db)
+			if len(db) != 0 {
+				opt.dbs = append(opt.dbs, db)
+			}
+		}
 	}
 
 	if len(opt.tbl) > 0 {
@@ -194,7 +199,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	}
 
 	// add foreign_key_checks variable to dump file
-	fmt.Println("SET foreign_key_checks = 0;")
+	fmt.Printf("SET foreign_key_checks = 0;\n\n")
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
@@ -209,7 +214,6 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
 				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`;", db)
-				fmt.Printf("/* DUMP SUBSCRIPTION DATABASE  %s */; \n", db)
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
