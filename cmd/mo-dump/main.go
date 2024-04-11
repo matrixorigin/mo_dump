@@ -124,9 +124,14 @@ func main() {
 		err = moerr.NewInvalidInput(ctx, "database must be specified")
 		return
 	}
+	for i, db := range opt.dbs {
+		opt.dbs[i] = strings.TrimSpace(db)
+	}
+
 	if len(opt.tbl) > 0 {
 		tbls := strings.Split(opt.tbl, ",")
 		for _, t := range tbls {
+			t = strings.TrimSpace(t)
 			if len(t) != 0 {
 				opt.tables = append(opt.tables, Table{t, ""})
 			}
