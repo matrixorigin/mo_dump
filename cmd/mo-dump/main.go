@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -646,7 +647,7 @@ func toCsvFields(rowResults []any, cols []*Column, line []string) {
 			str = "\\" + str
 		}
 		if strings.ToLower(cols[i].Type) == "text" {
-			str = strings.Replace(str, ",", "\\,", -1)
+			str = escapeChars(str)
 		}
 		line[i] = str
 	}
@@ -823,4 +824,16 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 	}
 
 	return tables, nil
+}
+
+// escapeChars
+func escapeChars(text string) string {
+	charSet := ""
+	for _, char := range escapeCharSet {
+		charSet += regexp.QuoteMeta(string(char))
+	}
+	re := regexp.MustCompile(`[` + charSet + `]`)
+	return re.ReplaceAllStringFunc(text, func(s string) string {
+		return "\\" + s
+	})
 }
