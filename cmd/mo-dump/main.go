@@ -646,7 +646,7 @@ func toCsvFields(rowResults []any, cols []*Column, line []string) {
 		if len(str) > 0 && str[0] == '#' {
 			str = "\\" + str
 		}
-		if strings.ToLower(cols[i].Type) == "text" {
+		if strings.ToLower(cols[i].Type) == "text" && str != string(nullBytes) {
 			str = escapeChars(str)
 		}
 		line[i] = str
