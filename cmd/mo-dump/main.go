@@ -837,7 +837,8 @@ func escapeChars(text string) string {
 		return "\\" + s
 	})
 }
+
 func isStringType(typ string) bool {
 	typ = strings.ToLower(typ)
-	return typ == "text" || typ == "char" || typ == "varchar"
+	return typ == "text" || typ == "char" || typ == "varchar" || typ == "json"
 }
