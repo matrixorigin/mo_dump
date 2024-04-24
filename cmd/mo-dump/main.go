@@ -214,7 +214,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		}
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
-				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`;", db)
+				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", db)
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
