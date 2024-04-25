@@ -50,6 +50,7 @@ type Options struct {
 	emptyTables          bool
 	csvConf              csvConfig
 	csvFieldDelimiterStr string
+	enableEscape         bool
 }
 
 func (t *Tables) String() string {
@@ -62,7 +63,7 @@ func (t *Tables) Set(value string) error {
 }
 
 var usage = func() {
-	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [-csv] [-tbl <table>...] [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [--enable-escape=false] [-csv] [-tbl <table>...] [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
@@ -104,6 +105,7 @@ func main() {
 	flag.StringVar(&opt.csvFieldDelimiterStr, "csv-field-delimiter", string(defaultFieldDelimiter), "set csv field delimiter (only one utf8 character). enabled only when the option 'csv' is set.")
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
 	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
+	flag.BoolVar(&opt.enableEscape, "enable-escape", defaultEnableEscape, "enable escape characters in csv output")
 	flag.Parse()
 
 	flag.Usage = usage
@@ -160,6 +162,7 @@ func main() {
 	if opt.toCsv {
 		opt.csvConf.enable = opt.toCsv
 		opt.csvConf.fieldDelimiter, err = checkFieldDelimiter(ctx, opt.csvFieldDelimiterStr)
+		opt.csvConf.enableEscape = opt.enableEscape
 		if err != nil {
 			return
 		}
@@ -630,7 +633,7 @@ func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvC
 		if err != nil {
 			return err
 		}
-		err = toCsvLine(csvWriter, rowResults, cols, line)
+		err = toCsvLine(csvWriter, rowResults, cols, line, csvConf.enableEscape)
 		if err != nil {
 			return err
 		}
@@ -639,24 +642,26 @@ func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvC
 }
 
 // toCsvFields converts the result from mo to string
-func toCsvFields(rowResults []any, cols []*Column, line []string) {
+func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape bool) {
 	for i, v := range rowResults {
 		dt, format := convertValue2(v, cols[i].Type)
 		str := fmt.Sprintf(format, dt)
 		if len(str) > 0 && str[0] == '#' {
 			str = "\\" + str
 		}
-		if isStringType(cols[i].Type) && str != string(nullBytes) {
+		if enableEscape && isStringType(cols[i].Type) && str != string(nullBytes) {
 			str = escapeChars(str)
+		} else if !enableEscape && strings.ToLower(cols[i].Type) == "text" {
+			str = strings.Replace(str, ",", "\\,", -1)
 		}
 		line[i] = str
 	}
 }
 
 // toCsvLine converts the result from mo to csv single line
-func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []string) error {
+func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []string, enableEscape bool) error {
 	var err error
-	toCsvFields(rowResults, cols, line)
+	toCsvFields(rowResults, cols, line, enableEscape)
 	err = csvWriter.Write(line)
 	if err != nil {
 		return err

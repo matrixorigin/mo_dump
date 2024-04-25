@@ -40,6 +40,7 @@ const (
 	// lineByte                   = '\n'
 	// carriageByte               = '\r'
 	// tabularByte                = '\t'
+	defaultEnableEscape = false
 )
 
 const (
@@ -70,6 +71,7 @@ type Tables []Table
 type csvConfig struct {
 	enable         bool
 	fieldDelimiter rune
+	enableEscape   bool
 }
 
 type Db struct {
