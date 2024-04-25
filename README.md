@@ -31,7 +31,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-no-data**：默认值为 false。当设置为 true 时表示不导出数据，仅导出表结构。
 
-- **--local-infile**：默认值为 false，仅在参数 **-csv** 设置为 true 时生效。表示对特殊字符开启转义，可以避免一些兼容性问题。
+- **-enable-escape**：默认值为 false，仅在参数 **-csv** 设置为 true 时生效。表示对特殊字符开启转义，可以避免一些兼容性问题。
 
 
 ### 构建 mo-dump 二进制文件
