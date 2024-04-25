@@ -40,6 +40,7 @@ const (
 	// lineByte                   = '\n'
 	// carriageByte               = '\r'
 	// tabularByte                = '\t'
+	defaultEnableEscape = false
 )
 
 const (
@@ -49,8 +50,9 @@ const (
 )
 
 var (
-	conn      *sql.DB
-	nullBytes = []byte("\\N")
+	conn          *sql.DB
+	nullBytes     = []byte("\\N")
+	escapeCharSet = []rune{',', '\\'}
 )
 
 type Column struct {
@@ -69,6 +71,7 @@ type Tables []Table
 type csvConfig struct {
 	enable         bool
 	fieldDelimiter rune
+	enableEscape   bool
 }
 
 type Db struct {

@@ -175,7 +175,7 @@ func Test_toCsvFields(t *testing.T) {
 		},
 	}
 	line := make([]string, 1)
-	toCsvFields(args1, cols1, line)
+	toCsvFields(args1, cols1, line, false)
 	want := "\\10\\36\\86\\"
 	assert.Equal(t, want, line[0])
 }
@@ -193,7 +193,7 @@ func Test_toCsvLine(t *testing.T) {
 	bb := bytes.Buffer{}
 	cw1 := csv.NewWriter(&bb)
 	cw1.Comma = '\t'
-	err := toCsvLine(cw1, args1, cols1, line)
+	err := toCsvLine(cw1, args1, cols1, line, false)
 	assert.NoError(t, err)
 	want := "\\10\\36\\86\\"
 	assert.Equal(t, want, line[0])

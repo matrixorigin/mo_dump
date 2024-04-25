@@ -6,7 +6,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 ### 语法结构
 
 ```
-./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [-csv] [-no-data] [-tbl ${table}...] -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
+./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [--enable-escape=false] [-csv] [-no-data] [-tbl ${table}...] -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
 ```
 
 **参数释义**
@@ -30,6 +30,8 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 - **-tbl [表名]**：可选参数。如果参数为空，则导出整个数据库。如果要备份指定表，则可以在命令中指定多个 `-tbl` 和表名。
 
 - **-no-data**：默认值为 false。当设置为 true 时表示不导出数据，仅导出表结构。
+
+- **--local-infile**：默认值为 false，仅在参数 **-csv** 设置为 true 时生效。表示对特殊字符开启转义，可以避免一些兼容性问题。
 
 
 ### 构建 mo-dump 二进制文件
