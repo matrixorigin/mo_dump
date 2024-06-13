@@ -656,6 +656,11 @@ func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape b
 			// can be removed soon
 			str = strings.Replace(str, ",", "\\,", -1)
 		}
+
+		if str == "\\" {
+			str = "\\\\"
+		}
+
 		line[i] = str
 	}
 }
