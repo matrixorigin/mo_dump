@@ -566,8 +566,12 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 					if ret == nil {
 						curBuf.WriteString("NULL")
 					} else {
-						curBuf.WriteString(blobPrefix)
-						curBuf.WriteString(fmt.Sprintf("%X", ret))
+						if len(ret) == 0 {
+							curBuf.WriteString("''")
+						} else {
+							curBuf.WriteString(blobPrefix)
+							curBuf.WriteString(fmt.Sprintf("%X", ret))
+						}
 					}
 				} else {
 					curBuf.WriteString(convertValue(v, cols[i].Type))
