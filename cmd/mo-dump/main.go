@@ -661,12 +661,22 @@ func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape b
 			str = strings.Replace(str, ",", "\\,", -1)
 		}
 
-		if str == "\\" {
-			str = "\\\\"
-		}
-
-		line[i] = str
+		line[i] = escapeString(str)
 	}
+}
+
+func escapeString(s string) string {
+	if s == "\\N" {
+		return s
+	}
+	var builder strings.Builder
+	for _, char := range s {
+		if char == '\\' {
+			builder.WriteString("\\")
+		}
+		builder.WriteRune(char)
+	}
+	return builder.String()
 }
 
 // toCsvLine converts the result from mo to csv single line
