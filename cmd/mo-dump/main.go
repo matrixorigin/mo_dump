@@ -656,9 +656,6 @@ func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape b
 		}
 		if enableEscape && isStringType(cols[i].Type) && str != string(nullBytes) {
 			str = escapeChars(str)
-		} else if !enableEscape && strings.ToLower(cols[i].Type) == "text" {
-			// can be removed soon
-			str = strings.Replace(str, ",", "\\,", -1)
 		}
 
 		line[i] = escapeString(str)
