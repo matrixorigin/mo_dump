@@ -51,6 +51,7 @@ type Options struct {
 	csvConf              csvConfig
 	csvFieldDelimiterStr string
 	enableEscape         bool
+	where                string
 }
 
 func (t *Tables) String() string {
@@ -106,6 +107,7 @@ func main() {
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
 	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
 	flag.BoolVar(&opt.enableEscape, "enable-escape", defaultEnableEscape, "enable escape characters in csv output")
+	flag.StringVar(&opt.where, "where", "", "Dump only selected records. Quotes are mandatory.")
 	flag.Parse()
 
 	flag.Usage = usage
@@ -292,7 +294,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, false)
 				if !opt.noData {
-					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf)
+					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
 					if err != nil {
 						return err
 					}
@@ -688,8 +690,12 @@ func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []s
 	return err
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig) error {
-	r, err := conn.Query("select * from `" + db + "`.`" + tbl + "`")
+func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {
+	querySql := "select * from `" + db + "`.`" + tbl + "`"
+	if condition != "" {
+		querySql += " where " + condition
+	}
+	r, err := conn.Query(querySql)
 	if err != nil {
 		return err
 	}
