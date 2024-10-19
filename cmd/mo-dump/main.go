@@ -51,6 +51,8 @@ type Options struct {
 	csvConf              csvConfig
 	csvFieldDelimiterStr string
 	enableEscape         bool
+	where                string
+	sysAccount           bool // used in getDatabaseType, getTables
 }
 
 func (t *Tables) String() string {
@@ -106,6 +108,8 @@ func main() {
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
 	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
 	flag.BoolVar(&opt.enableEscape, "enable-escape", defaultEnableEscape, "enable escape characters in csv output")
+	flag.StringVar(&opt.where, "where", "", "Dump only selected records. Quotes are mandatory.")
+	flag.BoolVar(&opt.sysAccount, "sys", false, "Dump system table from 'sys' account, used for check db / table schema.")
 	flag.Parse()
 
 	flag.Usage = usage
@@ -207,7 +211,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
-		dbStruct, err = getDatabaseType(ctx, db)
+		dbStruct, err = getDatabaseType(ctx, db, opt.sysAccount)
 		if err != nil {
 			return err
 		}
@@ -235,7 +239,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				return err
 			}
 		} else {
-			opt.tables, err = getTables(ctx, db, opt.tables)
+			opt.tables, err = getTables(ctx, db, opt.tables, opt.sysAccount)
 			if err != nil {
 				return err
 			}
@@ -292,7 +296,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, false)
 				if !opt.noData {
-					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf)
+					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
 					if err != nil {
 						return err
 					}
@@ -397,8 +401,11 @@ func showCreateTable(createSql string, withNextLine bool) {
 	}
 	fmt.Printf("%s%s\n", createSql, suffix)
 }
-func getDatabaseType(ctx context.Context, db string) (Db, error) {
+func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
+	if isSys {
+		sql += " and account_id = 0"
+	}
 	r, err := conn.Query(sql)
 	if err != nil {
 		return Db{}, err
@@ -420,8 +427,11 @@ func getDatabaseType(ctx context.Context, db string) (Db, error) {
 	return dbs[0], nil
 }
 
-func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
+func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
+	if isSys {
+		sql += " and account_id = 0"
+	}
 	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
 		sql += " and relname in ("
@@ -688,8 +698,12 @@ func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []s
 	return err
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig) error {
-	r, err := conn.Query("select * from `" + db + "`.`" + tbl + "`")
+func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {
+	querySql := "select * from `" + db + "`.`" + tbl + "`"
+	if condition != "" {
+		querySql += " where " + condition
+	}
+	r, err := conn.Query(querySql)
 	if err != nil {
 		return err
 	}
