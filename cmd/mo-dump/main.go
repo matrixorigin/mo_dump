@@ -260,7 +260,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 			default:
-				err = moerr.NewNotSupported(ctx, "table: %s table type: %s", tbl.Name, tbl.Kind)
+				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
 			createTable[i] = createTableSql
@@ -305,7 +305,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			default:
-				err = moerr.NewNotSupported(ctx, "table: %s table type: %s", tbl.Name, tbl.Kind)
+				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
 		}
@@ -332,7 +332,7 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	select {
 	case err = <-ch:
 	case <-time.After(timeout):
-		return nil, moerr.NewInternalError(ctx, "connect to %s timeout", dsn)
+		return nil, moerr.NewInternalError(ctx, fmt.Sprintf("connect to %s timeout", dsn))
 	}
 	if err != nil {
 		return nil, err
@@ -415,7 +415,7 @@ func getDatabaseType(ctx context.Context, db string) (Db, error) {
 		dbs = append(dbs, Db{dbName, dbType})
 	}
 	if len(dbs) != 1 {
-		return Db{}, moerr.NewInvalidInput(ctx, "database %s not exists", db)
+		return Db{}, moerr.NewInvalidInput(ctx, fmt.Sprintf("database %s not exists", db))
 	}
 	return dbs[0], nil
 }
@@ -463,7 +463,7 @@ func getTables(ctx context.Context, db string, tables Tables) (Tables, error) {
 
 	for k, v := range tableNames {
 		if !v {
-			return nil, moerr.NewInvalidInput(ctx, "table %s not exists", k)
+			return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf("table %s not exists", k))
 		}
 	}
 
@@ -651,9 +651,6 @@ func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape b
 	for i, v := range rowResults {
 		dt, format := convertValue2(v, cols[i].Type)
 		str := fmt.Sprintf(format, dt)
-		if len(str) > 0 && str[0] == '#' {
-			str = "\\" + str
-		}
 		if enableEscape && isStringType(cols[i].Type) && str != string(nullBytes) {
 			str = escapeChars(str)
 		}
@@ -842,7 +839,7 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 
 	for k, v := range tableNames {
 		if !v {
-			return nil, moerr.NewInvalidInput(ctx, "table %s not exists", k)
+			return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf("table %s not exists", k))
 		}
 	}
 
