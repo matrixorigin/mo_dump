@@ -732,6 +732,25 @@ func convertValue(v any, typ string) string {
 		return "NULL"
 	}
 	typ = strings.ToLower(typ)
+
+	if typ == "" {
+		// why empty string in column type?
+		// see https://github.com/matrixorigin/matrixone/issues/8050#issuecomment-1431251524 and https://github.com/matrixorigin/matrixone/issues/21903
+		// now the driver cannot identify BOOL and UUID type.
+		// so the current way to identify these two types is to observe the traits of values
+		val := string(ret)
+		if val == "true" || val == "false" {
+			return val
+		} else {
+			str := strings.Replace(val, "\\", "\\\\", -1)
+			return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
+		}
+	}
+	// bool can be somehow identified as varchar
+	if typ == "varchar" && (string(ret) == "true" || string(ret) == "false") {
+		return string(ret)
+	}
+
 	switch typ {
 	case "float":
 		retStr := string(ret)
@@ -739,9 +758,7 @@ func convertValue(v any, typ string) string {
 			return retStr
 		}
 		return "'" + retStr + "'" // NaN, +Inf, -Inf, maybe no hacking need in the future
-	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "double", "bool", "boolean", "":
-		// why empty string in column type?
-		// see https://github.com/matrixorigin/matrixone/issues/8050#issuecomment-1431251524
+	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "double", "bool", "boolean":
 		return string(ret)
 	case "vecf32", "vecf64":
 		return string(ret)
