@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -702,16 +703,34 @@ func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []s
 	return err
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {
+func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
+	queryConn, err := conn.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer queryConn.Close()
+
 	querySql := "select * from `" + db + "`.`" + tbl + "`"
 	if condition != "" {
 		querySql += " where " + condition
 	}
-	r, err := conn.Query(querySql)
+	r, err := queryConn.QueryContext(context.Background(), querySql)
 	if err != nil {
 		return err
 	}
-	defer r.Close()
+	defer func() {
+		if err != nil {
+			// MySQL Rows.Close drains unread results. Abort the physical connection
+			// first so a local failure cannot wait for the source to send EOF.
+			_ = queryConn.Raw(func(raw any) error {
+				_ = raw.(driver.Conn).Close()
+				// Returning ErrBadConn here would make sql.Conn wait for the rows
+				// we still own. Release them before returning the connection.
+				return nil
+			})
+		}
+		_ = r.Close()
+	}()
 	colTypes, err := r.ColumnTypes()
 	if err != nil {
 		return err

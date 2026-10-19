@@ -182,6 +182,7 @@ func TestGenOutputClosesRows(t *testing.T) {
 				database = filepath.Join(t.TempDir(), "missing", "db")
 			}
 			mock.ExpectQuery("select * from `" + database + "`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+			mock.ExpectClose()
 			pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
 			err := genOutput(database, "t", pool, 29, true, &conf, "")
 			switch mode {
