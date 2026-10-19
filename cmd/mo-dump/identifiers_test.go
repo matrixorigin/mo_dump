@@ -293,6 +293,9 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 				rows = sqlmock.NewRows([]string{"Table", "Create"}).AddRow("a`b", ddl)
 			}
 			mock.ExpectQuery("show create table `d`.`a``b`").WillReturnRows(rows).RowsWillBeClosed()
+			if kind == catalog.SystemViewRel {
+				mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
+			}
 			got := captureIdentifierOutput(t, func() { require.NoError(t, opt.dumpData(context.Background())) })
 			require.Equal(t, "SET foreign_key_checks = 0;\n\n"+drop+ddl+";\n\n\nSET foreign_key_checks = 1;\n", got)
 		})

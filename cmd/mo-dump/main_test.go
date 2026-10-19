@@ -25,6 +25,7 @@ import (
 	"unicode/utf8"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -125,7 +126,6 @@ func TestShowCreateTable(t *testing.T) {
 }
 
 func TestViewOrder(t *testing.T) {
-	start := 1
 	createTable := []string{
 		"create table t1(a int);",
 		"create view t4 as select * from t2, t3;",
@@ -158,7 +158,11 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	adjustViewOrder(createTable, tables, start)
+	for i := 1; i < len(tables); i++ {
+		tables[i].Kind = catalog.SystemViewRel
+		tableTarget[i].Kind = catalog.SystemViewRel
+	}
+	require.NoError(t, adjustViewOrder(context.Background(), "d", 0, createTable, tables))
 	for i := 0; i < len(createTable); i++ {
 		require.Equal(t, createTable[i], createTarget[i])
 		require.Equal(t, tables[i], tableTarget[i])
@@ -401,31 +405,12 @@ func TestGetCreateTable(t *testing.T) {
 }
 
 func TestGetCreateView(t *testing.T) {
-	// create mock database
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock database: %v", err)
-	}
-	defer db.Close()
-
-	rows := sqlmock.NewRows([]string{"Table", "Create"}).
-		AddRow("table1_view", "CREATE VIEW table1_view as SELECT * FROM table1")
-
-	mock.ExpectQuery("show create table").WillReturnRows(rows)
-	conn = db
-
-	// check the results
-	createTable, err := getCreateTable("db1", "table1_view")
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-
-	expectedCreateTable := "CREATE VIEW table1_view as SELECT * FROM table1"
-	if createTable != expectedCreateTable {
-		t.Errorf("Unexpected create table statement. Expected: %s, Got: %s", expectedCreateTable, createTable)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("Unfulfilled expectations: %s", err)
-	}
+	mock := newIdentifierMock(t)
+	const ddl = "CREATE VIEW table1_view as SELECT * FROM table1"
+	mock.ExpectQuery("show create table `db1`.`table1_view`").WillReturnRows(
+		sqlmock.NewRows([]string{"View", "Create", "charset", "collation"}).AddRow("table1_view", ddl, "utf8mb4", "utf8mb4_bin"),
+	).RowsWillBeClosed()
+	got, err := getCreateView("db1", "table1_view")
+	require.NoError(t, err)
+	require.Equal(t, ddl, got)
 }
