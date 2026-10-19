@@ -299,13 +299,14 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			}
 		}
 	}
-	var lowerCase int64
+	var mode viewSQLMode
 	if len(views) > 0 {
-		if err := conn.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCase); err != nil {
-			return fmt.Errorf("read lower_case_table_names: %w", err)
+		mode, err = getViewSQLMode(ctx)
+		if err != nil {
+			return fmt.Errorf("read view SQL mode: %w", err)
 		}
 	}
-	orderedViews, err := orderDumpViews(ctx, views, lowerCase)
+	orderedViews, err := orderDumpViews(ctx, views, mode)
 	if err != nil {
 		return err
 	}

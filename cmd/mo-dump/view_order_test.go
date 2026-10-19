@@ -50,7 +50,7 @@ func TestViewReferences(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "result"}, "CREATE VIEW result AS " + tt.query}, 1)
+			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "result"}, "CREATE VIEW result AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Len(t, refs, len(tt.refs))
 			for _, ref := range tt.refs {
@@ -78,9 +78,13 @@ func TestOrderDumpViews(t *testing.T) {
 		{name: "independent_literals", views: []dumpView{v("db", "va", "SELECT 'vb' AS x"), v("db", "vb", "SELECT 'va' AS x")}, order: []viewName{{"db", "va"}, {"db", "vb"}}},
 		{name: "external_dependency", views: []dumpView{v("a", "v", "SELECT * FROM b.v")}, order: []viewName{{"a", "v"}}},
 		{name: "self_cycle", views: []dumpView{v("db", "v", "SELECT * FROM v")}, err: "cyclic view dependencies"},
+		{name: "unused_cte_not_cycle", views: []dumpView{v("db", "v", "WITH unused AS (SELECT * FROM v) SELECT 1 AS x")}, order: []viewName{{"db", "v"}}},
+		{name: "dual_not_cycle", views: []dumpView{v("db", "dual", "SELECT 1 AS x FROM dual")}, order: []viewName{{"db", "dual"}}},
+		{name: "qualified_dual_self_cycle", views: []dumpView{v("db", "dual", "SELECT * FROM db.dual")}, err: "cyclic view dependencies"},
+		{name: "masked_outer_cte_orders_catalog_view", views: []dumpView{v("db", "a_shadow", "WITH x AS (SELECT 99 AS x) SELECT * FROM (WITH y AS (SELECT * FROM x), x AS (SELECT 7 AS x) SELECT * FROM y) q"), v("db", "x", "SELECT 5 AS x")}, order: []viewName{{"db", "x"}, {"db", "a_shadow"}}},
 		{name: "cross_database_cycle", views: []dumpView{v("a", "v", "SELECT * FROM b.v"), v("b", "v", "SELECT * FROM a.v")}, err: "cyclic view dependencies"},
 		{name: "partial_cycle", views: []dumpView{v("db", "ok", "SELECT 1"), v("db", "v", "SELECT * FROM v")}, err: "cyclic view dependencies"},
-		{name: "invalid", views: []dumpView{{viewName{"db", "v"}, "CREATE VIEW v AS SELECT FROM"}}, err: "parse view db.v"},
+		{name: "invalid", views: []dumpView{{viewName{"db", "v"}, "CREATE VIEW v AS SELECT FROM"}}, err: "analyze view db.v"},
 		{name: "not_a_view", views: []dumpView{{viewName{"db", "v"}, "SELECT 1"}}, err: "expected CREATE VIEW"},
 		{name: "duplicate", views: []dumpView{v("db", "v", "SELECT 1"), v("DB", "V", "SELECT 1")}, err: "duplicate view"},
 		{name: "multiple_statements", views: []dumpView{{viewName{"db", "v"}, "CREATE VIEW v AS SELECT 1; CREATE VIEW other AS SELECT 2"}}, err: "expected one CREATE VIEW"},
@@ -88,7 +92,7 @@ func TestOrderDumpViews(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			before := append([]dumpView(nil), tt.views...)
-			ordered, err := orderDumpViews(context.Background(), tt.views, 1)
+			ordered, err := orderDumpViews(context.Background(), tt.views, viewSQLMode{lowerCaseTableNames: 1})
 			require.Equal(t, before, tt.views, "sorting must not mutate the input, including on errors")
 			if tt.err != "" {
 				require.ErrorContains(t, err, tt.err)
@@ -113,17 +117,17 @@ func TestCaseSensitiveViews(t *testing.T) {
 		{viewName{"db", "v"}, "CREATE VIEW v AS SELECT * FROM db.V"},
 		{viewName{"db", "V"}, "CREATE VIEW V AS SELECT 1"},
 	}
-	ordered, err := orderDumpViews(context.Background(), views, 0)
-	require.NoError(t, err)
-	require.Equal(t, []dumpView{views[1], views[0]}, ordered)
-	for _, mode := range []int64{1, 2} {
-		_, err = orderDumpViews(context.Background(), views, mode)
-		require.ErrorContains(t, err, "duplicate view")
+	for _, mode := range []int64{0, 2} {
+		ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: mode})
+		require.NoError(t, err)
+		require.Equal(t, []dumpView{views[1], views[0]}, ordered)
 	}
-	refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "result"}, "CREATE VIEW result AS WITH v AS (SELECT 1) SELECT * FROM V"}, 0)
+	_, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
+	require.ErrorContains(t, err, "duplicate view")
+	refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "result"}, "CREATE VIEW result AS WITH v AS (SELECT 1) SELECT * FROM V"}, viewSQLMode{})
 	require.NoError(t, err)
 	require.Equal(t, map[viewName]struct{}{{"db", "V"}: {}}, refs)
-	refs, err = viewReferences(context.Background(), dumpView{viewName{"DB", "result"}, "CREATE VIEW result AS WITH V AS (SELECT 1) SELECT * FROM v JOIN OTHER.T ON true"}, 2)
+	refs, err = viewReferences(context.Background(), dumpView{viewName{"DB", "result"}, "CREATE VIEW result AS WITH V AS (SELECT 1) SELECT * FROM v JOIN OTHER.T ON true"}, viewSQLMode{lowerCaseTableNames: 2})
 	require.NoError(t, err)
-	require.Equal(t, map[viewName]struct{}{{"other", "t"}: {}}, refs)
+	require.Equal(t, map[viewName]struct{}{{"OTHER", "T"}: {}}, refs)
 }

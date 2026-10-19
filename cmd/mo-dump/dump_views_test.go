@@ -59,7 +59,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 					}
 				}
 			}
-			mock.ExpectQuery("SELECT @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
+			mock.ExpectQuery("select @@lower_case_table_names, @@sql_mode").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(1, ""))
 			opt := Options{dbs: dbs, emptyTables: true, noData: tt.noData, netBufferLength: defaultNetBufferLength}
 			require.NoError(t, opt.dumpData(context.Background()))
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -123,7 +123,7 @@ func TestDumpViewsFailure(t *testing.T) {
 			if failure == "data" {
 				steps = append(steps, queryStep{"data", "select * from `db`.`t`", nil})
 			} else {
-				steps = append(steps, queryStep{"case_setting", "SELECT @@lower_case_table_names", sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1)})
+				steps = append(steps, queryStep{"case_setting", "select @@lower_case_table_names, @@sql_mode", sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(1, "")})
 			}
 			for _, step := range steps {
 				expect := mock.ExpectQuery(step.query)
@@ -137,7 +137,7 @@ func TestDumpViewsFailure(t *testing.T) {
 			err := opt.dumpData(context.Background())
 			switch failure {
 			case "invalid_view":
-				require.ErrorContains(t, err, "parse view db.v")
+				require.ErrorContains(t, err, "analyze view db.v")
 			case "cycle":
 				require.ErrorContains(t, err, "cyclic view dependencies")
 			default:

@@ -162,7 +162,7 @@ func TestViewOrder(t *testing.T) {
 	for i := start; i < len(tables); i++ {
 		views = append(views, dumpView{name: viewName{"db", tables[i].Name}, create: createTable[i]})
 	}
-	ordered, err := orderDumpViews(context.Background(), views, 1)
+	ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
 	require.NoError(t, err)
 	require.Len(t, ordered, len(tables)-start)
 	for i, view := range ordered {
