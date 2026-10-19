@@ -288,7 +288,12 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			createTable[left], createTable[right] = createTable[right], createTable[left]
 			opt.tables[left], opt.tables[right] = opt.tables[right], opt.tables[left]
 		}
-		adjustViewOrder(createTable, opt.tables, left)
+		for left < len(opt.tables) && opt.tables[left].Kind != catalog.SystemViewRel {
+			left++
+		}
+		if err := adjustViewOrder(ctx, db, createTable, opt.tables, left); err != nil {
+			return err
+		}
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
@@ -343,52 +348,6 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	}
 
 	return conn, nil
-}
-
-func adjustViewOrder(createTable []string, tables Tables, start int) {
-	viewName := make([]string, 0)
-	viewPos := make(map[string]int)
-	cnt := len(tables)
-	for i := start; i < cnt; i++ {
-		viewPos[tables[i].Name] = i - start
-		viewName = append(viewName, tables[i].Name)
-	}
-	viewCount := make([]int, len(viewName))
-	viewRef := make([][]int, len(viewName))
-	for i := start; i < cnt; i++ {
-		for j := start; j < cnt; j++ {
-			if i == j {
-				continue
-			}
-			if strings.Count(createTable[i], tables[j].Name) > 0 {
-				viewCount[viewPos[tables[i].Name]]++
-				viewRef[viewPos[tables[j].Name]] = append(viewRef[viewPos[tables[j].Name]], viewPos[tables[i].Name])
-			}
-		}
-	}
-	order := 0
-	orderArr := make([]int, 0)
-	visit := make([]bool, len(viewName))
-	for order < len(viewName) {
-		for i := 0; i < len(viewName); i++ {
-			if viewCount[i] == 0 && !visit[i] {
-				visit[i] = true
-				order++
-				orderArr = append(orderArr, i)
-				for j := 0; j < len(viewRef[i]); j++ {
-					viewCount[viewRef[i][j]]--
-				}
-			}
-		}
-	}
-	newCreate := make([]string, cnt)
-	newTables := make([]Table, cnt)
-	for i := 0; i < len(orderArr); i++ {
-		newCreate[i] = createTable[orderArr[i]+start]
-		newTables[i] = tables[orderArr[i]+start]
-	}
-	_ = copy(createTable[start:], newCreate)
-	_ = copy(tables[start:], newTables)
 }
 
 func showCreateTable(createSql string, withNextLine bool) {
