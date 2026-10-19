@@ -539,7 +539,15 @@ func getCreateView(db, tbl string) (string, error) {
 func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
 	curBuf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		curBuf.Reset()
+		bufPool.Put(curBuf)
+	}()
 	buf.Grow(netBufferLength)
 	initInert := "INSERT INTO `" + tbl + "` VALUES "
 	for {
@@ -594,6 +602,9 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			buf.Write(curBuf.Bytes())
 			curBuf.Reset()
 		}
+		if err := r.Err(); err != nil {
+			return err
+		}
 		if buf.Len() > preLen {
 			buf.WriteString(";\n")
 			_, err = buf.WriteTo(os.Stdout)
@@ -605,12 +616,8 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		if curBuf.Len() > 0 {
 			continue
 		}
-		buf.Reset()
-		curBuf.Reset()
 		break
 	}
-	bufPool.Put(buf)
-	bufPool.Put(curBuf)
 	fmt.Printf("\n\n\n")
 	return nil
 }
@@ -653,7 +660,7 @@ func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvC
 			return err
 		}
 	}
-	return err
+	return r.Err()
 }
 
 // toCsvFields converts the result from mo to string
@@ -704,6 +711,7 @@ func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, l
 	if err != nil {
 		return err
 	}
+	defer r.Close()
 	colTypes, err := r.ColumnTypes()
 	if err != nil {
 		return err
