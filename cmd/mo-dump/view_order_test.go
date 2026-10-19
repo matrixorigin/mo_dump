@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -57,10 +58,54 @@ func TestViewDependencies(t *testing.T) {
 		{"nested scope restored", "select * from (with vb as (select 1 as x) select * from vb) s join vb using (x)", []string{"vb"}},
 		{"outer CTE visible", "with vb as (select 1 as x) select * from (select * from vb) s", nil},
 		{"nested CTE restores outer", "with vb as (select 1 as x) select * from (with vb as (select * from vc) select * from vb) s join vb using (x)", []string{"vc"}},
+		{"named window", "select sum(x) over w from vb window w as (order by x)", []string{"vb"}},
+		{"VALUES ROW", "values row(1)", nil},
+		{"VALUES subquery", "values row((select x from vb))", []string{"vb"}},
+		{"ROLLUP", "select x, count(*) from vb group by x with rollup", []string{"vb"}},
+		{"unused self CTE", "with unused as (select * from va) select 1 as x", nil},
+		{"unused external CTE", "with unused as (select * from vb) select * from vc", []string{"vc"}},
+		{"only reachable CTE", "with unused as (select * from va), used as (select * from vb) select * from used", []string{"vb"}},
+		{"reachable CTE chain", "with a as (select * from vb), b as (select * from a) select * from b join b c using(x)", []string{"vb"}},
+		{"unused recursive CTE", "with recursive unused as (select * from va union all select * from unused) select 1", nil},
+		{"reachable recursive CTE", "with recursive used as (select * from vb union all select * from used) select * from used", []string{"vb"}},
+		{"declaration scope not use site", "with a as (select * from vb) select * from (with vb as (select 1 as x) select * from a) s", []string{"vb"}},
+		{"CTE columns", "with vb(x) as (select x from vc) select * from vb", []string{"vc"}},
+		{"EXTRACT FROM", "select extract(year from ts) from vb", []string{"vb"}},
+		{"TRIM FROM subquery", "select trim(both 'x' from (select x from vb))", []string{"vb"}},
+		{"table valued function", "select * from vb('vc')", nil},
+		{"table function subquery", "select * from f((select x from vb))", []string{"vb"}},
+		{"lateral derived query", "select * from lateral (select * from vb) s", []string{"vb"}},
+		{"nested table groups", "select * from ((vb)) a join vc on a.x=vc.x", []string{"vb", "vc"}},
+		{"TABLE shorthand", "table vb", []string{"vb"}},
+		{"TABLE union", "table vb union all table vc", []string{"vb", "vc"}},
+		{"mixed TABLE union", "select * from vb union table vc", []string{"vb", "vc"}},
+		{"quoted keywords", "select `from` as `join` from `select`", []string{"select"}},
+		{"quoted punctuation", "select `(` as `,` from `(` as `,`", []string{"("}},
+		{"quoted numeric name", "select * from `123`", []string{"123"}},
+		{"quoted comma alias", "select * from vb as `,`, vc as `where`", []string{"vb", "vc"}},
+		{"double quoted literal", "select \"from vb\" as x", nil},
+		{"literal escaping", "select 'it\\'s from vb'", nil},
+		{"dollar string", "select $$'from vb$$", nil},
+		{"tagged dollar string", "select $tag$'from vb$tag$", nil},
+		{"executable comment", "select * /*!50000 from vb */", []string{"vb"}},
+		{"comment quote", "select 1 /* ' from vb */", nil},
+		{"end line comment", "select 1 -- ' from vb", nil},
+		{"hash comment", "select 1 # ' from vb", nil},
+		{"double minus arithmetic", "select 1--1 from vb", []string{"vb"}},
+		{"group boundary", "select x,y from vb group by x,y", []string{"vb"}},
+		{"window boundary", "select sum(x) over w from vb window w as (), z as ()", []string{"vb"}},
+		{"parenthesized query", "(select * from vb)", []string{"vb"}},
+		{"explicit nonreserved alias", "select * from vb as offset, vc", []string{"vb", "vc"}},
+		{"variable names", "select @from, @@join, @`(`", nil},
+		{"STRAIGHT_JOIN", "select * from vb straight_join vc on vb.x=vc.x", []string{"vb", "vc"}},
+		{"APPLY", "select * from vb cross apply (select * from vc) s", []string{"vb", "vc"}},
+		{"typed literals", "select X'66726f6d207662', B'01', date '2020-01-01', _binary'from vb'", nil},
+		{"snapshot reference", "select * from va{snapshot='historical'}", nil},
+		{"snapshot and current references", "select * from va{snapshot='historical'} a join vb using(x)", []string{"vb"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			refs, err := viewDependencies(context.Background(), "d", "create view va as "+tc.query)
+			refs, err := viewDependencies("d", "create view va as "+tc.query, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Equal(t, tc.refs, refs)
 		})
@@ -75,6 +120,7 @@ func TestViewOrderBoundaries(t *testing.T) {
 		start int
 		want  []string
 		err   string
+		mode  *viewSQLMode
 	}{
 		{name: "empty"},
 		{name: "ordinary table only", names: []string{"t"}, ddls: []string{"create table t(x int)"}, start: 1, want: []string{"t"}},
@@ -85,6 +131,11 @@ func TestViewOrderBoundaries(t *testing.T) {
 		{name: "ordinary prefix preserved", names: []string{"t", "va", "vb"}, ddls: []string{"create table t(x int)", "create view va as select * from d.vb", "create view vb as select * from t"}, start: 1, want: []string{"t", "vb", "va"}},
 		{name: "external schema not local cycle", names: []string{"va", "vb"}, ddls: []string{"create view va as select * from other.vb", "create view vb as select * from va"}, want: []string{"va", "vb"}},
 		{name: "case folded", names: []string{"Va", "Vb"}, ddls: []string{"create view Va as select * from `D`.`VB`", "create view Vb as select 1"}, want: []string{"Vb", "Va"}},
+		{name: "case sensitive identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select * from Va", "create view Va as select 1"}, want: []string{"Va", "va"}, mode: &viewSQLMode{}},
+		{name: "mode 2 preserves identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select * from Va", "create view Va as select 1"}, want: []string{"Va", "va"}, mode: &viewSQLMode{lowerCaseTableNames: 2}},
+		{name: "CTE declaration normalization", names: []string{"v"}, ddls: []string{"create view v as with V as (select 1 as x) select * from v"}, want: []string{"v"}, mode: &viewSQLMode{}},
+		{name: "folded duplicate identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select 1", "create view Va as select 1"}, err: "duplicate view identity"},
+		{name: "unused CTE no self cycle", names: []string{"v"}, ddls: []string{"create view v as with unused as (select * from v) select 1 as x"}, want: []string{"v"}},
 		{name: "cycle", names: []string{"va", "vb"}, ddls: []string{"create view va as select * from vb", "create view vb as select * from va"}, err: "blocked views: va, vb"},
 		{name: "self reference", names: []string{"va"}, ddls: []string{"create view va as select * from va"}, err: "blocked views: va"},
 		{name: "partial progress", names: []string{"va", "free", "vb", "downstream"}, ddls: []string{"create view va as select * from vb", "create view free as select 1", "create view vb as select * from va", "create view downstream as select * from va"}, err: "blocked views: va, vb, downstream"},
@@ -102,7 +153,11 @@ func TestViewOrderBoundaries(t *testing.T) {
 			}
 			originalDDL := append([]string(nil), tc.ddls...)
 			originalTables := append(Tables{}, tables...)
-			err := adjustViewOrder(context.Background(), "d", tc.ddls, tables, tc.start)
+			mode := viewSQLMode{lowerCaseTableNames: 1}
+			if tc.mode != nil {
+				mode = *tc.mode
+			}
+			err := adjustViewOrder(context.Background(), "d", tc.ddls, tables, tc.start, mode)
 			if tc.err != "" {
 				require.ErrorContains(t, err, tc.err)
 				require.Equal(t, originalDDL, tc.ddls)
@@ -122,10 +177,12 @@ func TestDumpDataViewOrder(t *testing.T) {
 	cases := []struct {
 		name, kind, ddl, second string
 		err                     string
+		modeError               bool
 	}{
 		{name: "independent views", kind: catalog.SystemViewRel, ddl: "create view va as select 'vb' as marker", second: "create view vb as select 'va' as marker"},
 		{name: "cycle error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select * from vb", second: "create view vb as select * from va", err: "cyclic view dependencies"},
 		{name: "parse error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select from", err: "cannot order view d.va"},
+		{name: "mode query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read view SQL mode", modeError: true},
 		{name: "one ordinary table", kind: catalog.SystemOrdinaryRel, ddl: "create table va (x int)"},
 		{name: "empty database"},
 	}
@@ -162,6 +219,14 @@ func TestDumpDataViewOrder(t *testing.T) {
 				mock.ExpectQuery("show create table `d`.`va`").WillReturnRows(definition)
 				if tc.second != "" {
 					mock.ExpectQuery("show create table `d`.`vb`").WillReturnRows(sqlmock.NewRows(columns).AddRow("vb", tc.second, "utf8mb4", "utf8mb4_bin"))
+				}
+			}
+			if tc.kind == catalog.SystemViewRel {
+				query := mock.ExpectQuery("select @@lower_case_table_names, @@sql_mode")
+				if tc.modeError {
+					query.WillReturnError(errors.New("mode query failed"))
+				} else {
+					query.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(1, ""))
 				}
 			}
 			opt := Options{dbs: []string{"d"}, emptyTables: true, noData: true}

@@ -291,8 +291,14 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for left < len(opt.tables) && opt.tables[left].Kind != catalog.SystemViewRel {
 			left++
 		}
-		if err := adjustViewOrder(ctx, db, createTable, opt.tables, left); err != nil {
-			return err
+		if left < len(opt.tables) {
+			mode, err := getViewSQLMode(ctx)
+			if err != nil {
+				return fmt.Errorf("cannot read view SQL mode: %w", err)
+			}
+			if err := adjustViewOrder(ctx, db, createTable, opt.tables, left, mode); err != nil {
+				return err
+			}
 		}
 		for i, create := range createTable {
 			tbl := opt.tables[i]
