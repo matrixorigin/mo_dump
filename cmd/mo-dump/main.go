@@ -195,6 +195,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	var (
 		createDb    string
 		createTable []string
+		views       []dumpView
 		err         error
 	)
 
@@ -274,21 +275,6 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				return &bytes.Buffer{}
 			},
 		}
-		left, right := 0, len(createTable)-1
-		for left < right {
-			for left < len(createTable) && opt.tables[left].Kind != catalog.SystemViewRel {
-				left++
-			}
-			for right >= 0 && opt.tables[right].Kind == catalog.SystemViewRel {
-				right--
-			}
-			if left >= right {
-				break
-			}
-			createTable[left], createTable[right] = createTable[right], createTable[left]
-			opt.tables[left], opt.tables[right] = opt.tables[right], opt.tables[left]
-		}
-		adjustViewOrder(createTable, opt.tables, left)
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
@@ -306,13 +292,27 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
-				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, true)
+				views = append(views, dumpView{name: viewName{database: db, name: tbl.Name}, create: create})
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
 		}
+	}
+	var lowerCase int64
+	if len(views) > 0 {
+		if err := conn.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCase); err != nil {
+			return fmt.Errorf("read lower_case_table_names: %w", err)
+		}
+	}
+	orderedViews, err := orderDumpViews(ctx, views, lowerCase)
+	if err != nil {
+		return err
+	}
+	for _, view := range orderedViews {
+		fmt.Printf("USE %s;\n\n", quoteIdentifier(view.name.database))
+		fmt.Printf("DROP VIEW IF EXISTS %s;\n", quoteIdentifier(view.name.name))
+		showCreateTable(view.create, true)
 	}
 	// reset foreign_key_checks variable to dump file
 	fmt.Println("SET foreign_key_checks = 1;")
@@ -343,52 +343,6 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	}
 
 	return conn, nil
-}
-
-func adjustViewOrder(createTable []string, tables Tables, start int) {
-	viewName := make([]string, 0)
-	viewPos := make(map[string]int)
-	cnt := len(tables)
-	for i := start; i < cnt; i++ {
-		viewPos[tables[i].Name] = i - start
-		viewName = append(viewName, tables[i].Name)
-	}
-	viewCount := make([]int, len(viewName))
-	viewRef := make([][]int, len(viewName))
-	for i := start; i < cnt; i++ {
-		for j := start; j < cnt; j++ {
-			if i == j {
-				continue
-			}
-			if strings.Count(createTable[i], tables[j].Name) > 0 {
-				viewCount[viewPos[tables[i].Name]]++
-				viewRef[viewPos[tables[j].Name]] = append(viewRef[viewPos[tables[j].Name]], viewPos[tables[i].Name])
-			}
-		}
-	}
-	order := 0
-	orderArr := make([]int, 0)
-	visit := make([]bool, len(viewName))
-	for order < len(viewName) {
-		for i := 0; i < len(viewName); i++ {
-			if viewCount[i] == 0 && !visit[i] {
-				visit[i] = true
-				order++
-				orderArr = append(orderArr, i)
-				for j := 0; j < len(viewRef[i]); j++ {
-					viewCount[viewRef[i][j]]--
-				}
-			}
-		}
-	}
-	newCreate := make([]string, cnt)
-	newTables := make([]Table, cnt)
-	for i := 0; i < len(orderArr); i++ {
-		newCreate[i] = createTable[orderArr[i]+start]
-		newTables[i] = tables[orderArr[i]+start]
-	}
-	_ = copy(createTable[start:], newCreate)
-	_ = copy(tables[start:], newTables)
 }
 
 func showCreateTable(createSql string, withNextLine bool) {

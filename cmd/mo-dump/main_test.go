@@ -158,10 +158,16 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	adjustViewOrder(createTable, tables, start)
-	for i := 0; i < len(createTable); i++ {
-		require.Equal(t, createTable[i], createTarget[i])
-		require.Equal(t, tables[i], tableTarget[i])
+	views := make([]dumpView, 0, len(tables)-start)
+	for i := start; i < len(tables); i++ {
+		views = append(views, dumpView{name: viewName{"db", tables[i].Name}, create: createTable[i]})
+	}
+	ordered, err := orderDumpViews(context.Background(), views, 1)
+	require.NoError(t, err)
+	require.Len(t, ordered, len(tables)-start)
+	for i, view := range ordered {
+		require.Equal(t, createTarget[i+start], view.create)
+		require.Equal(t, tableTarget[i+start].Name, view.name.name)
 	}
 }
 
