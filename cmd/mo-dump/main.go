@@ -603,6 +603,10 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			continue
 		}
 		if curBuf.Len() > 0 {
+			//matrixone#30638: nothing was emitted above; drop the unflushed
+			// header so the carried-over oversized row is not preceded by a
+			// duplicated INSERT statement prefix.
+			buf.Reset()
 			continue
 		}
 		buf.Reset()
