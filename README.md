@@ -37,7 +37,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 ### 构建 mo-dump 二进制文件
 __Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</a>（支持自动工具链选择的 Go 1.21 或更新版本）、C/C++ 编译器、`make`、`tar` 和 `shasum`。构建会选用 `go.mod` 指定的 Go 1.26.4，从固定版本 MatrixOne 模块的已校验源码归档构建静态 jemalloc，不需要安装整个 MatrixOne 内核或在运行时携带 jemalloc 动态库。
 
-视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集。保留原始视图 DDL，对真实循环返回错误而不是无限重排。跨库或未选中的外部依赖仍需在恢复环境中可用。
+视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集。保留原始视图 DDL，对真实循环返回错误而不是无限重排。依赖分析使用每个视图在 `mo_catalog.mo_tables.viewdef` 中持久化的创建语句、默认库及解析模式，不使用导出连接的 SQL mode 猜测视图语法；历史记录缺少模式字段时遵循服务端 legacy 规则。元数据缺失或损坏会明确报错，不猜测回退。恢复文件仍保留服务端提供的 DDL，恢复会话须使用适合这些 DDL 的模式；不会自动为各视图插入 `SET sql_mode`。跨库或未选中的外部依赖仍需在恢复环境中可用。
 
 1. 执行下面的代码即可从 MatrixOrigin/mo_dump 源代码构建 `mo-dump` 二进制文件：
 

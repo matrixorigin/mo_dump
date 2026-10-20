@@ -158,7 +158,7 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	require.NoError(t, adjustViewOrder(context.Background(), "d", createTable, tables, start, viewSQLMode{lowerCaseTableNames: 1}))
+	require.NoError(t, adjustViewOrder(context.Background(), "d", createTable, tables, start, viewSQLMode{lowerCaseTableNames: 1}, nil))
 	for i := 0; i < len(createTable); i++ {
 		require.Equal(t, createTable[i], createTarget[i])
 		require.Equal(t, tables[i], tableTarget[i])

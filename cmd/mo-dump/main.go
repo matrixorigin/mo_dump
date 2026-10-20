@@ -292,11 +292,15 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			left++
 		}
 		if left < len(opt.tables) {
-			mode, err := getViewSQLMode(ctx)
+			mode, err := getViewCatalogMode(ctx)
 			if err != nil {
-				return fmt.Errorf("cannot read view SQL mode: %w", err)
+				return fmt.Errorf("cannot read view catalog mode: %w", err)
 			}
-			if err := adjustViewOrder(ctx, db, createTable, opt.tables, left, mode); err != nil {
+			definitions, err := getViewDefinitions(ctx, db, opt.tables[left:], opt.sysAccount)
+			if err != nil {
+				return err
+			}
+			if err := adjustViewOrder(ctx, db, createTable, opt.tables, left, mode, definitions); err != nil {
 				return err
 			}
 		}

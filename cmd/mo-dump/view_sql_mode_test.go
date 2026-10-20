@@ -98,7 +98,7 @@ func TestViewDependencyMalformedStructure(t *testing.T) {
 	}
 }
 
-func TestGetViewSQLMode(t *testing.T) {
+func TestGetViewCatalogMode(t *testing.T) {
 	for _, value := range []int64{-1, 0, 1, 2, 3} {
 		t.Run(fmt.Sprint(value), func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -107,15 +107,16 @@ func TestGetViewSQLMode(t *testing.T) {
 			old := conn
 			conn = db
 			t.Cleanup(func() { conn = old })
-			mock.ExpectQuery("select @@lower_case_table_names, @@sql_mode").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(value, " ANSI_QUOTES,NO_BACKSLASH_ESCAPES "))
-			mode, err := getViewSQLMode(context.Background())
+			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(value))
+			mode, err := getViewCatalogMode(context.Background())
 			if value < 0 || value > 2 {
 				require.ErrorContains(t, err, "unsupported lower_case_table_names")
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, value, mode.lowerCaseTableNames)
-				require.True(t, mode.ansiQuotes)
-				require.True(t, mode.noBackslashEscapes)
+				require.False(t, mode.ansiQuotes)
+				require.False(t, mode.noBackslashEscapes)
+				require.Empty(t, mode.sqlMode)
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 			mock.ExpectClose()
@@ -128,7 +129,7 @@ func TestViewOrderCancelled(t *testing.T) {
 	cancel()
 	ddls := []string{"create view a as select * from b", "create view b as select 1"}
 	tables := Tables{{Name: "a"}, {Name: "b"}}
-	err := adjustViewOrder(ctx, "d", ddls, tables, 0, viewSQLMode{})
+	err := adjustViewOrder(ctx, "d", ddls, tables, 0, viewSQLMode{}, nil)
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, []string{"create view a as select * from b", "create view b as select 1"}, ddls)
 	require.Equal(t, Tables{{Name: "a"}, {Name: "b"}}, tables)

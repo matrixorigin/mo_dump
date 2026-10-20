@@ -87,7 +87,7 @@ func TestViewTableFactorErrors(t *testing.T) {
 func TestViewImplicitAliasRestoreOrder(t *testing.T) {
 	ddl := []string{"create view a_dep as select offset.x from t offset, z_root", "create view z_root as select 1 as x"}
 	tables := Tables{{Name: "a_dep"}, {Name: "z_root"}}
-	require.NoError(t, adjustViewOrder(context.Background(), "d", ddl, tables, 0, viewSQLMode{lowerCaseTableNames: 1}))
+	require.NoError(t, adjustViewOrder(context.Background(), "d", ddl, tables, 0, viewSQLMode{lowerCaseTableNames: 1}, nil))
 	require.Equal(t, Tables{{Name: "z_root"}, {Name: "a_dep"}}, tables)
 }
 

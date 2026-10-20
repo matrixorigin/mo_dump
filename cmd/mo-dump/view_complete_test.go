@@ -27,6 +27,10 @@ func TestViewCompleteSyntax(t *testing.T) {
 		name, query string
 		refs        []string
 	}{
+		{"parenthesized WITH visible to outer ORDER BY", "SELECT * FROM ((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x) ORDER BY (SELECT x FROM q))s", []string{"z_root"}},
+		{"parenthesized WITH prevents false self edge", "SELECT * FROM ((WITH a_dep AS(SELECT 1 AS x) SELECT 1 AS x) ORDER BY (SELECT x FROM a_dep))s", nil},
+		{"unwrapped WITH ORDER BY control", "SELECT * FROM (WITH q AS(SELECT x FROM z_root) SELECT 1 AS x ORDER BY (SELECT x FROM q))s", []string{"z_root"}},
+		{"deep parenthesized WITH ORDER BY", "SELECT * FROM ((((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x))) ORDER BY (SELECT x FROM q))s", []string{"z_root"}},
 		{"unshadowed outer CTE remains visible", "WITH z_root AS(SELECT 999 AS x) SELECT * FROM(WITH used AS(SELECT x FROM z_root) SELECT * FROM used)s", nil},
 		{"later CTE masks outer definition", "WITH z_root AS(SELECT 999 AS x) SELECT * FROM(WITH used AS(SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used)s", []string{"z_root"}},
 		{"masked outer CTE stays unused", "WITH z_root AS(SELECT x FROM a_dep) SELECT * FROM(WITH used AS(SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used)s", []string{"z_root"}},
@@ -56,6 +60,8 @@ func TestViewCompleteSyntax(t *testing.T) {
 
 func TestViewCompleteRestoreOrder(t *testing.T) {
 	for _, query := range []string{
+		"SELECT * FROM ((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x) ORDER BY (SELECT x FROM q))s",
+		"SELECT * FROM ((((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x))) ORDER BY (SELECT x FROM q))s",
 		"WITH z_root AS(SELECT 999 AS x) SELECT * FROM(WITH used AS(SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used)s",
 		"WITH z_root AS(SELECT x FROM a_dep) SELECT * FROM(WITH used AS(SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used)s",
 		"SELECT * FROM ((SELECT 1 AS x) UNION ALL SELECT x FROM z_root) s",
@@ -66,7 +72,7 @@ func TestViewCompleteRestoreOrder(t *testing.T) {
 		t.Run(query, func(t *testing.T) {
 			ddls := []string{"CREATE VIEW a_dep AS " + query, "CREATE VIEW z_root AS SELECT 1 AS x"}
 			tables := Tables{{Name: "a_dep", Kind: "v"}, {Name: "z_root", Kind: "v"}}
-			require.NoError(t, adjustViewOrder(context.Background(), "d", ddls, tables, 0, viewSQLMode{lowerCaseTableNames: 1}))
+			require.NoError(t, adjustViewOrder(context.Background(), "d", ddls, tables, 0, viewSQLMode{lowerCaseTableNames: 1}, nil))
 			require.Equal(t, "z_root", tables[0].Name)
 			require.Equal(t, "CREATE VIEW z_root AS SELECT 1 AS x", ddls[0])
 			require.Equal(t, "a_dep", tables[1].Name)

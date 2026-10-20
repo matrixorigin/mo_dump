@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -157,7 +158,7 @@ func TestViewOrderBoundaries(t *testing.T) {
 			if tc.mode != nil {
 				mode = *tc.mode
 			}
-			err := adjustViewOrder(context.Background(), "d", tc.ddls, tables, tc.start, mode)
+			err := adjustViewOrder(context.Background(), "d", tc.ddls, tables, tc.start, mode, nil)
 			if tc.err != "" {
 				require.ErrorContains(t, err, tc.err)
 				require.Equal(t, originalDDL, tc.ddls)
@@ -178,11 +179,13 @@ func TestDumpDataViewOrder(t *testing.T) {
 		name, kind, ddl, second string
 		err                     string
 		modeError               bool
+		metadataError           bool
 	}{
 		{name: "independent views", kind: catalog.SystemViewRel, ddl: "create view va as select 'vb' as marker", second: "create view vb as select 'va' as marker"},
 		{name: "cycle error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select * from vb", second: "create view vb as select * from va", err: "cyclic view dependencies"},
 		{name: "parse error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select from", err: "cannot order view d.va"},
-		{name: "mode query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read view SQL mode", modeError: true},
+		{name: "mode query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read view catalog mode", modeError: true},
+		{name: "metadata query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read persisted view definitions", metadataError: true},
 		{name: "one ordinary table", kind: catalog.SystemOrdinaryRel, ddl: "create table va (x int)"},
 		{name: "empty database"},
 	}
@@ -222,11 +225,25 @@ func TestDumpDataViewOrder(t *testing.T) {
 				}
 			}
 			if tc.kind == catalog.SystemViewRel {
-				query := mock.ExpectQuery("select @@lower_case_table_names, @@sql_mode")
+				query := mock.ExpectQuery("select @@lower_case_table_names")
 				if tc.modeError {
 					query.WillReturnError(errors.New("mode query failed"))
 				} else {
-					query.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(1, ""))
+					query.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
+					definitions := sqlmock.NewRows([]string{"relname", "viewdef"})
+					payload, err := json.Marshal(viewDefinition{Stmt: tc.ddl, DefaultDatabase: "d"})
+					require.NoError(t, err)
+					definitions.AddRow("va", string(payload))
+					if tc.second != "" {
+						payload, err = json.Marshal(viewDefinition{Stmt: tc.second, DefaultDatabase: "d"})
+						require.NoError(t, err)
+						definitions.AddRow("vb", string(payload))
+					}
+					if tc.metadataError {
+						mock.ExpectQuery("select relname,viewdef").WillReturnError(errors.New("view metadata unavailable"))
+					} else {
+						mock.ExpectQuery("select relname,viewdef").WillReturnRows(definitions).RowsWillBeClosed()
+					}
 				}
 			}
 			opt := Options{dbs: []string{"d"}, emptyTables: true, noData: true}
