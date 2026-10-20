@@ -169,8 +169,36 @@ type viewRefWalker struct {
 type viewCTEBinding struct {
 	name     string
 	stmt     tree.Statement
-	visible  []*viewCTEBinding
+	visible  *viewCTEScope
 	expanded bool
+}
+
+// A declaration sees earlier bindings, but later names mask outer scopes.
+// Both slices share the WITH's immutable declaration list.
+type viewCTEScope struct {
+	parent   *viewCTEScope
+	bindings []*viewCTEBinding
+	masked   []*viewCTEBinding
+}
+
+// Masks remain active inside nested queries of a CTE definition, including
+// nested WITH declarations. Like the binder, check them before visible names.
+func (scope *viewCTEScope) lookup(name string) *viewCTEBinding {
+	for current := scope; current != nil; current = current.parent {
+		for _, binding := range current.masked {
+			if name == binding.name {
+				return nil
+			}
+		}
+	}
+	for current := scope; current != nil; current = current.parent {
+		for i := len(current.bindings) - 1; i >= 0; i-- {
+			if name == current.bindings[i].name {
+				return current.bindings[i]
+			}
+		}
+	}
+	return nil
 }
 
 func (w *viewRefWalker) expand(binding *viewCTEBinding, required bool) {
@@ -182,7 +210,7 @@ func (w *viewRefWalker) expand(binding *viewCTEBinding, required bool) {
 
 var viewTreePackage = reflect.TypeOf(tree.Select{}).PkgPath()
 
-func (w *viewRefWalker) walk(value reflect.Value, ctes []*viewCTEBinding, required bool) {
+func (w *viewRefWalker) walk(value reflect.Value, ctes *viewCTEScope, required bool) {
 	if !value.IsValid() {
 		return
 	}
@@ -201,20 +229,19 @@ func (w *viewRefWalker) walk(value reflect.Value, ctes []*viewCTEBinding, requir
 		switch node := value.Interface().(type) {
 		case *tree.Select:
 			if node.With != nil {
-				// Own the scope's backing storage so nested declarations cannot
-				// overwrite the names visible to a following sibling query.
-				scope := make([]*viewCTEBinding, len(ctes), len(ctes)+len(node.With.CTEs))
-				copy(scope, ctes)
-				ctes = scope
-				for _, cte := range node.With.CTEs {
-					binding := &viewCTEBinding{name: string(cte.Name.Alias), stmt: cte.Stmt}
-					binding.visible = ctes
-					ctes = append(ctes, binding)
+				bindings := make([]*viewCTEBinding, len(node.With.CTEs))
+				for i, cte := range node.With.CTEs {
+					bindings[i] = &viewCTEBinding{name: string(cte.Name.Alias), stmt: cte.Stmt}
+				}
+				for i, binding := range bindings {
+					end := i
 					if node.With.IsRecursive {
-						binding.visible = ctes
+						end++
 					}
+					binding.visible = &viewCTEScope{parent: ctes, bindings: bindings[:end], masked: bindings[i+1:]}
 					w.pending = append(w.pending, binding)
 				}
+				ctes = &viewCTEScope{parent: ctes, bindings: bindings}
 			}
 			w.walkFields(value.Elem(), ctes, required, "With")
 			return
@@ -227,11 +254,9 @@ func (w *viewRefWalker) walk(value reflect.Value, ctes []*viewCTEBinding, requir
 				if name == "" || name == "dual" {
 					return
 				}
-				for i := len(ctes) - 1; i >= 0; i-- {
-					if name == ctes[i].name {
-						w.expand(ctes[i], required)
-						return
-					}
+				if binding := ctes.lookup(name); binding != nil {
+					w.expand(binding, required)
+					return
 				}
 			}
 			w.emit(node, required)
@@ -259,7 +284,7 @@ func (w *viewRefWalker) walk(value reflect.Value, ctes []*viewCTEBinding, requir
 	}
 }
 
-func (w *viewRefWalker) walkFields(value reflect.Value, ctes []*viewCTEBinding, required bool, skip string) {
+func (w *viewRefWalker) walkFields(value reflect.Value, ctes *viewCTEScope, required bool, skip string) {
 	if value.Type().PkgPath() != viewTreePackage {
 		return
 	}

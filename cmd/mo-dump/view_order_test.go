@@ -53,6 +53,16 @@ func TestCollectViewRelations(t *testing.T) {
 		{"used chain", "WITH x AS (SELECT * FROM parent), y AS (SELECT * FROM x) SELECT * FROM y JOIN y again", 0, []string{"parent"}},
 		{"late required", "WITH p AS (SELECT * FROM parent) SELECT (WITH unused AS (SELECT * FROM p) SELECT 1), (SELECT count(*) FROM p)", 0, []string{"parent"}},
 		{"definition scope", "WITH p AS (SELECT * FROM parent), q AS (SELECT * FROM p) SELECT * FROM (WITH p AS (SELECT * FROM other) SELECT * FROM q) x", 0, []string{"parent", "?other"}},
+		{"forward masks outer", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"p"}},
+		{"no forward mask", "WITH p AS (SELECT * FROM parent) SELECT * FROM (WITH x AS (SELECT * FROM p) SELECT * FROM x) q", 0, []string{"parent"}},
+		{"earlier local shadows outer", "WITH p AS (SELECT * FROM parent) SELECT * FROM (WITH p AS (SELECT * FROM local_parent), x AS (SELECT * FROM p) SELECT * FROM x) q", 0, []string{"local_parent", "?parent"}},
+		{"earlier captured binding bypasses mask", "WITH p AS (SELECT * FROM parent), q AS (SELECT * FROM p) SELECT * FROM (WITH x AS (SELECT * FROM q), p AS (SELECT 7 AS id) SELECT * FROM x) r", 0, []string{"parent"}},
+		{"forward mask advisory", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT 1) q", 0, []string{"?p"}},
+		{"recursive forward masks outer", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH RECURSIVE x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"p"}},
+		{"forward mask nested scope", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM (SELECT * FROM p) r), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"p"}},
+		{"inherited mask precedes inner binding", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (WITH p AS (SELECT * FROM parent) SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"p", "?parent"}},
+		{"forward mask folded name", "WITH P AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM P), P AS (SELECT 7 AS id) SELECT * FROM x) q", 1, []string{"P"}},
+		{"qualified bypasses forward mask", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM d.p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"d.p"}},
 		{"table function", "SELECT * FROM generate_series((SELECT max(id) FROM p), 10) q", 0, []string{"p"}},
 		{"dual", "SELECT 1 FROM dual", 0, nil},
 	} {
@@ -88,6 +98,7 @@ func TestViewOrderDependencies(t *testing.T) {
 		{"prefix", "d", "parent", "SELECT * FROM parent_suffix", 0, false},
 		{"literal", "d", "parent", "SELECT 'parent' AS parent", 0, false},
 		{"cte", "d", "parent", "WITH parent AS (SELECT 1) SELECT * FROM parent", 0, false},
+		{"nested forward shadow", "d", "p", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, true},
 		{"case zero", "D", "Parent", "SELECT * FROM d.parent", 0, false},
 		{"case one", "D", "Parent", "SELECT * FROM d.parent", 1, true},
 		{"case two", "D", "Parent", "SELECT * FROM d.parent", 2, false},
@@ -145,21 +156,26 @@ func TestViewOrderFailureIsAtomic(t *testing.T) {
 }
 
 func TestDumpViewDependencies(t *testing.T) {
-	for _, mode := range []string{"ordered", "mode error", "parse error", "cycle"} {
+	for _, mode := range []string{"ordered", "nested forward shadow", "mode error", "parse error", "cycle"} {
 		t.Run(mode, func(t *testing.T) {
 			mock := newIdentifierMock(t)
-			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a_child"}, {Name: "z`parent"}}, noData: true}
-			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
-			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?,?)").WithArgs("d", "a_child", "z`parent").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_child", catalog.SystemViewRel).AddRow("z`parent", catalog.SystemViewRel))
+			parentName := "z`parent"
 			child := "CREATE VIEW a_child AS SELECT * FROM `z``parent`"
-			parent := "CREATE VIEW `z``parent` AS SELECT 1"
+			if mode == "nested forward shadow" {
+				parentName = "p"
+				child = "CREATE VIEW a_child AS WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q"
+			}
+			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a_child"}, {Name: parentName}}, noData: true}
+			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
+			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?,?)").WithArgs("d", "a_child", parentName).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_child", catalog.SystemViewRel).AddRow(parentName, catalog.SystemViewRel))
+			parent := "CREATE VIEW " + quoteIdentifier(parentName) + " AS SELECT 1"
 			if mode == "parse error" {
 				child = "CREATE VIEW a_child AS SELECT * FROM"
 			}
 			if mode == "cycle" {
 				parent = "CREATE VIEW `z``parent` AS SELECT * FROM a_child"
 			}
-			for _, v := range []struct{ name, ddl string }{{"a_child", child}, {"z`parent", parent}} {
+			for _, v := range []struct{ name, ddl string }{{"a_child", child}, {parentName, parent}} {
 				mock.ExpectQuery("show create table `d`." + quoteIdentifier(v.name)).WillReturnRows(sqlmock.NewRows([]string{"View", "Create", "charset", "collation"}).AddRow(v.name, v.ddl, "utf8mb4", "utf8mb4_bin"))
 			}
 			expected := mock.ExpectQuery("select @@lower_case_table_names")
@@ -171,9 +187,9 @@ func TestDumpViewDependencies(t *testing.T) {
 			}
 			var err error
 			output := captureIdentifierOutput(t, func() { err = opt.dumpData(context.Background()) })
-			if mode == "ordered" {
+			if mode == "ordered" || mode == "nested forward shadow" {
 				require.NoError(t, err)
-				require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP VIEW IF EXISTS `z``parent`;\n"+parent+";\n\n\nDROP VIEW IF EXISTS `a_child`;\n"+child+";\n\n\nSET foreign_key_checks = 1;\n", output)
+				require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP VIEW IF EXISTS "+quoteIdentifier(parentName)+";\n"+parent+";\n\n\nDROP VIEW IF EXISTS `a_child`;\n"+child+";\n\n\nSET foreign_key_checks = 1;\n", output)
 			} else {
 				require.Error(t, err)
 				if mode == "mode error" {
