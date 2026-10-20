@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -704,20 +705,34 @@ func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []s
 }
 
 func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
-	queryConn, err := conn.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer queryConn.Close()
-
 	querySql := "select * from `" + db + "`.`" + tbl + "`"
 	if condition != "" {
 		querySql += " where " + condition
 	}
-	r, err := queryConn.QueryContext(context.Background(), querySql)
+
+	// Match DB.Query's three-attempt budget, but retain exclusive ownership of
+	// the successful connection. Never retry once a result set is returned.
+	const maxQueryAttempts = 3
+	var queryConn *sql.Conn
+	var r *sql.Rows
+	for attempt := 0; attempt < maxQueryAttempts; attempt++ {
+		queryConn, err = conn.Conn(context.Background())
+		if err != nil {
+			return err
+		}
+		r, err = queryConn.QueryContext(context.Background(), querySql)
+		if err == nil {
+			break
+		}
+		_ = queryConn.Close()
+		if !errors.Is(err, driver.ErrBadConn) {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
+	defer queryConn.Close()
 	defer func() {
 		if err != nil {
 			// MySQL Rows.Close drains unread results. Abort the physical connection
