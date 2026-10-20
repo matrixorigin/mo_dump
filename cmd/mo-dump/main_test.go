@@ -409,7 +409,7 @@ func TestGetCreateTable(t *testing.T) {
 func TestGetDumpView(t *testing.T) {
 	mock, _ := mockDumpOutput(t)
 	create := "CREATE VIEW table1_view as SELECT * FROM table1"
-	mock.ExpectQuery("select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, create, "")))
+	mock.ExpectQuery("select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "db1", create, "")))
 	view, err := getDumpView(context.Background(), "db1", "table1_view", false)
 	require.NoError(t, err)
 	require.Equal(t, viewName{"db1", "table1_view"}, view.name)

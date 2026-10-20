@@ -52,7 +52,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 				}
 				mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + name + "'").WillReturnRows(rows)
 				if name == "view_db" {
-					mock.ExpectQuery("select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'").WithArgs("view_db", "v").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "")))
+					mock.ExpectQuery("select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'").WithArgs("view_db", "v").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "view_db", "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "")))
 				} else {
 					mock.ExpectQuery("show create table `data_db`.`t`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (id INT PRIMARY KEY, v DECIMAL(10,2))"))
 					if !tt.noData {
@@ -83,9 +83,9 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 	}
 }
 
-func viewDefinitionJSON(t *testing.T, create, sqlMode string) string {
+func viewDefinitionJSON(t *testing.T, database, create, sqlMode string) string {
 	t.Helper()
-	encoded, err := json.Marshal(map[string]string{"Stmt": create, "sql_mode": sqlMode})
+	encoded, err := json.Marshal(map[string]string{"Stmt": create, "DefaultDatabase": database, "sql_mode": sqlMode})
 	require.NoError(t, err)
 	return string(encoded)
 }
@@ -125,7 +125,7 @@ func TestDumpViewsFailure(t *testing.T) {
 				{"database", "select datname, dat_type from mo_catalog.mo_database where datname = 'db'", sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", "")},
 				{"database_ddl", "show create database `db`", sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db")},
 				{"tables", "select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'", sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("v", catalog.SystemViewRel).AddRow("t", catalog.SystemOrdinaryRel)},
-				{"view_ddl", "select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'", sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, create, ""))},
+				{"view_ddl", "select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'", sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "db", create, ""))},
 				{"table_ddl", "show create table `db`.`t`", sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)")},
 			}
 			if failure == "data" {

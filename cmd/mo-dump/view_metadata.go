@@ -26,6 +26,7 @@ import (
 // Explicitly persisted empty SQLMode and zero name mode must remain distinct.
 type viewDefinition struct {
 	Stmt                string
+	DefaultDatabase     *string
 	SQLMode             *string `json:"sql_mode"`
 	LowerCaseTableNames *int64  `json:"lower_case_table_names"`
 }
@@ -56,6 +57,11 @@ func getDumpView(ctx context.Context, database, name string, isSys bool) (dumpVi
 	}
 	if definition == nil || strings.TrimSpace(definition.Stmt) == "" {
 		return dumpView{}, fmt.Errorf("view definition %s.%s has no statement", database, name)
+	}
+	// The server's string field decodes absent/null as a known empty default.
+	if definition.DefaultDatabase == nil {
+		empty := ""
+		definition.DefaultDatabase = &empty
 	}
 	if lower := definition.LowerCaseTableNames; lower != nil && (*lower < 0 || *lower > 2) {
 		return dumpView{}, fmt.Errorf("view definition %s.%s has unsupported lower_case_table_names: %d", database, name, *lower)
@@ -101,8 +107,10 @@ func showDumpView(view dumpView) {
 		flags := viewParserMode(view.definition.parserMode())
 		fmt.Printf("SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH ',' FROM %s), ''), NULLIF(X'%x', ''));\n", target, flags)
 	}
-	fmt.Printf("USE %s;\n\n", quoteIdentifier(view.name.database))
-	fmt.Printf("DROP VIEW IF EXISTS %s;\n", quoteIdentifier(view.name.name))
+	if database := view.defaultDatabase(); database != "" {
+		fmt.Printf("USE %s;\n\n", quoteIdentifier(database))
+	}
+	fmt.Printf("DROP VIEW IF EXISTS %s.%s;\n", quoteIdentifier(view.name.database), quoteIdentifier(view.name.name))
 	showCreateTable(view.create, true)
 	if view.definition != nil {
 		fmt.Println("SET SESSION sql_mode = @modump_saved_sql_mode;")

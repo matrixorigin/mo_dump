@@ -76,8 +76,8 @@ func TestDumpStoredViewSQLMode(t *testing.T) {
 	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_consumer", catalog.SystemViewRel).AddRow("z_source", catalog.SystemViewRel))
 	createConsumer := `CREATE VIEW a_consumer AS SELECT x FROM "z_source"`
 	query := "select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'"
-	mock.ExpectQuery(query).WithArgs("db", "a_consumer").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, createConsumer, "ANSI_QUOTES")))
-	mock.ExpectQuery(query).WithArgs("db", "z_source").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "CREATE VIEW z_source AS SELECT 7 AS x", "")))
+	mock.ExpectQuery(query).WithArgs("db", "a_consumer").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "db", createConsumer, "ANSI_QUOTES")))
+	mock.ExpectQuery(query).WithArgs("db", "z_source").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "db", "CREATE VIEW z_source AS SELECT 7 AS x", "")))
 	mock.ExpectQuery("select @@lower_case_table_names, @@sql_mode").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names", "sql_mode"}).AddRow(1, ""))
 	opt := Options{dbs: []string{"db"}, emptyTables: true, noData: true}
 	require.NoError(t, opt.dumpData(context.Background()))

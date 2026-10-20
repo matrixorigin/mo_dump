@@ -27,6 +27,14 @@ type dumpView struct {
 	definition *viewDefinition
 }
 
+func (view dumpView) defaultDatabase() string {
+	if view.definition != nil && view.definition.DefaultDatabase != nil {
+		return *view.definition.DefaultDatabase
+	}
+	// Bare in-memory views have no captured creation context.
+	return view.name.database
+}
+
 func normalizedViewName(database, name string, mode viewSQLMode) viewName {
 	return viewName{mode.name(database), mode.name(name)}
 }
@@ -96,7 +104,7 @@ func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[v
 			mode.lowerCaseTableNames = *lower
 		}
 	}
-	refs, err := viewDependencies(view.name.database, view.create, mode)
+	refs, err := viewDependencies(view.defaultDatabase(), view.create, mode)
 	if err != nil {
 		return nil, fmt.Errorf("analyze view %s.%s: %w", view.name.database, view.name.name, err)
 	}
