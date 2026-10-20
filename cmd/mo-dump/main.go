@@ -22,8 +22,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -628,10 +630,14 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 	if err != nil {
 		return err
 	}
+	//#30590: path and delimiter are interpolated as SQL string literals;
+	// double-quote escaping keeps them valid in both sql_modes.
+	fileLiteral := sqlStringLiteral(fmt.Sprintf("%s/%s", pwd, fname))
+	delimLiteral := sqlStringLiteral(string(csvConf.fieldDelimiter))
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE `%s` FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fileLiteral, tbl, delimLiteral)
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA INFILE %s INTO TABLE `%s` FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fileLiteral, tbl, delimLiteral)
 	}
 	return nil
 }
@@ -741,10 +747,8 @@ func convertValue(v any, typ string) string {
 		val := string(ret)
 		if val == "true" || val == "false" {
 			return val
-		} else {
-			str := strings.Replace(val, "\\", "\\\\", -1)
-			return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
 		}
+		return quoteSQLStringLiteral(val)
 	}
 	// bool can be somehow identified as varchar
 	if typ == "varchar" && (string(ret) == "true" || string(ret) == "false") {
@@ -752,32 +756,82 @@ func convertValue(v any, typ string) string {
 	}
 
 	switch typ {
-	case "float":
-		retStr := string(ret)
-		if (retStr[0] >= '0' && retStr[0] <= '9') || (retStr[0] == '-' && retStr[1] >= '0' && retStr[1] <= '9') {
-			return retStr
-		}
-		return "'" + retStr + "'" // NaN, +Inf, -Inf, maybe no hacking need in the future
-	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "double", "bool", "boolean":
+	case "float", "double":
+		//#30596/#30598: NaN/±Inf are not valid unquoted numeric literals,
+		// near-max FLOAT text parses out of range on restore, and -0
+		// loses its sign; those must stay quoted.
+		return floatSQLValue(string(ret), typ == "float")
+	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "bool", "boolean":
 		return string(ret)
 	case "vecf32", "vecf64":
 		return string(ret)
 	case "bit":
-		var builder strings.Builder
-		builder.WriteString("_binary '")
-		for _, b := range ret {
-			if b == byte(0) {
-				builder.WriteString("\\0")
-			} else {
-				builder.WriteByte(b)
-			}
-		}
-		builder.WriteString("'")
-		return builder.String()
+		//#30587: \0 escapes break under NO_BACKSLASH_ESCAPES and a raw
+		// quote byte would close the literal; join _binary pieces with
+		// CHAR(0) instead.
+		return bitSQLValue(ret)
 	default:
-		str := strings.Replace(string(ret), "\\", "\\\\", -1)
-		return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
+		//#30587: backslash-escaped literals break under
+		// NO_BACKSLASH_ESCAPES; emit a sql_mode-independent token.
+		return quoteSQLStringLiteral(string(ret))
 	}
+}
+
+// floatSQLValue renders FLOAT/DOUBLE wire text as a restorable SQL token.
+// NaN and ±Inf are not valid unquoted numeric literals; a magnitude above
+// MaxFloat32 is rejected on restore when parsed as an unquoted FLOAT literal;
+// and an unquoted -0 restores as positive zero. Such values are emitted as
+// quoted string literals, which the restore cast reproduces exactly — the
+// same path the CSV roundtrip uses. (matrixone#30596, matrixone#30598)
+func floatSQLValue(val string, isFloat bool) string {
+	f, err := strconv.ParseFloat(val, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return sqlStringLiteral(val)
+	}
+	if f == 0 && strings.HasPrefix(val, "-") {
+		return sqlStringLiteral(val)
+	}
+	if isFloat && (f > math.MaxFloat32 || f < -math.MaxFloat32) {
+		return sqlStringLiteral(val)
+	}
+	return val
+}
+
+// sqlStringLiteral quotes s as a SQL string literal using doubled single
+// quotes, which parses the same with and without NO_BACKSLASH_ESCAPES.
+func sqlStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// quoteSQLStringLiteral builds a SQL string token equal to s whose parsing
+// does not depend on sql_mode: single quotes are doubled, and each backslash
+// byte is carried by CHAR(92), so no backslash escape is ever relied upon.
+// (matrixone#30587)
+func quoteSQLStringLiteral(s string) string {
+	parts := strings.Split(s, "\\")
+	if len(parts) == 1 {
+		return sqlStringLiteral(s)
+	}
+	lits := make([]string, len(parts))
+	for i, p := range parts {
+		lits[i] = sqlStringLiteral(p)
+	}
+	return "CONCAT(" + strings.Join(lits, ",CHAR(92),") + ")"
+}
+
+// bitSQLValue encodes BIT bytes as _binary literal pieces joined by CHAR(0):
+// the \0 escape breaks under NO_BACKSLASH_ESCAPES, and a raw quote byte would
+// close the literal early. (matrixone#30587)
+func bitSQLValue(raw []byte) string {
+	parts := bytes.Split(raw, []byte{0})
+	lits := make([]string, len(parts))
+	for i, p := range parts {
+		lits[i] = "_binary " + sqlStringLiteral(string(p))
+	}
+	if len(lits) == 1 {
+		return lits[0]
+	}
+	return "CONCAT(" + strings.Join(lits, ",CHAR(0),") + ")"
 }
 
 func convertValue2(v any, typ string) (sql.RawBytes, string) {
@@ -813,6 +867,12 @@ func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 		runCh, _ := utf8.DecodeRuneInString(s)
 		if runCh == utf8.RuneError {
 			return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter is invalid utf8 character")
+		}
+		//#30590: a backslash delimiter has no SQL literal form for the
+		// generated LOAD DATA that parses consistently across sql_modes;
+		// refuse it instead of claiming a successful unparsable export.
+		if runCh == '\\' {
+			return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter cannot be a backslash")
 		}
 		return runCh, nil
 	} else {

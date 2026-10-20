@@ -81,6 +81,61 @@ func TestConvertValue2(t *testing.T) {
 	assert.Equal(t, f, defaultFmt)
 }
 
+// matrixone#30596/#30598: NaN/±Inf for BOTH float and double, near-max
+// FLOAT text, and -0 must stay quoted in the SQL dump; ordinary finite
+// values keep the numeric passthrough.
+func TestConvertValueFloatBoundary(t *testing.T) {
+	assert.Equal(t, `'NaN'`, convertValue(makeValue("NaN"), "float"))
+	assert.Equal(t, `'+Inf'`, convertValue(makeValue("+Inf"), "float"))
+	assert.Equal(t, `'-Inf'`, convertValue(makeValue("-Inf"), "float"))
+	assert.Equal(t, `'NaN'`, convertValue(makeValue("NaN"), "double"))
+	assert.Equal(t, `'+Inf'`, convertValue(makeValue("+Inf"), "double"))
+	assert.Equal(t, `'-Inf'`, convertValue(makeValue("-Inf"), "double"))
+	// near-max finite FLOAT: unquoted literal would fail restore (#30598)
+	assert.Equal(t, `'3.4028235e+38'`, convertValue(makeValue("3.4028235e+38"), "float"))
+	// ordinary in-range values keep the compact numeric form
+	assert.Equal(t, `3.4028234e+38`, convertValue(makeValue("3.4028234e+38"), "float"))
+	assert.Equal(t, `1.1`, convertValue(makeValue("1.1"), "float"))
+	assert.Equal(t, `1.1`, convertValue(makeValue("1.1"), "double"))
+	assert.Equal(t, `1.7976931348623157e+308`, convertValue(makeValue("1.7976931348623157e+308"), "double"))
+	// signed zero must keep its sign (#30598)
+	assert.Equal(t, `'-0'`, convertValue(makeValue("-0"), "float"))
+	assert.Equal(t, `'-0'`, convertValue(makeValue("-0"), "double"))
+	assert.Equal(t, `0`, convertValue(makeValue("0"), "float"))
+	assert.Equal(t, `0`, convertValue(makeValue("0"), "double"))
+}
+
+// matrixone#30587: string literals must parse the same with and without
+// NO_BACKSLASH_ESCAPES — quotes doubled, backslashes via CHAR(92).
+func TestConvertValueSqlModeSafe(t *testing.T) {
+	assert.Equal(t, `'O''Reilly'`, convertValue(makeValue("O'Reilly"), "varchar"))
+	assert.Equal(t, `CONCAT('a',CHAR(92),'b')`, convertValue(makeValue(`a\b`), "varchar"))
+	assert.Equal(t, `CONCAT('a',CHAR(92),'',CHAR(92),'b')`, convertValue(makeValue(`a\\b`), "varchar"))
+	assert.Equal(t, `CONCAT('a',CHAR(92),'')`, convertValue(makeValue(`a\`), "varchar"))
+	assert.Equal(t, `'asa'`, convertValue(makeValue("asa"), "varchar"))
+	assert.Equal(t, `''`, convertValue(makeValue(""), "varchar"))
+}
+
+// matrixone#30587: bit bytes go as _binary pieces joined by CHAR(0).
+func TestConvertValueBit(t *testing.T) {
+	assert.Equal(t, `CONCAT(_binary 'ab',CHAR(0),_binary 'c')`, convertValue(makeValue("ab\x00c"), "bit"))
+	assert.Equal(t, `_binary 'abc'`, convertValue(makeValue("abc"), "bit"))
+}
+
+func TestSqlStringLiteral(t *testing.T) {
+	assert.Equal(t, `''`, sqlStringLiteral(""))
+	assert.Equal(t, `'a'`, sqlStringLiteral("a"))
+	assert.Equal(t, `'a''b'''`, sqlStringLiteral("a'b'"))
+}
+
+// matrixone#30590: a backslash field delimiter has no portable LOAD DATA
+// literal form, so it must be rejected before export.
+func TestCheckFieldDelimiterBackslash(t *testing.T) {
+	_, err := checkFieldDelimiter(nil, "\\")
+	assert.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "cannot be a backslash"))
+}
+
 func TestShowCreateTable(t *testing.T) {
 	kases := []struct {
 		sql          string
