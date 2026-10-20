@@ -92,7 +92,11 @@ func main() {
 		if err == nil && flag.NFlag() != 0 {
 			fmt.Fprintf(os.Stdout, "/* MODUMP SUCCESS, COST %v */\n", time.Since(dumpStart))
 			if opt.toCsv {
-				fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
+				if opt.localInfile {
+					fmt.Fprintf(os.Stdout, "/* ! Keep this script together with the generated .csv files; LOAD DATA LOCAL INFILE uses relative file names (matrixone#30481). ! */\n")
+				} else {
+					fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
+				}
 			}
 		}
 	}()
@@ -617,6 +621,18 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 	return nil
 }
 
+// loadDataInfilePath picks the path emitted into LOAD DATA: for LOCAL
+// INFILE a bare filename keeps the script+csv pair restorable from any
+// directory or host (matrixone#30481); server-side INFILE keeps the
+// absolute export path because the server resolves it on its own file
+// system.
+func loadDataInfilePath(pwd, fname string, localInfile bool) string {
+	if localInfile {
+		return fname
+	}
+	return fmt.Sprintf("%s/%s", pwd, fname)
+}
+
 func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig) error {
 	fname := fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
 	pwd := os.Getenv("PWD")
@@ -624,15 +640,21 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	err = toCsv(r, f, rowResults, cols, csvConf)
+	if err == nil {
+		//matrixone#30628: a final buffered write failure can surface only
+		// on Close; a deferred close would silently discard it.
+		err = f.Close()
+	} else {
+		_ = f.Close()
+	}
 	if err != nil {
 		return err
 	}
 	//#30590: path and delimiter are interpolated as SQL string literals;
 	// double-quote escaping keeps them valid in both sql_modes.
-	fileLiteral := sqlStringLiteral(fmt.Sprintf("%s/%s", pwd, fname))
+	fileLiteral := sqlStringLiteral(loadDataInfilePath(pwd, fname, localInfile))
 	delimLiteral := sqlStringLiteral(string(csvConf.fieldDelimiter))
 	if localInfile {
 		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE `%s` FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fileLiteral, tbl, delimLiteral)
@@ -698,7 +720,10 @@ func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []s
 		return err
 	}
 	csvWriter.Flush()
-	return err
+	//matrixone#30628: the final flush has no next write to expose a failing
+	// last-byte write to disk; surface the buffered error instead of
+	// reporting MODUMP SUCCESS over a truncated CSV.
+	return csvWriter.Error()
 }
 
 func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {

@@ -484,3 +484,29 @@ func TestGetCreateView(t *testing.T) {
 		t.Errorf("Unfulfilled expectations: %s", err)
 	}
 }
+
+// matrixone#30481: LOCAL INFILE uses a relative file name so the
+// script+csv pair restores from any directory or host; server-side INFILE
+// keeps the absolute export path.
+func Test_loadDataInfilePath(t *testing.T) {
+	assert.Equal(t, "d1_t2.csv", loadDataInfilePath("/tmp/x", "d1_t2.csv", true))
+	assert.Equal(t, "/tmp/x/d1_t2.csv", loadDataInfilePath("/tmp/x", "d1_t2.csv", false))
+}
+
+// matrixone#30628: an error on the final Flush must fail the export instead
+// of claiming a successful truncated dump.
+type failWriter struct{ writes int }
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return 0, fmt.Errorf("write file failed")
+}
+
+func Test_toCsvLineFlushError(t *testing.T) {
+	cw := csv.NewWriter(&failWriter{})
+	rowResults := []any{makeValue("1")}
+	cols := []*Column{{Name: "id", Type: "int"}}
+	line := make([]string, 1)
+	err := toCsvLine(cw, rowResults, cols, line, false)
+	assert.Error(t, err)
+}
