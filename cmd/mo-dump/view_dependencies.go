@@ -60,6 +60,7 @@ func getViewSQLMode(ctx context.Context) (viewSQLMode, error) {
 }
 
 type viewToken struct {
+	kind        int
 	text        string
 	quoted      bool
 	word        bool
@@ -206,7 +207,7 @@ func (c *viewReferenceCollector) body(start, end int, scope *viewCTEScope, inFro
 	for i := start; i < end; i++ {
 		token := c.tokens[i]
 		if token.keyword("as") && i+1 < end && c.tokens[i+1].word {
-			i++ // An explicit alias is not a clause or a relation.
+			i++ // A projection alias is not a clause or relation.
 			continue
 		}
 		if token.symbol("(") {
@@ -216,7 +217,8 @@ func (c *viewReferenceCollector) body(start, end int, scope *viewCTEScope, inFro
 			i = token.close
 			continue
 		}
-		if token.keyword("from") || token.keyword("join") || token.keyword("straight_join") || token.keyword("apply") || (inFrom && token.symbol(",")) || (queryStart && token.keyword("table")) {
+		join := inFrom && (token.keyword("join") || token.keyword("straight_join") || token.keyword("apply"))
+		if token.keyword("from") || join || (inFrom && token.symbol(",")) || (queryStart && token.keyword("table")) {
 			next, err := c.relation(i+1, end, scope)
 			if err != nil {
 				return err
@@ -231,7 +233,7 @@ func (c *viewReferenceCollector) body(start, end int, scope *viewCTEScope, inFro
 				inFrom, queryStart = false, true
 			case "select", "values":
 				inFrom, queryStart = false, false
-			case "where", "group", "having", "window", "order", "limit", "qualify", "into", "for", "lock":
+			case "where", "group", "having", "window", "order", "limit", "into", "for", "lock":
 				inFrom = false
 			}
 		}
@@ -239,10 +241,32 @@ func (c *viewReferenceCollector) body(start, end int, scope *viewCTEScope, inFro
 	return nil
 }
 
+// A query expression may begin with a parenthesized set-operation branch.
+// Do not classify TRIM((SELECT ...) FROM col) or function argument lists as
+// queries: only a complete group, set operator, or query tail may follow it.
+func (c *viewReferenceCollector) queryAt(start, end int) bool {
+	if start >= end {
+		return false
+	}
+	token := c.tokens[start]
+	if token.keyword("select") || token.keyword("with") || token.keyword("values") || token.keyword("table") {
+		return true
+	}
+	if !token.symbol("(") || token.close >= end || !c.queryAt(start+1, token.close) {
+		return false
+	}
+	next := token.close + 1
+	if next == end {
+		return true
+	}
+	tail := c.tokens[next]
+	return tail.keyword("union") || tail.keyword("intersect") || tail.keyword("except") || tail.keyword("minus") || tail.keyword("order") || tail.keyword("limit") || tail.keyword("offset")
+}
+
 // Parentheses in expressions may contain subqueries, but FROM in an ordinary
 // function (EXTRACT/TRIM/SUBSTRING) is not a table reference.
 func (c *viewReferenceCollector) nested(start, end int, scope *viewCTEScope) error {
-	if start < end && (c.tokens[start].keyword("select") || c.tokens[start].keyword("with") || c.tokens[start].keyword("values") || c.tokens[start].keyword("table")) {
+	if c.queryAt(start, end) {
 		return c.query(start, end, scope)
 	}
 	for i := start; i < end; i++ {
@@ -265,15 +289,20 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 	}
 	if c.tokens[start].symbol("(") {
 		close := c.tokens[start].close
-		first := start + 1
-		if first < close && (c.tokens[first].keyword("select") || c.tokens[first].keyword("with") || c.tokens[first].keyword("values") || c.tokens[first].keyword("table")) {
-			return close + 1, c.query(first, close, scope)
+		if c.queryAt(start+1, close) {
+			if err := c.query(start+1, close, scope); err != nil {
+				return close + 1, err
+			}
+		} else {
+			next, err := c.relation(start+1, close, scope)
+			if err != nil {
+				return close + 1, err
+			}
+			if err := c.body(next, close, scope, true); err != nil {
+				return close + 1, err
+			}
 		}
-		next, err := c.relation(first, close, scope)
-		if err != nil {
-			return close + 1, err
-		}
-		return close + 1, c.body(next, close, scope, true)
+		return c.relationSuffix(close+1, end)
 	}
 	if !c.tokens[start].word {
 		return start, fmt.Errorf("expected relation name")
@@ -290,14 +319,28 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 		pos += 2
 	}
 	if pos < end && c.tokens[pos].symbol("(") { // Table-valued function, not a VIEW.
-		return c.tokens[pos].close + 1, c.nested(pos+1, c.tokens[pos].close, scope)
+		if err := c.nested(pos+1, c.tokens[pos].close, scope); err != nil {
+			return pos, err
+		}
+		return c.relationSuffix(c.tokens[pos].close+1, end)
+	}
+	if pos < end && c.tokens[pos].symbol("{") {
+		close := c.tokens[pos].close
+		if pos+1 == close || !(c.tokens[pos+1].keyword("snapshot") || c.tokens[pos+1].keyword("timestamp") || c.tokens[pos+1].keyword("mo_ts") || c.tokens[pos+1].keyword("as")) {
+			return pos, fmt.Errorf("unsupported historical relation qualifier")
+		}
+		if err := c.nested(pos+1, close, scope); err != nil {
+			return pos, err
+		}
+		// A historical catalog object cannot be supplied by any current object
+		// emitted by this dump. Its snapshot remains an external prerequisite.
+		return c.relationSuffix(close+1, end)
 	}
 	name = c.mode.name(name)
 	if !qualified {
-		// MatrixOne resolves unqualified dual as its pseudo table before CTEs
-		// and catalog objects. A qualified schema.dual is a real relation.
+		// MatrixOne resolves unqualified dual before CTEs and catalog objects.
 		if name == "dual" {
-			return pos, nil
+			return c.relationSuffix(pos, end)
 		}
 		if binding := scope.lookup(name); binding != nil {
 			if !binding.visiting && !binding.done {
@@ -309,13 +352,67 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 				}
 				binding.done = true
 			}
-			return pos, nil
+			return c.relationSuffix(pos, end)
 		}
-	}
-	if !qualified {
 		schema = c.database
 	}
 	c.refs[normalizedViewName(schema, name, c.mode)] = struct{}{}
+	return c.relationSuffix(pos, end)
+}
+
+func viewAliasBoundary(token viewToken) bool {
+	if token.quoted {
+		return false
+	}
+	switch strings.ToLower(token.text) {
+	case "join", "inner", "cross", "left", "right", "full", "outer", "natural", "straight_join", "apply", "dedup", "centroidx", "on", "using", "where", "group", "having", "window", "order", "limit", "into", "for", "lock", "union", "intersect", "except", "minus", "use", "ignore", "force":
+		return true
+	}
+	return false
+}
+
+// Alias and index-hint namespaces belong to the table factor, not to the query
+// body. Consume them atomically so FOR JOIN / ORDER BY and hint-list commas
+// cannot be mistaken for joins, query clauses, or additional relations.
+func (c *viewReferenceCollector) relationSuffix(pos, end int) (int, error) {
+	if pos < end && c.tokens[pos].keyword("as") {
+		pos++
+		if pos >= end || !(c.tokens[pos].word || c.tokens[pos].kind == mysql.STRING) {
+			return pos, fmt.Errorf("expected relation alias")
+		}
+		pos++
+	} else if pos < end && (c.tokens[pos].kind == mysql.STRING || c.tokens[pos].word && !viewAliasBoundary(c.tokens[pos])) {
+		pos++
+	}
+	if pos < end && c.tokens[pos].symbol("(") {
+		pos = c.tokens[pos].close + 1
+	} // Derived-table column aliases.
+	for pos < end && (c.tokens[pos].keyword("use") || c.tokens[pos].keyword("force") || c.tokens[pos].keyword("ignore")) {
+		pos++
+		if pos >= end || !(c.tokens[pos].keyword("index") || c.tokens[pos].keyword("key")) {
+			return pos, fmt.Errorf("expected INDEX or KEY in index hint")
+		}
+		pos++
+		if pos < end && c.tokens[pos].keyword("for") {
+			pos++
+			if pos < end && c.tokens[pos].keyword("join") {
+				pos++
+			} else {
+				if pos >= end || !(c.tokens[pos].keyword("order") || c.tokens[pos].keyword("group")) {
+					return pos, fmt.Errorf("expected index hint scope")
+				}
+				pos++
+				if pos >= end || !c.tokens[pos].keyword("by") {
+					return pos, fmt.Errorf("expected BY in index hint")
+				}
+				pos++
+			}
+		}
+		if pos >= end || !c.tokens[pos].symbol("(") {
+			return pos, fmt.Errorf("expected index hint list")
+		}
+		pos = c.tokens[pos].close + 1
+	}
 	return pos, nil
 }
 
@@ -348,25 +445,30 @@ func tokenizeViewSQL(ddl string, mode viewSQLMode) ([]viewToken, error) {
 			value = string(rune(kind))
 		}
 		raw := strings.TrimSpace(text[scanner.PrePos:scanner.Pos])
-		word := len(raw) > 0 && (raw[0] >= 'A' && raw[0] <= 'Z' || raw[0] >= 'a' && raw[0] <= 'z' || raw[0] == '_' || raw[0] == '$' || raw[0] >= 128)
-		token := viewToken{text: value, word: word, quoted: strings.HasPrefix(raw, "`"), punctuation: kind < 256, close: -1}
+		quoted := strings.HasPrefix(raw, "`")
+		word := kind == mysql.ID || len(raw) > 0 && (raw[0] >= 'A' && raw[0] <= 'Z' || raw[0] >= 'a' && raw[0] <= 'z' || raw[0] == '_' || raw[0] == '$' || raw[0] >= 128)
+		token := viewToken{kind: kind, text: value, word: word, quoted: quoted, punctuation: kind < 256, close: -1}
 		if token.quoted {
 			token.word = true
 		}
 		switch kind {
-		case '(':
+		case '(', '{':
 			opens = append(opens, len(tokens))
-		case ')':
+		case ')', '}':
 			if len(opens) == 0 {
-				return nil, fmt.Errorf("unbalanced view query parentheses")
+				return nil, fmt.Errorf("unbalanced view query delimiters")
 			}
-			tokens[opens[len(opens)-1]].close = len(tokens)
+			open := opens[len(opens)-1]
+			if kind == ')' && !tokens[open].symbol("(") || kind == '}' && !tokens[open].symbol("{") {
+				return nil, fmt.Errorf("mismatched view query delimiters")
+			}
+			tokens[open].close = len(tokens)
 			opens = opens[:len(opens)-1]
 		}
 		tokens = append(tokens, token)
 	}
 	if len(opens) != 0 {
-		return nil, fmt.Errorf("unbalanced view query parentheses")
+		return nil, fmt.Errorf("unbalanced view query delimiters")
 	}
 	return tokens, nil
 }
@@ -433,8 +535,38 @@ func maskViewLiterals(sql string, mode viewSQLMode) (string, error) {
 			}
 		}
 		if ch != '\'' && ch != '"' && ch != '`' {
-			out.WriteByte(ch)
-			i++
+			start := i
+			nonASCII := false
+			for i < len(sql) && (sql[i] >= 'a' && sql[i] <= 'z' || sql[i] >= 'A' && sql[i] <= 'Z' || sql[i] >= '0' && sql[i] <= '9' || sql[i] == '_' || sql[i] == '$' || sql[i] >= 128) {
+				nonASCII = nonASCII || sql[i] >= 128
+				i++
+			}
+			if i > start {
+				// The pinned lexer accepts Unicode in quoted identifiers but not
+				// bare identifiers. Quote the whole mixed identifier in this analysis
+				// copy only; the exported DDL and its spelling remain untouched.
+				name := sql[start:i]
+				if nonASCII {
+					// The server's numeric-to-ID promotion folds ASCII spelling,
+					// even when ordinary identifier lookup is case-sensitive.
+					if name[0] >= '0' && name[0] <= '9' {
+						name = strings.Map(func(ch rune) rune {
+							if ch >= 'A' && ch <= 'Z' {
+								return ch + ('a' - 'A')
+							}
+							return ch
+						}, name)
+					}
+					out.WriteByte('`')
+				}
+				out.WriteString(name)
+				if nonASCII {
+					out.WriteByte('`')
+				}
+			} else {
+				out.WriteByte(ch)
+				i++
+			}
 			continue
 		}
 		identifier := ch == '`' || ch == '"' && mode.ansiQuotes

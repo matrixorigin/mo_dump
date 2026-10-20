@@ -45,7 +45,7 @@ func TestViewReferences(t *testing.T) {
 		{"cte_scope_does_not_escape", "SELECT * FROM (WITH v AS (SELECT 1) SELECT * FROM v) x JOIN v ON true", []viewName{{"db", "v"}}},
 		{"cte_nested_inherits", "WITH v AS (SELECT * FROM t) SELECT * FROM (SELECT * FROM v) x", []viewName{{"db", "t"}}},
 		{"case", "SELECT * FROM OTHER.V", []viewName{{"other", "v"}}},
-		{"time_travel", "SELECT * FROM a {timestamp = (SELECT x FROM b)}", []viewName{{"db", "a"}, {"db", "b"}}},
+		{"time_travel", "SELECT * FROM a {timestamp = (SELECT x FROM b)}", []viewName{{"db", "b"}}},
 		{"window", "SELECT sum(x) OVER (PARTITION BY (SELECT x FROM b) ORDER BY (SELECT x FROM c)) FROM a", []viewName{{"db", "a"}, {"db", "b"}, {"db", "c"}}},
 	}
 	for _, tt := range tests {

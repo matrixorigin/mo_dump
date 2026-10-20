@@ -96,6 +96,10 @@ func TestViewLexicalErrors(t *testing.T) {
 		"CREATE VIEW v AS WITH", "CREATE VIEW v AS WITH c(x) SELECT 1", "CREATE VIEW v AS WITH c AS SELECT 1", "CREATE VIEW v AS SELECT (1", "CREATE VIEW v AS SELECT 1)",
 		"CREATE VIEW v AS SELECT 'unterminated", "CREATE VIEW v AS SELECT 1 /* unterminated", "CREATE VIEW v AS SELECT $$unterminated", "CREATE VIEW v AS SELECT 1; SELECT 2",
 		"CREATE VIEW v AS SELECT * FROM (t JOIN)", "CREATE VIEW v AS WITH c AS (SELECT * FROM 42) SELECT * FROM c",
+		"CREATE VIEW v AS SELECT * FROM t AS", "CREATE VIEW v AS SELECT * FROM t AS 42", "CREATE VIEW v AS SELECT * FROM t USE nope",
+		"CREATE VIEW v AS SELECT * FROM t USE INDEX FOR nope (idx)", "CREATE VIEW v AS SELECT * FROM t USE INDEX FOR ORDER (idx)",
+		"CREATE VIEW v AS SELECT * FROM t USE INDEX", "CREATE VIEW v AS SELECT * FROM t {unknown='s'}", "CREATE VIEW v AS SELECT * FROM t {}",
+		"CREATE VIEW v AS SELECT * FROM t {snapshot='s')", "CREATE VIEW v AS SELECT * FROM t }", "CREATE VIEW v AS SELECT * FROM t {snapshot='s'",
 	} {
 		t.Run(ddl, func(t *testing.T) {
 			_, err := viewReferences(context.Background(), dumpView{viewName{"db", "v"}, ddl}, viewSQLMode{lowerCaseTableNames: 1})
