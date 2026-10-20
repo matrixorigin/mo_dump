@@ -63,6 +63,8 @@ func TestViewLiteralModes(t *testing.T) {
 		{"ANSI identifier", `create view v as select * from "Vb"`, viewSQLMode{ansiQuotes: true}, []string{"Vb"}},
 		{"ANSI punctuation", `create view v as select * from "("`, viewSQLMode{ansiQuotes: true}, []string{"("}},
 		{"identifier escapes", "create view v as select * from `v``b`", viewSQLMode{}, []string{"v`b"}},
+		{"combined ANSI and no backslash", `create view v as select 'a\' as marker,x from "Vb"`, viewSQLMode{ansiQuotes: true, noBackslashEscapes: true}, []string{"Vb"}},
+		{"raw SQL mode forwarded", `create view v as select 'a\' as marker,x from "Vb"`, viewSQLMode{sqlMode: "ANSI_QUOTES,NO_BACKSLASH_ESCAPES"}, []string{"Vb"}},
 		{"no backslash escapes", `create view v as select 'a\' as x from Vb`, viewSQLMode{noBackslashEscapes: true}, []string{"Vb"}},
 		{"no backslash executable comment", `create view v as select 'a\' as x /*!50000 from Vb */`, viewSQLMode{noBackslashEscapes: true}, []string{"Vb"}},
 		{"doubled string quote", `create view v as select 'it''s from Vb'`, viewSQLMode{}, nil},

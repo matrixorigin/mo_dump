@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,8 +74,8 @@ func TestViewDependencies(t *testing.T) {
 		{"TRIM FROM subquery", "select trim(both 'x' from (select x from vb))", []string{"vb"}},
 		{"table valued function", "select * from vb('vc')", nil},
 		{"table function subquery", "select * from f((select x from vb))", []string{"vb"}},
-		{"lateral derived query", "select * from lateral (select * from vb) s", []string{"vb"}},
-		{"nested table groups", "select * from ((vb)) a join vc on a.x=vc.x", []string{"vb", "vc"}},
+		{"implicit derived alias", "select * from (select * from vb) s", []string{"vb"}},
+		{"nested table groups", "select * from ((vb a)) join vc on a.x=vc.y", []string{"vb", "vc"}},
 		{"TABLE shorthand", "table vb", []string{"vb"}},
 		{"TABLE union", "table vb union all table vc", []string{"vb", "vc"}},
 		{"mixed TABLE union", "select * from vb union table vc", []string{"vb", "vc"}},

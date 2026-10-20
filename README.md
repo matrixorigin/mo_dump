@@ -35,7 +35,9 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 
 ### 构建 mo-dump 二进制文件
-__Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需要安装部署 <a href="https://go.dev/doc/install" target="_blank">Go</a> 语言。
+__Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</a>（支持自动工具链选择的 Go 1.21 或更新版本）、C/C++ 编译器、`make`、`tar` 和 `shasum`。构建会选用 `go.mod` 指定的 Go 1.26.4，从固定版本 MatrixOne 模块的已校验源码归档构建静态 jemalloc，不需要安装整个 MatrixOne 内核或在运行时携带 jemalloc 动态库。
+
+视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集。保留原始视图 DDL，对真实循环返回错误而不是无限重排。跨库或未选中的外部依赖仍需在恢复环境中可用。
 
 1. 执行下面的代码即可从 MatrixOrigin/mo_dump 源代码构建 `mo-dump` 二进制文件：
 
@@ -46,6 +48,15 @@ __Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需�
     ```
 
 2. 你可以在 mo_dump 文件夹中找到 `mo-dump` 可执行文件：*mo-dump*。
+
+3. `make test` 会使用相同 Go 工具链及当前工作区 native 依赖运行测试。直接执行 Go 命令时先运行 `make jemalloc`，并设置：
+
+    ```sh
+    export GOTOOLCHAIN=go1.26.4 GOWORK=off
+    export CGO_CFLAGS="-I$PWD/thirdparties/install/include"
+    export CGO_LDFLAGS="-L$PWD/thirdparties/install/lib"
+    go test -mod=readonly ./...
+    ```
 
 !!! note
     构建好的 `mo-dump` 文件也可以在相同的硬件平台上工作。但是需要注意在 x86 平台中构建的 `mo-dump` 二进制文件在 Darwin ARM 平台中则无法正常工作。你可以在同一套操作系统和硬件平台内构建并使用 `mo-dump` 二进制文件。`mo-dump` 目前只支持 Linux 和 macOS。

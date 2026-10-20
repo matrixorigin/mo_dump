@@ -32,7 +32,7 @@ func TestViewTableFactorRoles(t *testing.T) {
 		{"quoted alias", "select * from t `offset`, z_root", []string{"t", "z_root"}},
 		{"string alias", "select * from t 'offset', z_root", []string{"t", "z_root"}},
 		{"derived alias columns", "select * from (select x from t) offset(x), z_root", []string{"t", "z_root"}},
-		{"table group alias", "select * from (t join z_root using(x)) offset", []string{"t", "z_root"}},
+		{"alias inside table group", "select x from (t offset join z_root using(x))", []string{"t", "z_root"}},
 		{"actual offset clause", "select * from t offset 1", []string{"t"}},
 		{"alias before actual offset", "select * from t offset offset 1", []string{"t"}},
 		{"actual named window", "select sum(x) over w from t window w as (order by x)", []string{"t"}},
@@ -71,6 +71,11 @@ func TestViewTableFactorErrors(t *testing.T) {
 		"select * from t force key for order(v)",
 		"select * from t ignore index for join",
 		"select * from t{snapshot='s')",
+		// These old scanner fixtures are rejected by the real server grammar.
+		// Keep them as rejection oracles, not fabricated compatibility promises.
+		"select * from lateral (select * from vb) s",
+		"select * from ((vb)) a join vc on a.x=vc.x",
+		"select * from (t join z_root using(x)) offset",
 	} {
 		t.Run(query, func(t *testing.T) {
 			_, err := viewDependencies("d", "create view v as "+query, viewSQLMode{})

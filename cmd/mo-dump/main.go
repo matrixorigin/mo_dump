@@ -30,8 +30,8 @@ import (
 	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 )
 
 type Options struct {
