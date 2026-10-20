@@ -117,7 +117,7 @@ func TestScanViewSQL(t *testing.T) {
 		{"CREATE VIEW v AS SELECT q.id>=1 AS ok FROM `q` -- AS\n", "CREATE VIEW v AS SELECT q . id >= 1 AS ok FROM `q` "},
 	} {
 		t.Run(tc.ddl, func(t *testing.T) {
-			text, sourceStart, err := scanViewSQL(tc.ddl)
+			text, sourceStart, err := scanViewSQL(tc.ddl, false)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, text)
 			require.Positive(t, sourceStart)
@@ -169,11 +169,42 @@ func TestScanViewTokenEquivalence(t *testing.T) {
 		t.Run(body, func(t *testing.T) {
 			ddl := "CREATE VIEW v AS " + body
 			want := read(ddl)
-			text, _, err := scanViewSQL(ddl)
+			text, _, err := scanViewSQL(ddl, false)
 			require.NoError(t, err)
 			require.Equal(t, want, read(text), "parser input must preserve the original scanner token stream")
 		})
 	}
+}
+
+func TestCollectViewRelationsAnsiFallback(t *testing.T) {
+	for _, tc := range []struct{ name, query, want string }{
+		{"double quoted relation", `SELECT * FROM "parent"`, "parent"},
+		{"doubled quote in name", `SELECT * FROM "par""ent"`, "par\"ent"},
+		{"qualified relation", `SELECT * FROM d."parent"`, "d.parent"},
+		{"missing stays harmless", `SELECT * FROM "missing"`, "missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			err := collectViewRefs(context.Background(), "CREATE VIEW child AS "+tc.query, 0, func(ref *tree.TableName, required bool) {
+				name := string(ref.Name())
+				if ref.ExplicitSchema {
+					name = string(ref.Schema()) + "." + name
+				}
+				got = append(got, name)
+			})
+			require.NoError(t, err)
+			require.Equal(t, []string{tc.want}, got)
+		})
+	}
+
+	// Default-mode parses never take the fallback: a double-quoted string in
+	// string context is not an identifier, and an invalid default expression
+	// stays an error rather than becoming a relation.
+	var got []string
+	err := collectViewRefs(context.Background(), `CREATE VIEW v AS SELECT 1 AS value, "parent" AS label`, 0,
+		func(ref *tree.TableName, _ bool) { got = append(got, string(ref.Name())) })
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 func TestViewSourceScannerReuse(t *testing.T) {
@@ -234,6 +265,7 @@ func TestViewOrderDependencies(t *testing.T) {
 		{"literal", "d", "parent", "SELECT 'parent' AS parent", 0, false},
 		{"cte", "d", "parent", "WITH parent AS (SELECT 1) SELECT * FROM parent", 0, false},
 		{"nested forward shadow", "d", "p", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, true},
+		{"ansi quoted relation", "d", "parent", "SELECT * FROM \"parent\"", 0, true},
 		{"case zero", "D", "Parent", "SELECT * FROM d.parent", 0, false},
 		{"case one", "D", "Parent", "SELECT * FROM d.parent", 1, true},
 		{"case two", "D", "Parent", "SELECT * FROM d.parent", 2, false},
@@ -299,7 +331,7 @@ func TestViewOrderFailureIsAtomic(t *testing.T) {
 }
 
 func TestDumpViewDependencies(t *testing.T) {
-	for _, mode := range []string{"ordered", "nested forward shadow", "mode error", "parse error", "cycle"} {
+	for _, mode := range []string{"ordered", "nested forward shadow", "ansi quoted", "mode error", "parse error", "cycle"} {
 		t.Run(mode, func(t *testing.T) {
 			mock := newIdentifierMock(t)
 			parentName := "z`parent"
@@ -307,6 +339,10 @@ func TestDumpViewDependencies(t *testing.T) {
 			if mode == "nested forward shadow" {
 				parentName = "p"
 				child = "CREATE VIEW a_child AS WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q"
+			}
+			if mode == "ansi quoted" {
+				child = "create view a_child as select * from \"parent\""
+				parentName = "parent"
 			}
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a_child"}, {Name: parentName}}, noData: true}
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
@@ -330,7 +366,7 @@ func TestDumpViewDependencies(t *testing.T) {
 			}
 			var err error
 			output := captureIdentifierOutput(t, func() { err = opt.dumpData(context.Background()) })
-			if mode == "ordered" || mode == "nested forward shadow" {
+			if mode == "ordered" || mode == "nested forward shadow" || mode == "ansi quoted" {
 				require.NoError(t, err)
 				require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP VIEW IF EXISTS "+quoteIdentifier(parentName)+";\n"+parent+";\n\n\nDROP VIEW IF EXISTS `a_child`;\n"+child+";\n\n\nSET foreign_key_checks = 1;\n", output)
 			} else {

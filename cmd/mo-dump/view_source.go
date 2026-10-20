@@ -27,43 +27,46 @@ import (
 // parseViewSource returns the owning statement and its borrowed query source.
 // The caller frees only the owner after dependency collection.
 func parseViewSource(ctx context.Context, ddl string) (tree.Statement, tree.Statement, error) {
-	text, sourceStart, scanErr := scanViewSQL(ddl)
-	if scanErr != nil {
-		return nil, nil, scanErr
-	}
-	stmt, err := mysql.ParseOne(ctx, text, 0)
-	if err == nil {
-		if view, ok := stmt.(*tree.CreateView); ok {
-			return stmt, view.AsSource, nil
+	for _, ansiIdentifiers := range []bool{false, true} {
+		text, sourceStart, scanErr := scanViewSQL(ddl, ansiIdentifiers)
+		if scanErr != nil {
+			return nil, nil, scanErr
 		}
-		stmt.Free()
-		return nil, nil, fmt.Errorf("expected CREATE VIEW, got %T", stmt)
-	}
+		stmt, err := mysql.ParseOne(ctx, text, 0)
+		if err == nil {
+			if view, ok := stmt.(*tree.CreateView); ok {
+				return stmt, view.AsSource, nil
+			}
+			stmt.Free()
+			return nil, nil, fmt.Errorf("expected CREATE VIEW, got %T", stmt)
+		}
 
-	// The pinned grammar supports standalone VALUES but not VALUES as a view
-	// source. Validate both parts with the same parser, using a split between
-	// complete tokens rather than one that can truncate an executable comment.
-	if sourceStart < 0 {
+		// The pinned grammar supports standalone VALUES but not VALUES as a
+		// view source. Validate both parts with the same parser, using a split
+		// between complete tokens rather than one that can truncate an
+		// executable comment.
+		if sourceStart >= 0 {
+			header, headerErr := mysql.ParseOne(ctx, text[:sourceStart]+" SELECT 1", 0)
+			if headerErr == nil {
+				_, isView := header.(*tree.CreateView)
+				header.Free()
+				if isView {
+					query, queryErr := mysql.ParseOne(ctx, text[sourceStart:], 0)
+					if queryErr == nil {
+						if _, ok := query.(*tree.ValuesStatement); ok {
+							return query, query, nil
+						}
+						query.Free()
+					}
+				}
+			}
+		}
+		if !ansiIdentifiers {
+			continue
+		}
 		return nil, nil, err
 	}
-	header, headerErr := mysql.ParseOne(ctx, text[:sourceStart]+" SELECT 1", 0)
-	if headerErr != nil {
-		return nil, nil, err
-	}
-	_, isView := header.(*tree.CreateView)
-	header.Free()
-	if !isView {
-		return nil, nil, err
-	}
-	query, queryErr := mysql.ParseOne(ctx, text[sourceStart:], 0)
-	if queryErr != nil {
-		return nil, nil, err
-	}
-	if _, ok := query.(*tree.ValuesStatement); ok {
-		return query, query, nil
-	}
-	query.Free()
-	return nil, nil, err
+	panic("unreachable")
 }
 
 // scanViewSQL preserves the scanner's token stream, including quoted payloads,
@@ -71,7 +74,11 @@ func parseViewSource(ctx context.Context, ddl string) (tree.Statement, tree.Stat
 // also prevents the parser from pooling an unfinished executable-comment state
 // when it rejects a newer grammar before reaching the closing comment marker.
 // dumpData continues to emit the original, unmodified DDL.
-func scanViewSQL(ddl string) (string, int, error) {
+// When ansiIdentifiers is true, double-quoted strings become backtick
+// identifiers. This is only the fallback for catalog DDL authored under
+// ANSI_QUOTES: the dump session's sql_mode is not necessarily the mode used
+// when the view was created, and the stored DDL carries no mode metadata.
+func scanViewSQL(ddl string, ansiIdentifiers bool) (string, int, error) {
 	scanner := mysql.NewScanner(dialect.MYSQL, ddl)
 	// The pinned NewScanner does not reset this field on pool acquisition.
 	scanner.CommentFlag = false
@@ -99,7 +106,12 @@ func scanViewSQL(ddl string) (string, int, error) {
 			text.WriteByte(byte(token))
 		} else {
 			// Named tokens retain the original quotes and escapes.
-			text.WriteString(strings.TrimSpace(ddl[scanner.PrePos:scanner.Pos]))
+			raw := strings.TrimSpace(ddl[scanner.PrePos:scanner.Pos])
+			if ansiIdentifiers && token == mysql.STRING && strings.HasPrefix(raw, `"`) {
+				// The scanner value has doubled quotes and escapes resolved.
+				raw = "`" + strings.ReplaceAll(value, "`", "``") + "`"
+			}
+			text.WriteString(raw)
 		}
 		switch token {
 		case '(':
