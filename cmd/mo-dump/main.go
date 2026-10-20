@@ -138,6 +138,10 @@ func main() {
 				opt.dbs = append(opt.dbs, db)
 			}
 		}
+		if len(opt.dbs) == 0 {
+			err = moerr.NewInvalidInput(ctx, fmt.Sprintf("database '%s' contains no valid database name", opt.database))
+			return
+		}
 	}
 
 	if len(opt.tbl) > 0 {
