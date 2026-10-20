@@ -85,12 +85,12 @@ func TestMoDumpDbOptionValidation(t *testing.T) {
 		{name: "commas and spaces", args: []string{"-db", " , , "}, wantErr: "contains no valid database name"},
 		{name: "empty option", args: []string{"-db", ""}, wantErr: "database must be specified"},
 		{
-			// A list with at least one valid name must pass argument validation. Port 1
-			// refuses the connection immediately, so the error comes from the dial
-			// instead of the -db validation.
+			// A list with at least one valid name must pass argument validation.
+			// The host check runs after -db parsing and before any connection,
+			// so -h ':' deterministically proves the -db list was accepted.
 			name:       "valid name with trailing comma",
-			args:       []string{"-db", "testdb,, ", "-P", "1"},
-			wantErr:    "modump error",
+			args:       []string{"-db", "testdb,, ", "-h", ":"},
+			wantErr:    "host can not have character ':'",
 			notWantErr: []string{"contains no valid database name", "database must be specified"},
 		},
 	}
