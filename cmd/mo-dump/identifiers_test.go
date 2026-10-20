@@ -240,7 +240,9 @@ func TestDumpIdentifiers(t *testing.T) {
 				opt := Options{dbs: []string{dbName}, emptyTables: mode != "table", noData: mode == "schema", netBufferLength: 1024}
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 					WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "")).RowsWillBeClosed()
-				want := "SET foreign_key_checks = 0;\n\n"
+				want := "SET foreign_key_checks = 0;\n\n" +
+					"SET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\n" +
+					"SET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n"
 				query := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersFor(false)
 				args := []driver.Value{dbName, dbName}
 				if opt.emptyTables {
@@ -307,7 +309,7 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 			if kind == catalog.SystemViewRel {
 				require.Contains(t, got, "USE `d`;\n\n"+drop+ddl+";\n\n\nSET SESSION sql_mode = @modump_saved_sql_mode;\nSET foreign_key_checks = 1;\n")
 			} else {
-				require.Equal(t, "SET foreign_key_checks = 0;\n\n"+drop+ddl+";\n\n\nSET foreign_key_checks = 1;\n", got)
+				require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n"+drop+ddl+";\n\n\nSET foreign_key_checks = 1;\n", got)
 			}
 		})
 	}
@@ -335,7 +337,7 @@ func TestLoadIdentifiers(t *testing.T) {
 			if local {
 				prefix += " LOCAL"
 			}
-			require.Equal(t, prefix+" INFILE '"+root+"/work''`\\\\dir/d_a''`\\\\b.csv' INTO TABLE `a'``\\b` FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", got)
+			require.Equal(t, prefix+" INFILE "+sqlStringLiteral("d_a'`\\b.csv")+" INTO TABLE "+quoteIdentifier("a'`\\b")+" FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", got)
 			data, err := os.ReadFile(filepath.Join(dir, "d_a'`\\b.csv"))
 			require.NoError(t, err)
 			require.Equal(t, "1\n", string(data))
