@@ -22,8 +22,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +90,9 @@ func main() {
 			}
 		}
 		if err == nil && flag.NFlag() != 0 {
+			// Restore the session sql_mode pinned at the top of the script
+			// (matrixorigin/matrixone#30587).
+			fmt.Fprintf(os.Stdout, "SET SESSION sql_mode=@MODUMP_SAVED_SQL_MODE;\n\n\n")
 			fmt.Fprintf(os.Stdout, "/* MODUMP SUCCESS, COST %v */\n", time.Since(dumpStart))
 			if opt.toCsv {
 				fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
@@ -231,6 +236,11 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
 			fmt.Println(createDb, ";")
 			fmt.Printf("USE `%s`;\n\n\n", db)
+			// String literals in this script were quoted assuming backslash
+			// escapes. Pin the restore session's sql_mode correspondingly even
+			// when it runs under NO_BACKSLASH_ESCAPES, and restore it at the
+			// end of the script (matrixorigin/matrixone#30587).
+			fmt.Printf("SET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT REPLACE(@@session.sql_mode,'NO_BACKSLASH_ESCAPES',''));\n\n\n")
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -617,23 +627,49 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 
 func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig) error {
 	fname := fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
-	pwd := os.Getenv("PWD")
 	f, err := os.Create(fname)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	err = toCsv(r, f, rowResults, cols, csvConf)
 	if err != nil {
+		f.Close()
 		return err
 	}
+	// A failed final flush/close must fail the dump: silently truncated CSV
+	// restores as corrupted data (matrixorigin/matrixone#30628).
+	if cerr := f.Close(); cerr != nil {
+		return fmt.Errorf("close csv file %s: %w", fname, cerr)
+	}
+	// The CSV file is written next to the dump script, so reference it by its
+	// plain name: the script stays restorable after both are moved to another
+	// directory or machine (matrixorigin/matrixone#30481). Path and delimiter
+	// are emitted as escaped SQL string literals (matrixorigin/matrixone#30590).
+	path := sqlStringLiteral(fname)
+	delim := sqlStringLiteral(string(csvConf.fieldDelimiter))
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE `%s` FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", path, tbl, delim)
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA INFILE %s INTO TABLE `%s` FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", path, tbl, delim)
 	}
 	return nil
+}
+
+// sqlStringLiteral renders s as a backslash-escaped SQL string literal. The
+// dump script pins a backslash-escapes sql_mode at restore time
+// (matrixorigin/matrixone#30587), so \' and \\ are always valid there.
+func sqlStringLiteral(s string) string {
+	var b strings.Builder
+	b.WriteByte('\'')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' || s[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // toCsv converts the result from mo to csv file
@@ -653,7 +689,16 @@ func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvC
 			return err
 		}
 	}
-	return err
+	if err = r.Err(); err != nil {
+		return err
+	}
+	// csv.NewWriter buffers; a failed write (including the final Flush) is
+	// reported only via Error(). Propagating it stops the dump from claiming
+	// success while the CSV is truncated (matrixorigin/matrixone#30628).
+	if err = csvWriter.Error(); err != nil {
+		return fmt.Errorf("write csv: %w", err)
+	}
+	return nil
 }
 
 // toCsvFields converts the result from mo to string
@@ -752,13 +797,29 @@ func convertValue(v any, typ string) string {
 	}
 
 	switch typ {
-	case "float":
+	case "float", "double":
 		retStr := string(ret)
 		if (retStr[0] >= '0' && retStr[0] <= '9') || (retStr[0] == '-' && retStr[1] >= '0' && retStr[1] <= '9') {
+			// The wire text of a finite FLOAT that overflows the float32
+			// lexical range (e.g. its max finite value) cannot be re-inserted
+			// as a bare numeric literal; CAST parses it back losslessly
+			// (matrixorigin/matrixone#30598).
+			if typ == "float" {
+				if f, err := strconv.ParseFloat(retStr, 64); err == nil && math.Abs(f) > math.MaxFloat32 {
+					return "cast('" + retStr + "' as float)"
+				}
+			}
+			// A bare -0 loses the negative-zero sign when re-inserted as a
+			// numeric literal; CAST preserves it (matrixorigin/matrixone#30598).
+			if retStr == "-0" {
+				return "cast('-0' as " + typ + ")"
+			}
 			return retStr
 		}
-		return "'" + retStr + "'" // NaN, +Inf, -Inf, maybe no hacking need in the future
-	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "double", "bool", "boolean":
+		return "'" + retStr + "'" // NaN, +Inf, -Inf: quoted so the server converts
+		// the literal on insert. Applies to DOUBLE as well
+		// (matrixorigin/matrixone#30596).
+	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "bool", "boolean":
 		return string(ret)
 	case "vecf32", "vecf64":
 		return string(ret)
