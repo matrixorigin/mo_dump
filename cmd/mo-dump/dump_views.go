@@ -37,7 +37,9 @@ func normalizedViewName(database, name string, mode viewSQLMode) viewName {
 func orderDumpViews(ctx context.Context, views []dumpView, mode viewSQLMode) ([]dumpView, error) {
 	positions := make(map[viewName]int, len(views))
 	for i, view := range views {
-		key := normalizedViewName(view.name.database, view.name.name, mode)
+		// Catalog names are already object identities. Only references are
+		// normalized by their owning view's parser environment.
+		key := view.name
 		if _, exists := positions[key]; exists {
 			return nil, fmt.Errorf("duplicate view %s.%s", view.name.database, view.name.name)
 		}
@@ -90,6 +92,9 @@ func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[v
 	}
 	if view.definition != nil {
 		mode = mode.withSQLMode(view.definition.parserMode())
+		if lower := view.definition.LowerCaseTableNames; lower != nil {
+			mode.lowerCaseTableNames = *lower
+		}
 	}
 	refs, err := viewDependencies(view.name.database, view.create, mode)
 	if err != nil {

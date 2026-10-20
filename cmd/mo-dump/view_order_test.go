@@ -86,7 +86,7 @@ func TestOrderDumpViews(t *testing.T) {
 		{name: "partial_cycle", views: []dumpView{v("db", "ok", "SELECT 1"), v("db", "v", "SELECT * FROM v")}, err: "cyclic view dependencies"},
 		{name: "invalid", views: []dumpView{{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT FROM"}}, err: "analyze view db.v"},
 		{name: "not_a_view", views: []dumpView{{name: viewName{"db", "v"}, create: "SELECT 1"}}, err: "expected CREATE VIEW"},
-		{name: "duplicate", views: []dumpView{v("db", "v", "SELECT 1"), v("DB", "V", "SELECT 1")}, err: "duplicate view"},
+		{name: "duplicate", views: []dumpView{v("db", "v", "SELECT 1"), v("db", "v", "SELECT 2")}, err: "duplicate view"},
 		{name: "multiple_statements", views: []dumpView{{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT 1; CREATE VIEW other AS SELECT 2"}}, err: "expected one CREATE VIEW"},
 	}
 	for _, tt := range tests {
@@ -123,7 +123,7 @@ func TestCaseSensitiveViews(t *testing.T) {
 		require.Equal(t, []dumpView{views[1], views[0]}, ordered)
 	}
 	_, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
-	require.ErrorContains(t, err, "duplicate view")
+	require.ErrorContains(t, err, "cyclic view dependencies")
 	refs, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "result"}, create: "CREATE VIEW result AS WITH v AS (SELECT 1) SELECT * FROM V"}, viewSQLMode{})
 	require.NoError(t, err)
 	require.Equal(t, map[viewName]struct{}{{"db", "V"}: {}}, refs)

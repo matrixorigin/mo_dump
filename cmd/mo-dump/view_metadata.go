@@ -21,11 +21,13 @@ import (
 	"strings"
 )
 
-// This subset is wire-compatible with both legacy and current ViewData. A nil
-// SQLMode is not equivalent to the explicitly persisted empty string.
+// This subset is wire-compatible with legacy and current ViewData. Nil SQLMode
+// uses the legacy parser fallback; nil LowerCaseTableNames inherits the caller.
+// Explicitly persisted empty SQLMode and zero name mode must remain distinct.
 type viewDefinition struct {
-	Stmt    string
-	SQLMode *string `json:"sql_mode"`
+	Stmt                string
+	SQLMode             *string `json:"sql_mode"`
+	LowerCaseTableNames *int64  `json:"lower_case_table_names"`
 }
 
 func (definition *viewDefinition) parserMode() string {
@@ -54,6 +56,9 @@ func getDumpView(ctx context.Context, database, name string, isSys bool) (dumpVi
 	}
 	if definition == nil || strings.TrimSpace(definition.Stmt) == "" {
 		return dumpView{}, fmt.Errorf("view definition %s.%s has no statement", database, name)
+	}
+	if lower := definition.LowerCaseTableNames; lower != nil && (*lower < 0 || *lower > 2) {
+		return dumpView{}, fmt.Errorf("view definition %s.%s has unsupported lower_case_table_names: %d", database, name, *lower)
 	}
 	return dumpView{name: viewName{database, name}, create: definition.Stmt, definition: definition}, nil
 }
