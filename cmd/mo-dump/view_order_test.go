@@ -25,6 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const nestedLocalCTEQuery = "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (WITH p AS (SELECT * FROM q), z AS (SELECT * FROM p) SELECT * FROM z), p AS (SELECT 7 AS id) SELECT * FROM x) t"
+
 func TestCollectViewRelations(t *testing.T) {
 	for _, tc := range []struct {
 		name, query string
@@ -53,6 +55,7 @@ func TestCollectViewRelations(t *testing.T) {
 		{"used chain", "WITH x AS (SELECT * FROM parent), y AS (SELECT * FROM x) SELECT * FROM y JOIN y again", 0, []string{"parent"}},
 		{"late required", "WITH p AS (SELECT * FROM parent) SELECT (WITH unused AS (SELECT * FROM p) SELECT 1), (SELECT count(*) FROM p)", 0, []string{"parent"}},
 		{"definition scope", "WITH p AS (SELECT * FROM parent), q AS (SELECT * FROM p) SELECT * FROM (WITH p AS (SELECT * FROM other) SELECT * FROM q) x", 0, []string{"parent", "?other"}},
+		{"local binding before ancestor mask", nestedLocalCTEQuery, 1, []string{"q"}},
 		{"forward masks outer", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"p"}},
 		{"no forward mask", "WITH p AS (SELECT * FROM parent) SELECT * FROM (WITH x AS (SELECT * FROM p) SELECT * FROM x) q", 0, []string{"parent"}},
 		{"earlier local shadows outer", "WITH p AS (SELECT * FROM parent) SELECT * FROM (WITH p AS (SELECT * FROM local_parent), x AS (SELECT * FROM p) SELECT * FROM x) q", 0, []string{"local_parent", "?parent"}},
@@ -65,6 +68,10 @@ func TestCollectViewRelations(t *testing.T) {
 		{"qualified bypasses forward mask", "WITH p AS (SELECT 42 AS id) SELECT * FROM (WITH x AS (SELECT * FROM d.p), p AS (SELECT 7 AS id) SELECT * FROM x) q", 0, []string{"d.p"}},
 		{"table function", "SELECT * FROM generate_series((SELECT max(id) FROM p), 10) q", 0, []string{"p"}},
 		{"dual", "SELECT 1 FROM dual", 0, nil},
+		{"values constant", "VALUES ROW(1)", 0, nil},
+		{"values subquery", "VALUES ROW((SELECT max(id) FROM q))", 0, []string{"q"}},
+		{"values multiple rows", "VALUES ROW((SELECT id FROM p)), ROW((SELECT id FROM q))", 0, []string{"p", "q"}},
+		{"values ordering", "VALUES ROW(2), ROW(1) ORDER BY column_0 LIMIT 1", 0, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var got []string
@@ -80,6 +87,23 @@ func TestCollectViewRelations(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
+
+func TestCollectValuesViewHeaders(t *testing.T) {
+	for _, ddl := range []string{
+		"CREATE VIEW `AS` (`id`) AS VALUES ROW((SELECT id FROM q));",
+		"CREATE /* AS VALUES */ OR REPLACE VIEW v AS /* AS */ VALUES ROW((SELECT id FROM q))",
+		"CREATE VIEW `a``AS` AS VALUES ROW((SELECT id FROM q)), ROW(2) ORDER BY column_0 LIMIT 1",
+	} {
+		t.Run(ddl, func(t *testing.T) {
+			var got []string
+			require.NoError(t, collectViewRefs(context.Background(), ddl, 1, func(ref *tree.TableName, required bool) {
+				require.True(t, required)
+				got = append(got, string(ref.Name()))
+			}))
+			require.Equal(t, []string{"q"}, got)
 		})
 	}
 }
@@ -136,6 +160,14 @@ func TestViewOrderFailureIsAtomic(t *testing.T) {
 		{"required and advisory cycles", []string{"CREATE VIEW a AS SELECT * FROM b", "CREATE VIEW b AS SELECT * FROM a", "CREATE VIEW c AS WITH unused AS (SELECT * FROM c) SELECT 1"}, []string{"a", "b", "c"}, 0, "block `a`, `b`"},
 		{"invalid sql", []string{"CREATE VIEW a AS SELECT * FROM"}, []string{"a"}, 0, "database d, view a:"},
 		{"not a view", []string{"CREATE TABLE a(id INT)"}, []string{"a"}, 0, "expected CREATE VIEW"},
+		{"standalone values", []string{"VALUES ROW(1)"}, []string{"a"}, 0, "expected CREATE VIEW"},
+		{"invalid values", []string{"CREATE VIEW a AS VALUES ROW("}, []string{"a"}, 0, "database d, view a:"},
+		{"invalid values header", []string{"CREATE VIEW () AS VALUES ROW(1)"}, []string{"a"}, 0, "database d, view a:"},
+		{"non view values header", []string{"CREATE TABLE a AS VALUES ROW(1)"}, []string{"a"}, 0, "database d, view a:"},
+		{"invalid source type", []string{"CREATE VIEW a AS SHOW DATABASES"}, []string{"a"}, 0, "database d, view a:"},
+		{"multiple statements", []string{"CREATE VIEW a AS VALUES ROW(1); DROP TABLE t"}, []string{"a"}, 0, "database d, view a:"},
+		{"missing as", []string{"CREATE VIEW a VALUES ROW(1)"}, []string{"a"}, 0, "database d, view a:"},
+		{"lexer error", []string{"CREATE VIEW `unterminated AS VALUES ROW(1)"}, []string{"a"}, 0, "database d, view a:"},
 		{"invalid mode", []string{"CREATE VIEW a AS SELECT 1"}, []string{"a"}, 3, "invalid lower_case_table_names"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,6 +244,9 @@ func TestViewOrderCTECompatibility(t *testing.T) {
 		{"used chain", []string{"CREATE VIEW a AS WITH x AS (SELECT * FROM b), y AS (SELECT * FROM x) SELECT * FROM y", "CREATE VIEW b AS SELECT 1"}, []string{"a", "b"}, []string{"b", "a"}},
 		{"mixed cycle", []string{"CREATE VIEW a AS SELECT * FROM b", "CREATE VIEW b AS WITH unused AS (SELECT * FROM a) SELECT 1"}, []string{"a", "b"}, []string{"b", "a"}},
 		{"independent literals", []string{"CREATE VIEW alpha AS SELECT 'beta' AS v", "CREATE VIEW beta AS SELECT 'alpha' AS v"}, []string{"alpha", "beta"}, []string{"alpha", "beta"}},
+		{"values prerequisite", []string{"CREATE VIEW a_child AS VALUES ROW((SELECT id FROM q))", "CREATE VIEW q AS SELECT 2 AS id"}, []string{"a_child", "q"}, []string{"q", "a_child"}},
+		{"local binding avoids false cycle", []string{"CREATE VIEW a_child AS " + nestedLocalCTEQuery, "CREATE VIEW q AS SELECT 2 AS id", "CREATE VIEW p AS SELECT * FROM a_child"}, []string{"a_child", "q", "p"}, []string{"q", "a_child", "p"}},
+		{"local binding survives advisory fallback", []string{"CREATE VIEW a_child AS " + nestedLocalCTEQuery, "CREATE VIEW unused_cycle AS WITH unused AS (SELECT * FROM unused_cycle) SELECT 8 AS id", "CREATE VIEW q AS SELECT 2 AS id"}, []string{"a_child", "unused_cycle", "q"}, []string{"unused_cycle", "q", "a_child"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tables := make(Tables, len(tc.names))

@@ -21,7 +21,6 @@ import (
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
-	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
 
@@ -136,17 +135,13 @@ func viewIdentifier(db, name string, lower int64) (string, string) {
 }
 
 func collectViewRefs(ctx context.Context, ddl string, lower int64, emit func(*tree.TableName, bool)) error {
-	stmt, err := mysql.ParseOne(ctx, ddl, 0)
+	stmt, source, err := parseViewSource(ctx, ddl)
 	if err != nil {
 		return err
 	}
 	defer stmt.Free()
-	view, ok := stmt.(*tree.CreateView)
-	if !ok {
-		return fmt.Errorf("expected CREATE VIEW, got %T", stmt)
-	}
 	walker := viewRefWalker{lower: lower, emit: emit}
-	walker.walk(reflect.ValueOf(view.AsSource), nil, true)
+	walker.walk(reflect.ValueOf(source), nil, true)
 	// Finish required expansion globally before touching unused declarations.
 	// Nested SELECTs can append further declarations while this queue drains.
 	for i := 0; i < len(walker.pending); i++ {
@@ -181,8 +176,8 @@ type viewCTEScope struct {
 	masked   []*viewCTEBinding
 }
 
-// Masks remain active inside nested queries of a CTE definition, including
-// nested WITH declarations. Like the binder, check them before visible names.
+// Match findCTE one context at a time: this context's mask, its bindings,
+// then the parent context. An ancestor mask cannot hide a nearer binding.
 func (scope *viewCTEScope) lookup(name string) *viewCTEBinding {
 	for current := scope; current != nil; current = current.parent {
 		for _, binding := range current.masked {
@@ -190,8 +185,6 @@ func (scope *viewCTEScope) lookup(name string) *viewCTEBinding {
 				return nil
 			}
 		}
-	}
-	for current := scope; current != nil; current = current.parent {
 		for i := len(current.bindings) - 1; i >= 0; i-- {
 			if name == current.bindings[i].name {
 				return current.bindings[i]
@@ -241,7 +234,13 @@ func (w *viewRefWalker) walk(value reflect.Value, ctes *viewCTEScope, required b
 					binding.visible = &viewCTEScope{parent: ctes, bindings: bindings[:end], masked: bindings[i+1:]}
 					w.pending = append(w.pending, binding)
 				}
-				ctes = &viewCTEScope{parent: ctes, bindings: bindings}
+				// A query inherits its active CTE mask. Expanding another CTE
+				// instead uses that declaration's own binding.visible above.
+				scope := &viewCTEScope{parent: ctes, bindings: bindings}
+				if ctes != nil {
+					scope.masked = ctes.masked
+				}
+				ctes = scope
 			}
 			w.walkFields(value.Elem(), ctes, required, "With")
 			return
