@@ -108,6 +108,63 @@ func TestCollectValuesViewHeaders(t *testing.T) {
 	}
 }
 
+func TestScanViewSQL(t *testing.T) {
+	for _, tc := range []struct{ ddl, want string }{
+		{"CREATE VIEW `AS``名` /*! AS */ VALUES ROW(' AS ) (')", "CREATE VIEW `AS``名` AS VALUES ROW ( ' AS ) (' ) "},
+		{"CREATE VIEW v /*!50000 AS */ VALUES ROW('/*! AS */')", "CREATE VIEW v AS VALUES ROW ( '/*! AS */' ) "},
+		{"CREATE VIEW v AS SELECT q.id>=1 AS ok FROM `q` -- AS\n", "CREATE VIEW v AS SELECT q . id >= 1 AS ok FROM `q` "},
+	} {
+		t.Run(tc.ddl, func(t *testing.T) {
+			text, sourceStart, err := scanViewSQL(tc.ddl)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, text)
+			require.Positive(t, sourceStart)
+			require.Equal(t, "AS", text[sourceStart-2:sourceStart])
+		})
+	}
+}
+
+func TestViewSourceScannerReuse(t *testing.T) {
+	for _, tc := range []struct {
+		name, trigger string
+		wantErr       bool
+	}{
+		{"executable AS", "CREATE VIEW a_trigger /*! AS */ VALUES ROW(1)", false},
+		{"executable source", "CREATE VIEW a_trigger /*! AS VALUES ROW(1) */", false},
+		{"versioned source", "CREATE VIEW a_trigger /*!50000 AS VALUES ROW(1) */", false},
+		{"ordinary comment", "CREATE VIEW a_trigger AS /* AS */ VALUES ROW(1)", false},
+		{"unterminated comment", "CREATE VIEW a_trigger /*! AS VALUES ROW(1)", true},
+		{"invalid expression", "CREATE VIEW a_trigger /*! AS VALUES ROW(+) */", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			collect := func(ddl string) error {
+				return collectViewRefs(context.Background(), ddl, 1, func(*tree.TableName, bool) {
+					t.Fatal("constant view must not emit a relation")
+				})
+			}
+			const victim = "CREATE VIEW b_victim AS VALUES ROW(' AS ) (')"
+			require.NoError(t, collect(victim))
+			if tc.wantErr {
+				require.Error(t, collect(tc.trigger))
+			} else {
+				require.NoError(t, collect(tc.trigger))
+			}
+			require.NoError(t, collect(victim), "the next VALUES parse must be independent")
+			require.NoError(t, collect("CREATE VIEW c_victim AS SELECT '/*! AS ) ( */' AS v"), "the next SELECT parse must be independent")
+		})
+	}
+}
+
+func TestViewOrderScannerReuse(t *testing.T) {
+	ddl := []string{"CREATE VIEW a_trigger /*! AS */ VALUES ROW(1)", "CREATE VIEW b_victim AS VALUES ROW(' AS ) (')"}
+	tables := Tables{{Name: "a_trigger", Kind: catalog.SystemViewRel}, {Name: "b_victim", Kind: catalog.SystemViewRel}}
+	before := append([]string(nil), ddl...)
+	require.NoError(t, adjustViewOrder(context.Background(), "d", 1, ddl, tables))
+	require.Equal(t, before, ddl, "DDL including executable comments must be emitted unchanged")
+	require.Equal(t, "a_trigger", tables[0].Name)
+	require.Equal(t, "b_victim", tables[1].Name)
+}
+
 func TestViewOrderDependencies(t *testing.T) {
 	for _, tc := range []struct {
 		name, db, parent, query string
