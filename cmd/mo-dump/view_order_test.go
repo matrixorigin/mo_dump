@@ -21,6 +21,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/stretchr/testify/require"
 )
@@ -124,6 +126,56 @@ func TestScanViewSQL(t *testing.T) {
 	}
 }
 
+func TestScanViewTokenEquivalence(t *testing.T) {
+	type token struct {
+		id    int
+		value string
+	}
+	read := func(sql string) []token {
+		scanner := mysql.NewScanner(dialect.MYSQL, sql)
+		scanner.CommentFlag = false
+		defer func() {
+			scanner.CommentFlag = false
+			mysql.PutScanner(scanner)
+		}()
+		var tokens []token
+		for {
+			id, value := scanner.Scan()
+			if id == 0 {
+				return tokens
+			}
+			require.NotEqual(t, mysql.LEX_ERROR, id, sql)
+			tokens = append(tokens, token{id, value})
+		}
+	}
+	for _, body := range []string{
+		"/*! SELECT 0*34 AS val */",
+		"/*! SELECT 2*id FROM base */",
+		"/*! SELECT 2 * 34 AS val */",
+		"SELECT 2*34 AS val",
+		"/*! SELECT 7%34, 2+34, 9-34, 8/34 */",
+		"/*! SELECT a<=3, a!=4, a<=>5 FROM q */",
+		"/*! SELECT 1 AS val",
+		"/*! VALUES ROW(1)",
+		"/*!50000 SELECT 1 AS val",
+		"/*! SELECT 'word', '-word', 1 AS val */",
+		"SELECT/* AS */1 AS `x``名`",
+		"SELECT begin/* x */work FROM q",
+		"SELECT begin/* x */transaction FROM q",
+		"SELECT begin work FROM q",
+		"VALUES ROW(' AS ) ('), ROW('/*! AS */')",
+		"SELECT 'a\\\\b', 'a\\'b', 1e-2, 0x12 AS v",
+	} {
+		t.Run(body, func(t *testing.T) {
+			ddl := "CREATE VIEW v AS " + body
+			want := read(ddl)
+			text, _, err := scanViewSQL(ddl)
+			require.NoError(t, err)
+			require.Equal(t, want, read(text), "parser input must preserve the original scanner token stream")
+		})
+	}
+}
+
 func TestViewSourceScannerReuse(t *testing.T) {
 	for _, tc := range []struct {
 		name, trigger string
@@ -133,7 +185,9 @@ func TestViewSourceScannerReuse(t *testing.T) {
 		{"executable source", "CREATE VIEW a_trigger /*! AS VALUES ROW(1) */", false},
 		{"versioned source", "CREATE VIEW a_trigger /*!50000 AS VALUES ROW(1) */", false},
 		{"ordinary comment", "CREATE VIEW a_trigger AS /* AS */ VALUES ROW(1)", false},
-		{"unterminated comment", "CREATE VIEW a_trigger /*! AS VALUES ROW(1)", true},
+		{"server accepted executable EOF", "CREATE VIEW a_trigger /*! AS VALUES ROW(1)", false},
+		{"server accepted SELECT EOF", "CREATE VIEW a_trigger AS /*! SELECT 1 AS val", false},
+		{"adjacent multiply", "CREATE VIEW a_trigger AS /*! SELECT 0*34 AS val */", false},
 		{"invalid expression", "CREATE VIEW a_trigger /*! AS VALUES ROW(+) */", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

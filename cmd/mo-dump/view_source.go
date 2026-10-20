@@ -66,8 +66,8 @@ func parseViewSource(ctx context.Context, ddl string) (tree.Statement, tree.Stat
 	return nil, nil, err
 }
 
-// scanViewSQL preserves raw token spelling, including quoted payloads, while
-// removing comment wrappers only in the private dependency-parsing copy. This
+// scanViewSQL preserves the scanner's token stream, including quoted payloads,
+// while removing comment wrappers in the private dependency-parsing copy. This
 // also prevents the parser from pooling an unfinished executable-comment state
 // when it rejects a newer grammar before reaching the closing comment marker.
 // dumpData continues to emit the original, unmodified DDL.
@@ -85,16 +85,22 @@ func scanViewSQL(ddl string) (string, int, error) {
 		token, value := scanner.Scan()
 		switch token {
 		case 0:
-			if scanner.CommentFlag {
-				return "", -1, fmt.Errorf("unterminated executable comment in view SQL")
-			}
+			// MatrixOne accepts executable comments that end at request EOF.
+			// Leave grammar validation to the parser; defer still resets state.
 			return text.String(), sourceStart, nil
 		case mysql.LEX_ERROR:
 			return "", -1, fmt.Errorf("invalid token in view SQL: %s", value)
 		}
-		// Scan skips comments recursively and leaves PrePos at the token, not
-		// at the preceding comment. Keep quotes/escapes from the original SQL.
-		text.WriteString(strings.TrimSpace(ddl[scanner.PrePos:scanner.Pos]))
+		// ASCII tokens describe their own spelling. In the pinned scanner,
+		// the consumed span for '*' inside an executable comment can also
+		// contain the following character; that character is not part of the
+		// emitted token. Preserve scanner semantics, not its consumed span.
+		if token < 256 {
+			text.WriteByte(byte(token))
+		} else {
+			// Named tokens retain the original quotes and escapes.
+			text.WriteString(strings.TrimSpace(ddl[scanner.PrePos:scanner.Pos]))
+		}
 		switch token {
 		case '(':
 			depth++
@@ -105,6 +111,13 @@ func scanViewSQL(ddl string) (string, int, error) {
 				sourceStart = text.Len()
 			}
 		}
-		text.WriteByte(' ')
+		if token == mysql.SPBEGIN {
+			// BEGIN is classified using raw lookahead before comments are
+			// skipped. An inert comment preserves SPBEGIN even if the next
+			// token is WORK/TRANSACTION (or EOF) in the parsing copy.
+			text.WriteString(" /* */ ")
+		} else {
+			text.WriteByte(' ')
+		}
 	}
 }
