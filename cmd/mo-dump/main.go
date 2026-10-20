@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -729,10 +730,15 @@ func writeCsvRecord(w io.Writer, fields []string, nulls []bool, delim rune) erro
 }
 
 // csvFieldNeedsQuote reports whether a non-null field must be enclosed in
-// quotes: it contains the delimiter, a quote or a line break, or its content
-// would otherwise be read back as SQL NULL.
+// quotes: it contains the delimiter, a quote or a line break, it starts with
+// whitespace (unquoted whitespace-leading and whitespace-only records are
+// dropped by older loaders), or its content would otherwise be read back as
+// SQL NULL.
 func csvFieldNeedsQuote(field string, delim rune) bool {
 	if strings.EqualFold(field, "NULL") {
+		return true
+	}
+	if r1, _ := utf8.DecodeRuneInString(field); unicode.IsSpace(r1) {
 		return true
 	}
 	return strings.ContainsRune(field, delim) || strings.ContainsAny(field, "\"\r\n")
@@ -847,6 +853,12 @@ func convertValue2(v any, typ string) (sql.RawBytes, string) {
 	}
 }
 
+// validFieldDelimiter mirrors encoding/csv's delimiter rule: the delimiter
+// cannot be '"', '\r', '\n', or an invalid rune.
+func validFieldDelimiter(r rune) bool {
+	return r != 0 && r != '"' && r != '\r' && r != '\n' && utf8.ValidRune(r) && r != utf8.RuneError
+}
+
 // checkFieldDelimiter checks string is valid utf8 character and returns rune
 func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 	if utf8.ValidString(s) {
@@ -854,7 +866,7 @@ func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 			return rune(0), moerr.NewInvalidInput(ctx, "there are multiple utf8 characters for csv field delimiter. only one utf8 character is allowed")
 		}
 		runCh, _ := utf8.DecodeRuneInString(s)
-		if runCh == utf8.RuneError {
+		if !validFieldDelimiter(runCh) {
 			return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter is invalid utf8 character")
 		}
 		return runCh, nil

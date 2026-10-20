@@ -241,6 +241,12 @@ func Test_toCsvLine(t *testing.T) {
 		// binary (non-UTF-8) values must survive byte-identical
 		{"binary", []any{makeValue("\xff\xfe")}, []*Column{{Name: "col1", Type: "blob"}}, false, ',', "\xff\xfe\n"},
 		{"binary with quote", []any{makeValue("\xff\"\xfe")}, []*Column{{Name: "col1", Type: "blob"}}, false, ',', "\"\xff\"\"\xfe\"\n"},
+		// whitespace-leading values must be quoted: unquoted whitespace-only
+		// records are dropped by older loaders
+		{"leading space", text(" a"), varcharCol, false, ',', "\" a\"\n"},
+		{"space only", text(" "), varcharCol, false, ',', "\" \"\n"},
+		{"tabs only", text("\t\t"), varcharCol, false, ',', "\"\t\t\"\n"},
+		{"nbsp only", text("  "), varcharCol, false, ',', "\"  \"\n"},
 	}
 	for _, kase := range kases {
 		t.Run(kase.name, func(t *testing.T) {
@@ -252,6 +258,23 @@ func Test_toCsvLine(t *testing.T) {
 			assert.Equal(t, kase.want, bb.String())
 		})
 	}
+}
+
+// Test_toCsvLine_whitespaceOnlyRows: every whitespace-only record must be
+// written quoted, so an older loader does not skip it as an empty line.
+func Test_toCsvLine_whitespaceOnlyRows(t *testing.T) {
+	cols := []*Column{{Name: "col1", Type: "varchar"}}
+	bb := bytes.Buffer{}
+	line := make([]string, 1)
+	nulls := make([]bool, 1)
+	rows := []string{" ", "\t", " ", "  \t "}
+	for _, row := range rows {
+		err := toCsvLine(&bb, ',', []any{makeValue(row)}, cols, line, nulls, false)
+		assert.NoError(t, err)
+	}
+	got := bb.String()
+	assert.Equal(t, len(rows), strings.Count(got, "\n"))
+	assert.Equal(t, "\" \"\n\"\t\"\n\" \"\n\"  \t \"\n", got)
 }
 
 func Test_checkFieldDelimiter(t *testing.T) {
@@ -313,6 +336,33 @@ func Test_checkFieldDelimiter(t *testing.T) {
 			want: defaultFieldDelimiter,
 			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
 				assert.NoError(t, err)
+				return false
+			},
+		},
+		{
+			name: "double quote",
+			args: args{ctx: nil, s: "\""},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
+				return false
+			},
+		},
+		{
+			name: "line feed",
+			args: args{ctx: nil, s: "\n"},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
+				return false
+			},
+		},
+		{
+			name: "carriage return",
+			args: args{ctx: nil, s: "\r"},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
 				return false
 			},
 		},
