@@ -53,7 +53,7 @@ func TestViewDefaultDatabase(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, []dumpView{decoy, source, view}, ordered)
 			}
-			showDumpView(view)
+			require.NoError(t, showDumpView(view, viewSQLMode{lowerCaseTableNames: 1}))
 			data, err := os.ReadFile(output.Name())
 			require.NoError(t, err)
 			text := string(data)

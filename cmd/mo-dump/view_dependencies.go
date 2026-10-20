@@ -84,13 +84,23 @@ func (t viewToken) symbol(symbol string) bool {
 // View SQL has already been accepted by the server. Only relation positions are
 // needed here, not a second validation of its expression grammar. In particular,
 // an older client's parser must not reject new WINDOW, VALUES, or ROLLUP syntax.
+type viewAnalysis struct {
+	references          map[viewName]struct{}
+	usesDefaultDatabase bool
+}
+
 func viewDependencies(database, ddl string, mode viewSQLMode) (map[viewName]struct{}, error) {
+	analysis, err := analyzeViewDependencies(database, ddl, mode)
+	return analysis.references, err
+}
+
+func analyzeViewDependencies(database, ddl string, mode viewSQLMode) (viewAnalysis, error) {
 	tokens, err := tokenizeViewSQL(ddl, mode)
 	if err != nil {
-		return nil, err
+		return viewAnalysis{}, err
 	}
 	if len(tokens) == 0 || !tokens[0].keyword("create") {
-		return nil, fmt.Errorf("expected CREATE VIEW")
+		return viewAnalysis{}, fmt.Errorf("expected CREATE VIEW")
 	}
 	view, source := false, -1
 	for i := 1; i < len(tokens); i++ {
@@ -104,16 +114,16 @@ func viewDependencies(database, ddl string, mode viewSQLMode) (map[viewName]stru
 		}
 	}
 	if source < 0 {
-		return nil, fmt.Errorf("expected CREATE VIEW AS query")
+		return viewAnalysis{}, fmt.Errorf("expected CREATE VIEW AS query")
 	}
 	collector := viewReferenceCollector{
-		database: mode.name(database), mode: mode, tokens: tokens,
+		database: database, mode: mode, tokens: tokens,
 		refs: make(map[viewName]struct{}),
 	}
 	if err := collector.query(source, len(tokens), nil); err != nil {
-		return nil, err
+		return viewAnalysis{}, err
 	}
-	return collector.refs, nil
+	return viewAnalysis{references: collector.refs, usesDefaultDatabase: collector.usesDefaultDatabase}, nil
 }
 
 // Each binding retains its declaration environment, not the use-site scope.
@@ -121,6 +131,7 @@ func viewDependencies(database, ddl string, mode viewSQLMode) (map[viewName]stru
 type viewCTE struct {
 	start, end int
 	scope      *viewCTEScope
+	masked     []string
 	visiting   bool
 	done       bool
 }
@@ -129,10 +140,26 @@ type viewCTEScope struct {
 	parent  *viewCTEScope
 	name    string
 	binding *viewCTE
+	frame   bool
+	masked  []string
+}
+
+func (s *viewCTEScope) activeMask() []string {
+	for ; s != nil; s = s.parent {
+		if s.frame {
+			return s.masked
+		}
+	}
+	return nil
 }
 
 func (s *viewCTEScope) lookup(name string) *viewCTE {
 	for ; s != nil; s = s.parent {
+		for _, mask := range s.masked {
+			if mask == name {
+				return nil
+			}
+		}
 		if s.name == name {
 			return s.binding
 		}
@@ -141,10 +168,11 @@ func (s *viewCTEScope) lookup(name string) *viewCTE {
 }
 
 type viewReferenceCollector struct {
-	database string
-	mode     viewSQLMode
-	tokens   []viewToken
-	refs     map[viewName]struct{}
+	database            string
+	mode                viewSQLMode
+	tokens              []viewToken
+	refs                map[viewName]struct{}
+	usesDefaultDatabase bool
 }
 
 func (c *viewReferenceCollector) query(start, end int, scope *viewCTEScope) error {
@@ -156,6 +184,7 @@ func (c *viewReferenceCollector) query(start, end int, scope *viewCTEScope) erro
 		return fmt.Errorf("empty view query")
 	}
 	if c.tokens[start].keyword("with") {
+		activeMask := scope.activeMask()
 		start++
 		recursive := start < end && c.tokens[start].keyword("recursive")
 		if recursive {
@@ -166,6 +195,7 @@ func (c *viewReferenceCollector) query(start, end int, scope *viewCTEScope) erro
 			binding *viewCTE
 		}
 		var declarations []declaration
+		var names []string
 		for {
 			if start >= end || !c.tokens[start].word {
 				return fmt.Errorf("expected CTE name")
@@ -183,6 +213,7 @@ func (c *viewReferenceCollector) query(start, end int, scope *viewCTEScope) erro
 			body := start + 1
 			binding := &viewCTE{start: body + 1, end: c.tokens[body].close}
 			declarations = append(declarations, declaration{name, binding})
+			names = append(names, name)
 			start = binding.end + 1
 			if start >= end || !c.tokens[start].symbol(",") {
 				break
@@ -196,13 +227,17 @@ func (c *viewReferenceCollector) query(start, end int, scope *viewCTEScope) erro
 		for _, declaration := range declarations {
 			scope = &viewCTEScope{parent: scope, name: declaration.name}
 		}
-		for _, declaration := range declarations {
+		for i, declaration := range declarations {
+			declaration.binding.masked = names[i+1:]
 			declaration.binding.scope = scope
 			scope = &viewCTEScope{parent: scope, name: declaration.name, binding: declaration.binding}
 			if recursive {
 				declaration.binding.scope = scope
 			}
 		}
+		// A nested WITH replaces the local declarations, not the CTE currently
+		// being bound. Its active mask must precede those local declarations.
+		scope = &viewCTEScope{parent: scope, frame: true, masked: activeMask}
 	}
 	return c.body(start, end, scope, false)
 }
@@ -334,7 +369,7 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 		if pos+1 >= end || !c.tokens[pos+1].word {
 			return pos, fmt.Errorf("expected qualified relation name")
 		}
-		schema, name = name, c.tokens[pos+1].text
+		schema, name = c.mode.name(name), c.tokens[pos+1].text
 		pos += 2
 	}
 	if pos < end && c.tokens[pos].symbol("(") { // Table-valued function, not a VIEW.
@@ -357,7 +392,10 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 		if binding := scope.lookup(name); binding != nil {
 			if !binding.visiting && !binding.done {
 				binding.visiting = true
-				err := c.query(binding.start, binding.end, binding.scope)
+				// Binding a different CTE replaces the current frame's mask;
+				// declaration-site frames remain in the fallback chain.
+				frame := &viewCTEScope{parent: binding.scope, frame: true, masked: binding.masked}
+				err := c.query(binding.start, binding.end, frame)
 				binding.visiting = false
 				if err != nil {
 					return suffix, err
@@ -367,6 +405,7 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 			return c.relationSuffix(suffix, end)
 		}
 		schema = c.database
+		c.usesDefaultDatabase = true
 	}
 	if suffix != pos {
 		close := suffix - 1
@@ -379,7 +418,9 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 		// Only catalog-bound historical objects require an external snapshot.
 		return c.relationSuffix(suffix, end)
 	}
-	c.refs[normalizedViewName(schema, name, c.mode)] = struct{}{}
+	// An implicit schema is an already-bound default-database identity.
+	// Explicit schema tokens and the table token were normalized above.
+	c.refs[viewName{schema, name}] = struct{}{}
 	return c.relationSuffix(pos, end)
 }
 
@@ -516,17 +557,19 @@ func maskViewLiterals(sql string, mode viewSQLMode) (string, error) {
 			continue
 		}
 		if i+1 < len(sql) && sql[i:i+2] == "/*" {
-			end := strings.Index(sql[i+2:], "*/")
-			if end < 0 {
-				return "", fmt.Errorf("unterminated view comment")
+			close := strings.Index(sql[i+2:], "*/")
+			bodyEnd, end := len(sql), len(sql)
+			if close >= 0 {
+				bodyEnd = i + 2 + close
+				end = bodyEnd + 2
 			}
-			end += i + 4
 			if i+2 < len(sql) && sql[i+2] == '!' {
+				// The server executes this body through EOF when */ is absent.
 				body := i + 3
-				for body < end-2 && sql[body] >= '0' && sql[body] <= '9' {
+				for body < bodyEnd && sql[body] >= '0' && sql[body] <= '9' {
 					body++
 				}
-				masked, err := maskViewLiterals(sql[body:end-2], mode)
+				masked, err := maskViewLiterals(sql[body:bodyEnd], mode)
 				if err != nil {
 					return "", err
 				}
@@ -534,6 +577,9 @@ func maskViewLiterals(sql string, mode viewSQLMode) (string, error) {
 				out.WriteString(masked)
 				out.WriteByte(' ')
 			} else {
+				if close < 0 {
+					return "", fmt.Errorf("unterminated view comment")
+				}
 				out.WriteString(sql[i:end])
 			}
 			i = end

@@ -314,7 +314,9 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		return err
 	}
 	for _, view := range orderedViews {
-		showDumpView(view)
+		if err := showDumpView(view, mode); err != nil {
+			return err
+		}
 	}
 	// reset foreign_key_checks variable to dump file
 	fmt.Println("SET foreign_key_checks = 1;")

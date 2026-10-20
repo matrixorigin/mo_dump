@@ -153,7 +153,7 @@ func TestDumpViewModeOutput(t *testing.T) {
 			if !tt.legacy {
 				definition.SQLMode = &tt.mode
 			}
-			showDumpView(dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT 1", definition: definition})
+			require.NoError(t, showDumpView(dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT 1", definition: definition}, viewSQLMode{lowerCaseTableNames: 1}))
 			contents, err := os.ReadFile(output.Name())
 			require.NoError(t, err)
 			text := string(contents)

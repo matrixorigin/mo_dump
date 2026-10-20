@@ -35,10 +35,6 @@ func (view dumpView) defaultDatabase() string {
 	return view.name.database
 }
 
-func normalizedViewName(database, name string, mode viewSQLMode) viewName {
-	return viewName{mode.name(database), mode.name(name)}
-}
-
 // orderDumpViews sorts only dependencies within this export. Base tables have
 // already been emitted; references outside the selection remain the caller's
 // responsibility, just as for a single-database or selected-table dump.
@@ -95,8 +91,13 @@ func orderDumpViews(ctx context.Context, views []dumpView, mode viewSQLMode) ([]
 }
 
 func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[viewName]struct{}, error) {
+	analysis, err := analyzeDumpView(ctx, view, mode)
+	return analysis.references, err
+}
+
+func analyzeDumpView(ctx context.Context, view dumpView, mode viewSQLMode) (viewAnalysis, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return viewAnalysis{}, err
 	}
 	if view.definition != nil {
 		mode = mode.withSQLMode(view.definition.parserMode())
@@ -104,11 +105,11 @@ func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[v
 			mode.lowerCaseTableNames = *lower
 		}
 	}
-	refs, err := viewDependencies(view.defaultDatabase(), view.create, mode)
+	analysis, err := analyzeViewDependencies(view.defaultDatabase(), view.create, mode)
 	if err != nil {
-		return nil, fmt.Errorf("analyze view %s.%s: %w", view.name.database, view.name.name, err)
+		return viewAnalysis{}, fmt.Errorf("analyze view %s.%s: %w", view.name.database, view.name.name, err)
 	}
-	return refs, nil
+	return analysis, nil
 }
 
 func quoteIdentifier(name string) string { return "`" + strings.ReplaceAll(name, "`", "``") + "`" }

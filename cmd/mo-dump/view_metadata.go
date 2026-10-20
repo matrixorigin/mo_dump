@@ -95,7 +95,11 @@ func viewParserMode(mode string) string {
 	return strings.Join(flags, ",")
 }
 
-func showDumpView(view dumpView) {
+func showDumpView(view dumpView, mode viewSQLMode) error {
+	analysis, err := analyzeDumpView(context.Background(), view, mode)
+	if err != nil {
+		return err
+	}
 	if view.definition != nil {
 		fmt.Println("SET @modump_saved_sql_mode = @@SESSION.sql_mode;")
 		// Remove only parser flags from the target; preserve its non-parser policy.
@@ -108,11 +112,18 @@ func showDumpView(view dumpView) {
 		fmt.Printf("SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH ',' FROM %s), ''), NULLIF(X'%x', ''));\n", target, flags)
 	}
 	if database := view.defaultDatabase(); database != "" {
-		fmt.Printf("USE %s;\n\n", quoteIdentifier(database))
+		// A saved default is not itself a prerequisite. Constants, CTEs and
+		// qualified relations can survive deletion of that database.
+		context := view.name.database
+		if analysis.usesDefaultDatabase {
+			context = database
+		}
+		fmt.Printf("USE %s;\n\n", quoteIdentifier(context))
 	}
 	fmt.Printf("DROP VIEW IF EXISTS %s.%s;\n", quoteIdentifier(view.name.database), quoteIdentifier(view.name.name))
 	showCreateTable(view.create, true)
 	if view.definition != nil {
 		fmt.Println("SET SESSION sql_mode = @modump_saved_sql_mode;")
 	}
+	return nil
 }
