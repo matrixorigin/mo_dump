@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -51,7 +52,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 				}
 				mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + name + "'").WillReturnRows(rows)
 				if name == "view_db" {
-					mock.ExpectQuery("show create table `view_db`.`v`").WillReturnRows(sqlmock.NewRows([]string{"View", "Create View", "character_set_client", "collation_connection"}).AddRow("v", "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "utf8mb4", "utf8mb4_bin"))
+					mock.ExpectQuery("select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'").WithArgs("view_db", "v").WillReturnRows(sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "")))
 				} else {
 					mock.ExpectQuery("show create table `data_db`.`t`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (id INT PRIMARY KEY, v DECIMAL(10,2))"))
 					if !tt.noData {
@@ -80,6 +81,13 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 			require.True(t, strings.HasSuffix(text, "SET foreign_key_checks = 1;\n"))
 		})
 	}
+}
+
+func viewDefinitionJSON(t *testing.T, create, sqlMode string) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]string{"Stmt": create, "sql_mode": sqlMode})
+	require.NoError(t, err)
+	return string(encoded)
 }
 
 func mockDumpOutput(t *testing.T) (sqlmock.Sqlmock, *os.File) {
@@ -117,7 +125,7 @@ func TestDumpViewsFailure(t *testing.T) {
 				{"database", "select datname, dat_type from mo_catalog.mo_database where datname = 'db'", sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", "")},
 				{"database_ddl", "show create database `db`", sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db")},
 				{"tables", "select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'", sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("v", catalog.SystemViewRel).AddRow("t", catalog.SystemOrdinaryRel)},
-				{"view_ddl", "show create table `db`.`v`", sqlmock.NewRows([]string{"View", "Create View", "character_set_client", "collation_connection"}).AddRow("v", create, "utf8mb4", "utf8mb4_bin")},
+				{"view_ddl", "select viewdef from mo_catalog.mo_tables where reldatabase = ? and relname = ? and relkind = 'v'", sqlmock.NewRows([]string{"viewdef"}).AddRow(viewDefinitionJSON(t, create, ""))},
 				{"table_ddl", "show create table `db`.`t`", sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)")},
 			}
 			if failure == "data" {
@@ -127,6 +135,9 @@ func TestDumpViewsFailure(t *testing.T) {
 			}
 			for _, step := range steps {
 				expect := mock.ExpectQuery(step.query)
+				if step.name == "view_ddl" {
+					expect.WithArgs("db", "v")
+				}
 				if failure == step.name {
 					expect.WillReturnError(injected)
 					break

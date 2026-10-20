@@ -62,7 +62,7 @@ func TestViewRelationBoundaries(t *testing.T) {
 		{"historical_expression", "SELECT * FROM v {timestamp=(SELECT x FROM clock_view)}", []viewName{{"db", "clock_view"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "a_consumer"}, "CREATE VIEW a_consumer AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
+			refs, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "a_consumer"}, create: "CREATE VIEW a_consumer AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Len(t, refs, len(tt.refs))
 			for _, ref := range tt.refs {
@@ -74,7 +74,7 @@ func TestViewRelationBoundaries(t *testing.T) {
 
 func TestHistoricalViewIdentity(t *testing.T) {
 	mode := viewSQLMode{lowerCaseTableNames: 1}
-	views := []dumpView{{viewName{"db", "v"}, "CREATE VIEW v AS SELECT * FROM db.v {snapshot='saved'}"}}
+	views := []dumpView{{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT * FROM db.v {snapshot='saved'}"}}
 	ordered, err := orderDumpViews(context.Background(), views, mode)
 	require.NoError(t, err)
 	require.Equal(t, views, ordered)
@@ -84,7 +84,7 @@ func TestHistoricalViewIdentity(t *testing.T) {
 }
 
 func TestViewIdentifierSpelling(t *testing.T) {
-	refs, err := viewReferences(context.Background(), dumpView{viewName{"DB", "v"}, "CREATE VIEW v AS SELECT * FROM 123Source JOIN Other.数据表 ON true JOIN 123数据ABC n ON true"}, viewSQLMode{})
+	refs, err := viewReferences(context.Background(), dumpView{name: viewName{"DB", "v"}, create: "CREATE VIEW v AS SELECT * FROM 123Source JOIN Other.数据表 ON true JOIN 123数据ABC n ON true"}, viewSQLMode{})
 	require.NoError(t, err)
 	require.Equal(t, map[viewName]struct{}{{"DB", "123source"}: {}, {"Other", "数据表"}: {}, {"DB", "123数据abc"}: {}}, refs)
 }

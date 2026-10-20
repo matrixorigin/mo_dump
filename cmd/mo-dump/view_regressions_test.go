@@ -42,7 +42,7 @@ func TestViewReviewRegressions(t *testing.T) {
 		{"other_database_dual", "SELECT x FROM other.dual", []viewName{{"other", "dual"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "v"}, "CREATE VIEW v AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
+			refs, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Len(t, refs, len(tt.refs))
 			for _, ref := range tt.refs {

@@ -22,8 +22,9 @@ import (
 
 type viewName struct{ database, name string }
 type dumpView struct {
-	name   viewName
-	create string
+	name       viewName
+	create     string
+	definition *viewDefinition
 }
 
 func normalizedViewName(database, name string, mode viewSQLMode) viewName {
@@ -86,6 +87,9 @@ func orderDumpViews(ctx context.Context, views []dumpView, mode viewSQLMode) ([]
 func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[viewName]struct{}, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if view.definition != nil {
+		mode = mode.withSQLMode(view.definition.parserMode())
 	}
 	refs, err := viewDependencies(view.name.database, view.create, mode)
 	if err != nil {

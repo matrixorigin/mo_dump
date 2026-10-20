@@ -260,10 +260,12 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 			case catalog.SystemViewRel:
-				createTableSql, err = getCreateView(db, tbl.Name)
+				view, err := getDumpView(ctx, db, tbl.Name, opt.sysAccount)
 				if err != nil {
 					return err
 				}
+				views = append(views, view)
+				createTableSql = view.create
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
@@ -292,7 +294,8 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
-				views = append(views, dumpView{name: viewName{database: db, name: tbl.Name}, create: create})
+				// The definition and its creation mode were captured together above.
+				continue
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
@@ -311,9 +314,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		return err
 	}
 	for _, view := range orderedViews {
-		fmt.Printf("USE %s;\n\n", quoteIdentifier(view.name.database))
-		fmt.Printf("DROP VIEW IF EXISTS %s;\n", quoteIdentifier(view.name.name))
-		showCreateTable(view.create, true)
+		showDumpView(view)
 	}
 	// reset foreign_key_checks variable to dump file
 	fmt.Println("SET foreign_key_checks = 1;")
@@ -473,18 +474,6 @@ func getCreateTable(db, tbl string) (string, error) {
 	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
 	var create string
 	err := r.Scan(&tbl, &create)
-	if err != nil {
-		return "", err
-	}
-	return create, nil
-}
-
-func getCreateView(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
-	var create string
-	var character_set_client string
-	var collation_connection string
-	err := r.Scan(&tbl, &create, &character_set_client, &collation_connection)
 	if err != nil {
 		return "", err
 	}

@@ -60,7 +60,7 @@ func TestViewLexicalScenarios(t *testing.T) {
 		{"terminated", "SELECT * FROM t; /* tail */", []viewName{{"db", "t"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "v"}, "CREATE VIEW v AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
+			refs, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS " + tt.query}, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Len(t, refs, len(tt.refs))
 			for _, ref := range tt.refs {
@@ -83,7 +83,7 @@ func TestViewLexicalSQLModes(t *testing.T) {
 		{"case_two", `CREATE VIEW v AS SELECT * FROM Other.T`, viewSQLMode{lowerCaseTableNames: 2}, viewName{"Other", "T"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			refs, err := viewReferences(context.Background(), dumpView{viewName{"db", "v"}, tt.ddl}, tt.mode)
+			refs, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "v"}, create: tt.ddl}, tt.mode)
 			require.NoError(t, err)
 			require.Equal(t, map[viewName]struct{}{tt.ref: {}}, refs)
 		})
@@ -102,13 +102,13 @@ func TestViewLexicalErrors(t *testing.T) {
 		"CREATE VIEW v AS SELECT * FROM t {snapshot='s')", "CREATE VIEW v AS SELECT * FROM t }", "CREATE VIEW v AS SELECT * FROM t {snapshot='s'",
 	} {
 		t.Run(ddl, func(t *testing.T) {
-			_, err := viewReferences(context.Background(), dumpView{viewName{"db", "v"}, ddl}, viewSQLMode{lowerCaseTableNames: 1})
+			_, err := viewReferences(context.Background(), dumpView{name: viewName{"db", "v"}, create: ddl}, viewSQLMode{lowerCaseTableNames: 1})
 			require.Error(t, err)
 		})
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := viewReferences(ctx, dumpView{viewName{"db", "v"}, "CREATE VIEW v AS SELECT 1"}, viewSQLMode{})
+	_, err := viewReferences(ctx, dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT 1"}, viewSQLMode{})
 	require.ErrorIs(t, err, context.Canceled)
 }
 

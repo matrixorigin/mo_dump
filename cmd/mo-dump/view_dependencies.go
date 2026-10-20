@@ -48,15 +48,20 @@ func getViewSQLMode(ctx context.Context) (viewSQLMode, error) {
 	if mode.lowerCaseTableNames < 0 || mode.lowerCaseTableNames > 2 {
 		return mode, fmt.Errorf("unsupported lower_case_table_names: %d", mode.lowerCaseTableNames)
 	}
+	return mode.withSQLMode(sqlMode), nil
+}
+
+func (mode viewSQLMode) withSQLMode(sqlMode string) viewSQLMode {
+	mode.ansiQuotes, mode.noBackslashEscapes = false, false
 	for _, option := range strings.Split(sqlMode, ",") {
 		switch strings.ToUpper(strings.TrimSpace(option)) {
-		case "ANSI_QUOTES":
+		case "ANSI", "ANSI_QUOTES":
 			mode.ansiQuotes = true
 		case "NO_BACKSLASH_ESCAPES":
 			mode.noBackslashEscapes = true
 		}
 	}
-	return mode, nil
+	return mode
 }
 
 type viewToken struct {
@@ -287,6 +292,20 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 	if start >= end {
 		return start, fmt.Errorf("expected relation after FROM/JOIN")
 	}
+	if c.tokens[start].symbol("{") {
+		close := c.tokens[start].close
+		if start+1 >= close || !c.tokens[start+1].word || !strings.EqualFold(c.tokens[start+1].text, "oj") {
+			return start, fmt.Errorf("expected OJ in table reference escape")
+		}
+		next, err := c.relation(start+2, close, scope)
+		if err != nil {
+			return close + 1, err
+		}
+		if err := c.body(next, close, scope, true); err != nil {
+			return close + 1, err
+		}
+		return c.relationSuffix(close+1, end)
+	}
 	if c.tokens[start].symbol("(") {
 		close := c.tokens[start].close
 		if c.queryAt(start+1, close) {
@@ -324,23 +343,16 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 		}
 		return c.relationSuffix(c.tokens[pos].close+1, end)
 	}
+	// Consume the syntax, but defer qualifier interpretation until the relation
+	// is bound. The server ignores AtTsExpr entirely for DUAL and CTEs.
+	suffix := pos
 	if pos < end && c.tokens[pos].symbol("{") {
-		close := c.tokens[pos].close
-		if pos+1 == close || !(c.tokens[pos+1].keyword("snapshot") || c.tokens[pos+1].keyword("timestamp") || c.tokens[pos+1].keyword("mo_ts") || c.tokens[pos+1].keyword("as")) {
-			return pos, fmt.Errorf("unsupported historical relation qualifier")
-		}
-		if err := c.nested(pos+1, close, scope); err != nil {
-			return pos, err
-		}
-		// A historical catalog object cannot be supplied by any current object
-		// emitted by this dump. Its snapshot remains an external prerequisite.
-		return c.relationSuffix(close+1, end)
+		suffix = c.tokens[pos].close + 1
 	}
 	name = c.mode.name(name)
 	if !qualified {
-		// MatrixOne resolves unqualified dual before CTEs and catalog objects.
 		if name == "dual" {
-			return c.relationSuffix(pos, end)
+			return c.relationSuffix(suffix, end)
 		}
 		if binding := scope.lookup(name); binding != nil {
 			if !binding.visiting && !binding.done {
@@ -348,13 +360,24 @@ func (c *viewReferenceCollector) relation(start, end int, scope *viewCTEScope) (
 				err := c.query(binding.start, binding.end, binding.scope)
 				binding.visiting = false
 				if err != nil {
-					return pos, err
+					return suffix, err
 				}
 				binding.done = true
 			}
-			return c.relationSuffix(pos, end)
+			return c.relationSuffix(suffix, end)
 		}
 		schema = c.database
+	}
+	if suffix != pos {
+		close := suffix - 1
+		if pos+1 == close || !(c.tokens[pos+1].keyword("snapshot") || c.tokens[pos+1].keyword("timestamp") || c.tokens[pos+1].keyword("mo_ts") || c.tokens[pos+1].keyword("as")) {
+			return pos, fmt.Errorf("unsupported historical relation qualifier")
+		}
+		if err := c.nested(pos+1, close, scope); err != nil {
+			return pos, err
+		}
+		// Only catalog-bound historical objects require an external snapshot.
+		return c.relationSuffix(suffix, end)
 	}
 	c.refs[normalizedViewName(schema, name, c.mode)] = struct{}{}
 	return c.relationSuffix(pos, end)
