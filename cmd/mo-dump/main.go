@@ -15,20 +15,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/csv"
+	"database/sql/driver"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -69,6 +71,26 @@ func (t *Tables) Set(value string) error {
 var usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [--enable-escape=false] [-csv] [-tbl <table>...] [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
 	flag.PrintDefaults()
+}
+
+// parseDatabases splits the -db option value by comma, trims spaces and drops
+// empty items. It returns an invalid-input error when no valid database name
+// remains (e.g. -db ',,'), so callers never dump with an empty database list.
+func parseDatabases(ctx context.Context, raw string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, moerr.NewInvalidInput(ctx, "database must be specified")
+	}
+	var dbs []string
+	for _, db := range strings.Split(raw, ",") {
+		db = strings.TrimSpace(db)
+		if len(db) != 0 {
+			dbs = append(dbs, db)
+		}
+	}
+	if len(dbs) == 0 {
+		return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf("database '%s' contains no valid database name", raw))
+	}
+	return dbs, nil
 }
 
 func main() {
@@ -132,17 +154,9 @@ func main() {
 		opt.netBufferLength = maxNetBufferLength
 	}
 
-	if len(opt.database) == 0 {
-		err = moerr.NewInvalidInput(ctx, "database must be specified")
+	opt.dbs, err = parseDatabases(ctx, opt.database)
+	if err != nil {
 		return
-	} else {
-		dbs := strings.Split(opt.database, ",")
-		for _, db := range dbs {
-			db = strings.TrimSpace(db)
-			if len(db) != 0 {
-				opt.dbs = append(opt.dbs, db)
-			}
-		}
 	}
 
 	if len(opt.tbl) > 0 {
@@ -214,6 +228,14 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	// add foreign_key_checks variable to dump file
 	fmt.Printf("SET foreign_key_checks = 0;\n\n")
 
+	// String literals in this script were quoted assuming backslash escapes.
+	// Pin the restore session's sql_mode correspondingly even when it runs
+	// under NO_BACKSLASH_ESCAPES, and restore it at the end of the script
+	// (matrixorigin/matrixone#30587). NO_BACKSLASH_ESCAPES is removed from a
+	// comma-wrapped copy of the mode list so stripping it can never leave an
+	// empty token, whatever its position.
+	fmt.Printf("SET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n")
+
 	for _, db := range opt.dbs {
 		var dbStruct Db
 		dbStruct, err = getDatabaseType(ctx, db, opt.sysAccount)
@@ -236,11 +258,6 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
 			fmt.Println(createDb, ";")
 			fmt.Printf("USE `%s`;\n\n\n", db)
-			// String literals in this script were quoted assuming backslash
-			// escapes. Pin the restore session's sql_mode correspondingly even
-			// when it runs under NO_BACKSLASH_ESCAPES, and restore it at the
-			// end of the script (matrixorigin/matrixone#30587).
-			fmt.Printf("SET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT REPLACE(@@session.sql_mode,'NO_BACKSLASH_ESCAPES',''));\n\n\n")
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -549,7 +566,15 @@ func getCreateView(db, tbl string) (string, error) {
 func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
 	curBuf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		curBuf.Reset()
+		bufPool.Put(curBuf)
+	}()
 	buf.Grow(netBufferLength)
 	initInert := "INSERT INTO `" + tbl + "` VALUES "
 	for {
@@ -604,6 +629,9 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			buf.Write(curBuf.Bytes())
 			curBuf.Reset()
 		}
+		if err := r.Err(); err != nil {
+			return err
+		}
 		if buf.Len() > preLen {
 			buf.WriteString(";\n")
 			_, err = buf.WriteTo(os.Stdout)
@@ -613,14 +641,14 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			continue
 		}
 		if curBuf.Len() > 0 {
+			//matrixone#30638: nothing was emitted above; drop the unflushed
+			// header so the carried-over oversized row is not preceded by a
+			// duplicated INSERT statement prefix.
+			buf.Reset()
 			continue
 		}
-		buf.Reset()
-		curBuf.Reset()
 		break
 	}
-	bufPool.Put(buf)
-	bufPool.Put(curBuf)
 	fmt.Printf("\n\n\n")
 	return nil
 }
@@ -675,80 +703,156 @@ func sqlStringLiteral(s string) string {
 // toCsv converts the result from mo to csv file
 func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvConf *csvConfig) error {
 	var err error
-	csvWriter := csv.NewWriter(output)
-	csvWriter.Comma = csvConf.fieldDelimiter
+	w := bufio.NewWriter(output)
 	line := make([]string, len(rowResults))
+	nulls := make([]bool, len(rowResults))
 
 	for r.Next() {
 		err = r.Scan(rowResults...)
 		if err != nil {
 			return err
 		}
-		err = toCsvLine(csvWriter, rowResults, cols, line, csvConf.enableEscape)
+		err = toCsvLine(w, csvConf.fieldDelimiter, rowResults, cols, line, nulls, csvConf.enableEscape)
 		if err != nil {
 			return err
 		}
 	}
-	if err = r.Err(); err != nil {
+	if err := r.Err(); err != nil {
 		return err
 	}
-	// csv.NewWriter buffers; a failed write (including the final Flush) is
-	// reported only via Error(). Propagating it stops the dump from claiming
-	// success while the CSV is truncated (matrixorigin/matrixone#30628).
-	if err = csvWriter.Error(); err != nil {
-		return fmt.Errorf("write csv: %w", err)
-	}
-	return nil
+	return w.Flush()
 }
 
 // toCsvFields converts the result from mo to string
-func toCsvFields(rowResults []any, cols []*Column, line []string, enableEscape bool) {
+func toCsvFields(rowResults []any, cols []*Column, line []string, nulls []bool, enableEscape bool) {
 	for i, v := range rowResults {
+		// SQL NULL is reported through nulls[i] instead of a magic string, so
+		// a literal text value never collides with the NULL marker \N.
+		if *(v.(*sql.RawBytes)) == nil {
+			nulls[i] = true
+			continue
+		}
+		nulls[i] = false
 		dt, format := convertValue2(v, cols[i].Type)
 		str := fmt.Sprintf(format, dt)
-		if enableEscape && isStringType(cols[i].Type) && str != string(nullBytes) {
-			str = escapeChars(str)
-		}
-
-		line[i] = escapeString(str)
+		line[i] = escapeString(str, enableEscape && isStringType(cols[i].Type))
 	}
 }
 
-func escapeString(s string) string {
-	if s == "\\N" {
-		return s
-	}
+// escapeString escapes a field value under the LOAD DATA escape protocol
+// (FIELDS ESCAPED BY '\'). Backslash is always escaped exactly once, so a
+// literal text value such as \N cannot be mistaken for the NULL marker on
+// load. escapeComma additionally escapes ',' and is enabled by -enable-escape
+// for string columns.
+func escapeString(s string, escapeComma bool) string {
 	var builder strings.Builder
-	for _, char := range s {
-		if char == '\\' {
-			builder.WriteString("\\")
+	// byte-level iteration keeps binary (non-UTF-8) values intact
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || (escapeComma && c == ',') {
+			builder.WriteByte('\\')
 		}
-		builder.WriteRune(char)
+		builder.WriteByte(c)
 	}
 	return builder.String()
 }
 
 // toCsvLine converts the result from mo to csv single line
-func toCsvLine(csvWriter *csv.Writer, rowResults []any, cols []*Column, line []string, enableEscape bool) error {
-	var err error
-	toCsvFields(rowResults, cols, line, enableEscape)
-	err = csvWriter.Write(line)
-	if err != nil {
-		return err
+func toCsvLine(w io.Writer, delim rune, rowResults []any, cols []*Column, line []string, nulls []bool, enableEscape bool) error {
+	toCsvFields(rowResults, cols, line, nulls, enableEscape)
+	return writeCsvRecord(w, line, nulls, delim)
+}
+
+// writeCsvRecord writes one CSV record terminated by '\n' in the framing the
+// generated dump.sql restores with:
+//
+//	FIELDS TERMINATED BY <delim> ENCLOSED BY '"' LINES TERMINATED BY '\n'
+//
+// encoding/csv cannot express "quote exactly these fields": the SQL NULL
+// marker \N must stay unquoted to load as NULL, while a literal text NULL
+// must be quoted to stay a string value (both MatrixOne and MySQL read an
+// unquoted NULL word as SQL NULL when FIELDS ENCLOSED BY is non-empty).
+func writeCsvRecord(w io.Writer, fields []string, nulls []bool, delim rune) error {
+	var b strings.Builder
+	for i, f := range fields {
+		if i > 0 {
+			b.WriteRune(delim)
+		}
+		if nulls[i] {
+			b.WriteString(string(nullBytes))
+			continue
+		}
+		if csvFieldNeedsQuote(f, delim) {
+			// byte-level quoting keeps binary (non-UTF-8) values intact
+			b.WriteByte('"')
+			b.WriteString(strings.ReplaceAll(f, "\"", "\"\""))
+			b.WriteByte('"')
+		} else {
+			b.WriteString(f)
+		}
 	}
-	csvWriter.Flush()
+	b.WriteByte('\n')
+	_, err := io.WriteString(w, b.String())
 	return err
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {
+// csvFieldNeedsQuote reports whether a non-null field must be enclosed in
+// quotes: it contains the delimiter, a quote or a line break, it starts with
+// whitespace (unquoted whitespace-leading and whitespace-only records are
+// dropped by older loaders), or its content would otherwise be read back as
+// SQL NULL.
+func csvFieldNeedsQuote(field string, delim rune) bool {
+	if strings.EqualFold(field, "NULL") {
+		return true
+	}
+	if r1, _ := utf8.DecodeRuneInString(field); unicode.IsSpace(r1) {
+		return true
+	}
+	return strings.ContainsRune(field, delim) || strings.ContainsAny(field, "\"\r\n")
+}
+
+func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
 	querySql := "select * from `" + db + "`.`" + tbl + "`"
 	if condition != "" {
 		querySql += " where " + condition
 	}
-	r, err := conn.Query(querySql)
+
+	// Match DB.Query's three-attempt budget, but retain exclusive ownership of
+	// the successful connection. Never retry once a result set is returned.
+	const maxQueryAttempts = 3
+	var queryConn *sql.Conn
+	var r *sql.Rows
+	for attempt := 0; attempt < maxQueryAttempts; attempt++ {
+		queryConn, err = conn.Conn(context.Background())
+		if err != nil {
+			return err
+		}
+		r, err = queryConn.QueryContext(context.Background(), querySql)
+		if err == nil {
+			break
+		}
+		_ = queryConn.Close()
+		if !errors.Is(err, driver.ErrBadConn) {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
+	defer queryConn.Close()
+	defer func() {
+		if err != nil {
+			// MySQL Rows.Close drains unread results. Abort the physical connection
+			// first so a local failure cannot wait for the source to send EOF.
+			_ = queryConn.Raw(func(raw any) error {
+				_ = raw.(driver.Conn).Close()
+				// Returning ErrBadConn here would make sql.Conn wait for the rows
+				// we still own. Release them before returning the connection.
+				return nil
+			})
+		}
+		_ = r.Close()
+	}()
 	colTypes, err := r.ColumnTypes()
 	if err != nil {
 		return err
@@ -824,17 +928,10 @@ func convertValue(v any, typ string) string {
 	case "vecf32", "vecf64":
 		return string(ret)
 	case "bit":
-		var builder strings.Builder
-		builder.WriteString("_binary '")
-		for _, b := range ret {
-			if b == byte(0) {
-				builder.WriteString("\\0")
-			} else {
-				builder.WriteByte(b)
-			}
+		if len(ret) == 0 {
+			return "''"
 		}
-		builder.WriteString("'")
-		return builder.String()
+		return fmt.Sprintf("0x%X", ret)
 	default:
 		str := strings.Replace(string(ret), "\\", "\\\\", -1)
 		return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
@@ -865,6 +962,12 @@ func convertValue2(v any, typ string) (sql.RawBytes, string) {
 	}
 }
 
+// validFieldDelimiter mirrors encoding/csv's delimiter rule: the delimiter
+// cannot be '"', '\r', '\n', or an invalid rune.
+func validFieldDelimiter(r rune) bool {
+	return r != 0 && r != '"' && r != '\r' && r != '\n' && utf8.ValidRune(r) && r != utf8.RuneError
+}
+
 // checkFieldDelimiter checks string is valid utf8 character and returns rune
 func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 	if utf8.ValidString(s) {
@@ -872,7 +975,7 @@ func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 			return rune(0), moerr.NewInvalidInput(ctx, "there are multiple utf8 characters for csv field delimiter. only one utf8 character is allowed")
 		}
 		runCh, _ := utf8.DecodeRuneInString(s)
-		if runCh == utf8.RuneError {
+		if !validFieldDelimiter(runCh) {
 			return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter is invalid utf8 character")
 		}
 		return runCh, nil
@@ -936,18 +1039,6 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 	}
 
 	return tables, nil
-}
-
-// escapeChars
-func escapeChars(text string) string {
-	charSet := ""
-	for _, char := range escapeCharSet {
-		charSet += regexp.QuoteMeta(string(char))
-	}
-	re := regexp.MustCompile(`[` + charSet + `]`)
-	return re.ReplaceAllStringFunc(text, func(s string) string {
-		return "\\" + s
-	})
 }
 
 func isStringType(typ string) bool {

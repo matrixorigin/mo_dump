@@ -50,9 +50,8 @@ const (
 )
 
 var (
-	conn          *sql.DB
-	nullBytes     = []byte("\\N")
-	escapeCharSet = []rune{',', '\\'}
+	conn      *sql.DB
+	nullBytes = []byte("\\N")
 )
 
 type Column struct {
