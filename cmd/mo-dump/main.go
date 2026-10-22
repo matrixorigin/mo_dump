@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -110,7 +111,7 @@ func main() {
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
 	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
 	flag.BoolVar(&opt.enableEscape, "enable-escape", defaultEnableEscape, "enable escape characters in csv output")
-	flag.StringVar(&opt.where, "where", "", "Dump only selected records. Quotes are mandatory.")
+	flag.StringVar(&opt.where, "where", "", "Dump only selected records. Quotes are mandatory. TIMESTAMP/DATETIME literals are compared under the pinned UTC export session.")
 	flag.BoolVar(&opt.sysAccount, "sys", false, "Dump system table from 'sys' account, used for check db / table schema.")
 	flag.Parse()
 
@@ -208,8 +209,13 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		defer conn.Close()
 	}
 
-	// add foreign_key_checks variable to dump file
-	fmt.Printf("SET foreign_key_checks = 0;\n\n")
+	// Session prelude of the dump file: disable foreign key checks, then save
+	// the import session's time zone and pin UTC before any DDL or DML is
+	// replayed. The exported TIMESTAMP text is UTC wall clock, so the restore
+	// session must not reinterpret it in its own time zone (#30564).
+	fmt.Printf("SET foreign_key_checks = 0;\n")
+	fmt.Printf("SET @OLD_TIME_ZONE = @@time_zone;\n")
+	fmt.Printf("SET time_zone = %s;\n\n", dumpTimeZoneLiteral)
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
@@ -318,11 +324,19 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	}
 	// reset foreign_key_checks variable to dump file
 	fmt.Println("SET foreign_key_checks = 1;")
+	// restore the time zone the import session had before the prelude
+	fmt.Println("SET time_zone = @OLD_TIME_ZONE;")
 	return err
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", opt.username, opt.password, opt.host, opt.port, database)
+	// The driver applies every unknown DSN parameter as a session SET on each
+	// new physical connection, so the pin also covers connections the pool
+	// re-creates later, including genOutput's retry connections. A one-shot SET
+	// on one pooled connection could not reach them. A server that rejects the
+	// pin fails the whole connection instead of silently exporting UTC-shifted
+	// TIMESTAMP text (#30564).
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?time_zone=%s", opt.username, opt.password, opt.host, opt.port, database, url.QueryEscape(dumpTimeZoneLiteral))
 
 	conn, err := sql.Open("mysql", dsn)
 	if err != nil {

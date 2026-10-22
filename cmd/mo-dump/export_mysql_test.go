@@ -75,8 +75,10 @@ func exportMySQLServer(t *testing.T, query string, finish bool) (*sql.DB, func()
 	return db, stop, result
 }
 
-func serveExportMySQL(peer net.Conn, query string, finish bool) error {
-	// Protocol 4.1, secure native-password authentication, no TLS or extra queries.
+// exportHandshake performs the fixed protocol 4.1, secure native-password,
+// no-TLS handshake shared by both fake servers, and leaves the connection
+// ready for its first command.
+func exportHandshake(peer net.Conn) error {
 	capabilities := uint32(1 | 4 | 512 | 8192 | 32768 | 1<<19)
 	hello := append([]byte{10}, []byte("8.0.30-test\x00")...)
 	hello = binary.LittleEndian.AppendUint32(hello, 1)
@@ -93,10 +95,14 @@ func serveExportMySQL(peer net.Conn, query string, finish bool) error {
 	if _, err := readExportPacket(peer); err != nil {
 		return err
 	}
-	ok := []byte{0, 0, 0, 2, 0, 0, 0}
-	if err := writeExportPacket(peer, 2, ok); err != nil {
+	return writeExportPacket(peer, 2, []byte{0, 0, 0, 2, 0, 0, 0})
+}
+
+func serveExportMySQL(peer net.Conn, query string, finish bool) error {
+	if err := exportHandshake(peer); err != nil {
 		return err
 	}
+	ok := []byte{0, 0, 0, 2, 0, 0, 0}
 	command, err := readExportPacket(peer)
 	if err != nil {
 		return err

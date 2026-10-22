@@ -269,6 +269,13 @@ func TestDumpExitStatus(t *testing.T) {
 			err := cmd.Run()
 			require.NoError(t, ctx.Err(), "child process did not terminate")
 			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
+			out := stdout.String()
+			// #30564: the session prelude must save the import session's time zone,
+			// pin UTC before any DDL/INSERT is replayed, and restore both session
+			// variables after the data. The ordering assertions prove the pin is
+			// not emitted between or after the data statements.
+			require.Contains(t, out, "SET @OLD_TIME_ZONE = @@time_zone;")
+			require.Contains(t, out, "SET time_zone = '+00:00';")
 			if mode == "cancel" {
 				var exitErr *exec.ExitError
 				require.ErrorAs(t, err, &exitErr)
@@ -276,11 +283,38 @@ func TestDumpExitStatus(t *testing.T) {
 				require.Contains(t, stderr.String(), "modump error: context canceled")
 				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
 				require.NotContains(t, stdout.String(), "SET foreign_key_checks = 1;")
+				require.NotContains(t, out, "SET time_zone = @OLD_TIME_ZONE;")
 			} else {
 				require.NoError(t, err, stderr.String())
 				require.Empty(t, stderr.String())
-				require.Contains(t, stdout.String(), "MODUMP SUCCESS")
-				require.Contains(t, stdout.String(), "SET foreign_key_checks = 1;")
+				require.Contains(t, out, "MODUMP SUCCESS")
+				require.Contains(t, out, "SET foreign_key_checks = 1;")
+				require.Contains(t, out, "SET time_zone = @OLD_TIME_ZONE;")
+				require.Less(
+					t,
+					strings.Index(out, "SET foreign_key_checks = 0;"),
+					strings.Index(out, "SET @OLD_TIME_ZONE = @@time_zone;"),
+					"session prelude out of order")
+				require.Less(
+					t,
+					strings.Index(out, "SET @OLD_TIME_ZONE = @@time_zone;"),
+					strings.Index(out, "SET time_zone = '+00:00';"),
+					"original time zone must be saved before the UTC pin")
+				require.Less(
+					t,
+					strings.Index(out, "SET time_zone = '+00:00';"),
+					strings.Index(out, "CREATE TABLE t"),
+					"UTC pin must precede DDL replay")
+				require.Less(
+					t,
+					strings.Index(out, "INSERT INTO `t` VALUES"),
+					strings.Index(out, "SET foreign_key_checks = 1;"),
+					"session variables must be restored after the data")
+				require.Less(
+					t,
+					strings.Index(out, "SET foreign_key_checks = 1;"),
+					strings.Index(out, "SET time_zone = @OLD_TIME_ZONE;"),
+					"time zone must be restored after the data")
 			}
 		})
 	}

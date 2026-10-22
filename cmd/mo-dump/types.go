@@ -41,6 +41,13 @@ const (
 	// carriageByte               = '\r'
 	// tabularByte                = '\t'
 	defaultEnableEscape = false
+	// dumpTimeZoneLiteral is the SQL literal that pins the export connection,
+	// every physical connection the pool later creates, and the restore session
+	// pinned inside the dump file to UTC. A TIMESTAMP crosses a dump/restore
+	// boundary only as wall-clock text, so both sessions must agree on UTC or
+	// the restored absolute instant silently shifts (#30564; same contract as
+	// mysqldump --tz-utc). Using an offset literal avoids loading tzdata.
+	dumpTimeZoneLiteral = "'+00:00'"
 )
 
 const (
