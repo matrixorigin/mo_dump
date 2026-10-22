@@ -133,9 +133,9 @@ func TestGenOutputBadConnRetry(t *testing.T) {
 			oldConn := conn
 			conn = db
 			t.Cleanup(func() { conn = oldConn })
-			out := exportTestStdout(t)
+			out, expectFile := exportTestSink(t)
 			pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
-			err := genOutput("db", "t", pool, 29, true, &csvConfig{}, "id > 0")
+			err := genOutput("db", "t", out, pool, 29, true, &csvConfig{}, "id > 0")
 			if err != tc.wantErr {
 				t.Fatalf("error = %v, want original error %v", err, tc.wantErr)
 			}
@@ -158,7 +158,7 @@ func TestGenOutputBadConnRetry(t *testing.T) {
 			if connector.rowsClosed != tc.rowsClosed {
 				t.Fatalf("rows closed %d times, want %d", connector.rowsClosed, tc.rowsClosed)
 			}
-			data, err := os.ReadFile(out.Name())
+			data, err := os.ReadFile(expectFile.Name())
 			if err != nil {
 				t.Fatal(err)
 			}

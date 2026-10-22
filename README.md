@@ -19,7 +19,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-P [port]**：MatrixOne 服务器的端口。默认值：6001
 
-- **-db [数据库名称]**：必需参数。要备份的数据库的名称。可以指定多个数据库，数据库名称之间用 `,` 分隔。
+- **-db [数据库名称]**：必需参数。要备份的数据库的名称。可以指定多个数据库，数据库名称之间用 `,` 分隔。`-db all` 表示导出当前账户可见的全部用户数据库；内置系统库（information_schema、mo_catalog、mo_debug、mo_task、mysql、system、system_metrics）会被跳过。如果当前账户没有用户数据库，导出会以明确错误退出，不会生成空备份。
 
 - **-net-buffer-length [数据包大小]**：数据包大小，即 SQL 语句字符的总大小。数据包是 SQL 导出数据的基本单位，如果不设置参数，则默认 1048576 Byte（1M），最大可设置 16777216 Byte（16M）。假如这里的参数设置为 16777216 Byte（16M），那么，当要导出大于 16M 的数据时，会把数据拆分成多个 16M 的数据包，除最后一个数据包之外，其它数据包大小都为 16M。
 
@@ -90,6 +90,13 @@ mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db all > /tm/all-dbs.sql
 ```mysql
 mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db db1 -tbl tbl1,tbl2,tbl3 > /tm/all-dbs.sql
 ```
+
+## 导出范围与完整性语义
+
+* 用户 `SEQUENCE` 会随整库/多库导出一并导出：mo-dump 按序列的**当前定义**（含 `ALTER SEQUENCE` 后的参数）重建 `CREATE SEQUENCE`，并回放其分配状态（`last_seq_num`/`is_called`），恢复后的序列从断点继续分配，不会重复使用已消费的值。脚本中序列先于依赖它的表导出。
+* `-no-data` 只导出定义：此时不回放序列进度，恢复后的序列从定义的 `START WITH` 开始分配。
+* 序列状态回放使用三参数形式的 `SELECT setval('序列名', n, 第三参数)`，依赖当前 MatrixOne 主线版本的 `SETVAL` 语义（`SETVAL(n, true)` 后下一个 `NEXTVAL` 返回 n、`SETVAL(n, false)` 后返回 n+increment）；较旧版本服务器恢复该语句时行为可能不同。
+* 输出安全：mo-dump 先把完整 SQL 脚本暂存在当前目录的隐藏临时文件中，全部导出成功后才整体写入 stdout；任何失败都以非零退出码结束且 stdout 不产生任何脚本输出，不会留下只包含 `DROP DATABASE` 的危险半成品脚本。CSV 数据文件同样先以隐藏临时文件暂存在最终路径旁，导出成功后原子重命名，失败时移除临时文件，不会截断之前成功导出的 CSV 文件。
 
 ## 限制
 * `mo-dump` 暂不支持只导出数据库的结构或数据。如果你想在没有数据库结构的情况下生成数据的备份，或者仅想导出数据库结构，那么，你需要手动拆分 `.sql` 文件。

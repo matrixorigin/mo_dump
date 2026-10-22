@@ -187,28 +187,52 @@ func main() {
 	}
 
 	if opt.database == "all" {
-		conn, err = opt.openDBConnection(ctx, "")
-		if err != nil {
-			return
+		if conn == nil {
+			conn, err = opt.openDBConnection(ctx, "")
+			if err != nil {
+				return
+			}
+			defer conn.Close()
 		}
-		defer conn.Close()
 
-		opt.dbs, err = getDatabases(ctx)
+		var dbs []string
+		dbs, err = getDatabases(ctx)
 		if err != nil {
 			return
 		}
+		dbs = filterUserDatabases(dbs)
+		if len(dbs) == 0 {
+			err = moerr.NewInvalidInput(ctx, "-db all found only system databases, nothing to dump")
+			return
+		}
+		opt.dbs = dbs
 	}
 
-	err = opt.dumpData(ctx)
+	// The whole dump is staged before anything reaches stdout: a failed run
+	// must not publish a truncated script whose DROP statements then destroy
+	// a target database (matrixorigin/matrixone#30577).
+	sink, sinkErr := newDumpSink()
+	if sinkErr != nil {
+		err = sinkErr
+		return
+	}
+	defer sink.discard()
+
+	err = opt.dumpData(ctx, sink)
+	if err != nil {
+		return
+	}
+	err = sink.publish()
 	if err != nil {
 		return
 	}
 }
 
-func (opt *Options) dumpData(ctx context.Context) error {
+func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 	var (
 		createDb    string
 		createTable []string
+		stateSQL    []string
 		err         error
 	)
 
@@ -221,7 +245,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	}
 
 	// add foreign_key_checks variable to dump file
-	fmt.Printf("SET foreign_key_checks = 0;\n\n")
+	out.printf("SET foreign_key_checks = 0;\n\n")
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
@@ -235,16 +259,16 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		}
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
-				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", db)
+				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(db))
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
 					return err
 				}
 			}
-			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
-			fmt.Println(createDb, ";")
-			fmt.Printf("USE `%s`;\n\n\n", db)
+			out.printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
+			out.printf("%s;\n", createDb)
+			out.printf("USE %s;\n\n\n", quoteIdentifier(db))
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -259,78 +283,128 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			}
 		}
 		createTable = make([]string, len(opt.tables))
+		stateSQL = make([]string, len(opt.tables))
 		for i, tbl := range opt.tables {
-			var createTableSql string
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
-				createTableSql, err = getCreateTable(db, tbl.Name)
-				if err != nil {
-					return err
-				}
-			case catalog.SystemExternalRel:
-				createTableSql, err = getCreateTable(db, tbl.Name)
-				if err != nil {
-					return err
-				}
+			case catalog.SystemOrdinaryRel, catalog.SystemExternalRel:
+				createTable[i], err = getCreateTable(db, tbl.Name)
 			case catalog.SystemViewRel:
-				createTableSql, err = getCreateView(db, tbl.Name)
-				if err != nil {
-					return err
-				}
+				createTable[i], err = getCreateView(db, tbl.Name)
+			case catalog.SystemSequenceRel:
+				// A sequence's current definition and allocation state live in
+				// its backing row, not in SHOW CREATE TABLE
+				// (matrixorigin/matrixone#30577).
+				var state string
+				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name)
+				stateSQL[i] = state
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
+			}
+			if err != nil {
 				return err
 			}
-			createTable[i] = createTableSql
 		}
+		// Sequences must be created before the tables whose DEFAULT nextval
+		// references them; views are emitted after everything they select
+		// from.
+		firstView := reorderDumpObjects(createTable, opt.tables, stateSQL)
+		adjustViewOrder(createTable, opt.tables, firstView)
 		bufPool := &sync.Pool{
 			New: func() any {
 				return &bytes.Buffer{}
 			},
 		}
-		left, right := 0, len(createTable)-1
-		for left < right {
-			for left < len(createTable) && opt.tables[left].Kind != catalog.SystemViewRel {
-				left++
-			}
-			for right >= 0 && opt.tables[right].Kind == catalog.SystemViewRel {
-				right--
-			}
-			if left >= right {
-				break
-			}
-			createTable[left], createTable[right] = createTable[right], createTable[left]
-			opt.tables[left], opt.tables[right] = opt.tables[right], opt.tables[left]
-		}
-		adjustViewOrder(createTable, opt.tables, left)
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, false)
+			case catalog.SystemSequenceRel:
+				out.printf("DROP SEQUENCE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, false)
 				if !opt.noData {
-					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
+					// Replay the allocation state so a restored sequence does
+					// not hand out values the source already consumed.
+					out.printf("%s;\n\n\n", stateSQL[i])
+				} else {
+					// -no-data exports definitions only: the restored sequence
+					// starts handing out values from its START value.
+					out.printf("\n\n")
+				}
+			case catalog.SystemOrdinaryRel:
+				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, false)
+				if !opt.noData {
+					err = genOutput(db, tbl.Name, out, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
 					if err != nil {
 						return err
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("/*!EXTERNAL TABLE `%s`*/\n", tbl.Name)
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, true)
+				out.printf("/*!EXTERNAL TABLE %s*/\n", quoteIdentifier(tbl.Name))
+				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, true)
 			case catalog.SystemViewRel:
-				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, true)
+				out.printf("DROP VIEW IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, true)
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
+			if e := out.Err(); e != nil {
+				return e
+			}
 		}
 	}
 	// reset foreign_key_checks variable to dump file
-	fmt.Println("SET foreign_key_checks = 1;")
-	return err
+	if e := out.Err(); e != nil {
+		return e
+	}
+	out.printf("SET foreign_key_checks = 1;\n")
+	return out.Err()
+}
+
+// reorderDumpObjects stably partitions one database's objects for restore:
+// sequences first — a table DEFAULT nextval requires the sequence to exist at
+// create time — then ordinary and external tables, then views, which may
+// depend on any earlier object. The parallel slices are reordered in place;
+// it returns the index of the first view (or len(tables) when there is none).
+func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) int {
+	n := len(tables)
+	rank := func(kind string) int {
+		switch kind {
+		case catalog.SystemSequenceRel:
+			return 0
+		case catalog.SystemViewRel:
+			return 2
+		default:
+			return 1
+		}
+	}
+	counts := [3]int{}
+	ranks := make([]int, n)
+	for i, tbl := range tables {
+		r := rank(tbl.Kind)
+		ranks[i] = r
+		counts[r]++
+	}
+	starts := [3]int{}
+	for r := 1; r < 3; r++ {
+		starts[r] = starts[r-1] + counts[r-1]
+	}
+	next := starts
+	newCreate := make([]string, n)
+	newState := make([]string, n)
+	newTables := make(Tables, n)
+	for i := 0; i < n; i++ {
+		j := next[ranks[i]]
+		next[ranks[i]]++
+		newCreate[j] = createTable[i]
+		newState[j] = stateSQL[i]
+		newTables[j] = tables[i]
+	}
+	copy(createTable, newCreate)
+	copy(stateSQL, newState)
+	copy(tables, newTables)
+	return starts[2]
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
@@ -405,7 +479,7 @@ func adjustViewOrder(createTable []string, tables Tables, start int) {
 	_ = copy(tables[start:], newTables)
 }
 
-func showCreateTable(createSql string, withNextLine bool) {
+func showCreateTable(out *dumpSink, createSql string, withNextLine bool) {
 	var suffix string
 	if !strings.HasSuffix(createSql, ";") {
 		suffix = ";"
@@ -413,7 +487,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 	if withNextLine {
 		suffix += "\n\n"
 	}
-	fmt.Printf("%s%s\n", createSql, suffix)
+	out.printf("%s%s\n", createSql, suffix)
 }
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
@@ -528,6 +602,36 @@ func getDatabases(ctx context.Context) ([]string, error) {
 	return dbs, nil
 }
 
+// systemDatabases are the databases the MatrixOne platform itself creates
+// in every account. -db all is a whole user backup, and these relations are
+// engine internals: mo_catalog alone contains every relkind, and sending
+// them through the ordinary-table dispatcher fails a clean tenant's export
+// (matrixorigin/matrixone#30601). The list mirrors catalog.SystemDatabases
+// from the MatrixOne server.
+var systemDatabases = map[string]struct{}{
+	"information_schema": {},
+	"mo_catalog":         {},
+	"mo_debug":           {},
+	"mo_task":            {},
+	"mysql":              {},
+	"system":             {},
+	"system_metrics":     {},
+}
+
+// filterUserDatabases removes built-in system databases from a SHOW
+// DATABASES result. Matching is exact: a user database whose name merely
+// starts like a system name is kept.
+func filterUserDatabases(dbs []string) []string {
+	kept := make([]string, 0, len(dbs))
+	for _, db := range dbs {
+		if _, isSystem := systemDatabases[db]; isSystem {
+			continue
+		}
+		kept = append(kept, db)
+	}
+	return kept
+}
+
 func getCreateTable(db, tbl string) (string, error) {
 	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
 	var create string
@@ -550,7 +654,7 @@ func getCreateView(db, tbl string) (string, error) {
 	return create, nil
 }
 
-func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
+func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int, out *dumpSink) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
 	defer func() {
@@ -621,7 +725,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		}
 		if buf.Len() > preLen {
 			buf.WriteString(";\n")
-			_, err = buf.WriteTo(os.Stdout)
+			_, err = buf.WriteTo(out)
 			if err != nil {
 				return err
 			}
@@ -636,29 +740,39 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		}
 		break
 	}
-	fmt.Printf("\n\n\n")
-	return nil
+	out.printf("\n\n\n")
+	return out.Err()
 }
 
-func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig) error {
-	fname := fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
-	pwd := os.Getenv("PWD")
-	f, err := os.Create(fname)
+func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig, out *dumpSink) error {
+	// The csv data file is staged beside its published name and is renamed
+	// only by sink.publish after the whole dump succeeded, so a failed run
+	// can not truncate the operator's previous dump files.
+	f, err := out.startCsv(db, tbl)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	err = toCsv(r, f, rowResults, cols, csvConf)
+	if err == nil {
+		// A failed final close must fail the dump: a silently truncated csv
+		// restores as corrupted data (same class as
+		// matrixorigin/matrixone#30628).
+		err = f.Close()
+	} else {
+		_ = f.Close()
+	}
 	if err != nil {
+		out.abortCsv(f)
 		return err
 	}
+	fName := csvFileName(db, tbl)
+	pwd := os.Getenv("PWD")
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA LOCAL INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, fName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, fName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
 	}
-	return nil
+	return out.Err()
 }
 
 // toCsv converts the result from mo to csv file
@@ -772,7 +886,7 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 	return strings.ContainsRune(field, delim) || strings.ContainsAny(field, "\"\r\n")
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
+func genOutput(db string, tbl string, out *dumpSink, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
 	querySql := "select * from `" + db + "`.`" + tbl + "`"
 	if condition != "" {
 		querySql += " where " + condition
@@ -831,9 +945,9 @@ func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, l
 		rowResults = append(rowResults, &v)
 	}
 	if !csvConf.enable {
-		return showInsert(r, rowResults, cols, tbl, bufPool, netBufferLength)
+		return showInsert(r, rowResults, cols, tbl, bufPool, netBufferLength, out)
 	}
-	return showLoad(r, rowResults, cols, db, tbl, localInfile, csvConf)
+	return showLoad(r, rowResults, cols, db, tbl, localInfile, csvConf, out)
 }
 
 func convertValue(v any, typ string) string {

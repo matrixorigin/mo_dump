@@ -22,13 +22,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // exportMySQLServer exercises the real MySQL driver without an external service.
@@ -167,21 +169,26 @@ func readExportPacket(r io.Reader) ([]byte, error) {
 }
 
 func TestGenOutputUnfinishedRows(t *testing.T) {
-	for _, mode := range []string{"csv_create_error", "sql_write_error", "complete_and_reuse"} {
+	for _, mode := range []string{"csv_stage_error", "sql_write_error", "complete_and_reuse"} {
 		t.Run(mode, func(t *testing.T) {
-			out := exportTestStdout(t)
+			sink, sinkFile := exportTestSink(t)
 			database := "db"
 			conf := csvConfig{fieldDelimiter: ','}
 			var wantErr error
 			switch mode {
-			case "csv_create_error":
+			case "csv_stage_error":
+				// The staged csv is created next to the dump script: a
+				// read-only working directory rejects it before any row is read.
 				conf.enable = true
-				database = filepath.Join(t.TempDir(), "missing", "db")
-				wantErr = os.ErrNotExist
+				stageDir := t.TempDir()
+				require.NoError(t, os.Chmod(stageDir, 0o555))
+				oldWd, err := os.Getwd()
+				require.NoError(t, err)
+				require.NoError(t, os.Chdir(stageDir))
+				t.Cleanup(func() { _ = os.Chdir(oldWd) })
+				wantErr = fs.ErrPermission
 			case "sql_write_error":
-				if err := out.Close(); err != nil {
-					t.Fatal(err)
-				}
+				require.NoError(t, sinkFile.Close())
 				wantErr = os.ErrClosed
 			}
 			db, stop, serverResult := exportMySQLServer(t, "select * from `"+database+"`.`t`", wantErr == nil)
@@ -193,7 +200,7 @@ func TestGenOutputUnfinishedRows(t *testing.T) {
 			go func() {
 				defer close(finished)
 				pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
-				gotErr = genOutput(database, "t", pool, 29, true, &conf, "")
+				gotErr = genOutput(database, "t", sink, pool, 29, true, &conf, "")
 			}()
 			t.Cleanup(func() {
 				stop()

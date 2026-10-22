@@ -23,7 +23,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -158,15 +157,15 @@ func exportTestDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	return db, mock
 }
 
-func exportTestStdout(t *testing.T) *os.File {
+// exportTestSink returns a sink over a fresh temp file. Closing the file
+// turns stream writes into write-error injections.
+func exportTestSink(t *testing.T) (*dumpSink, *os.File) {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "stdout")
 	require.NoError(t, err)
+	sink := sinkOver(f)
 	t.Cleanup(func() { _ = f.Close() })
-	oldStdout := os.Stdout
-	os.Stdout = f
-	t.Cleanup(func() { os.Stdout = oldStdout })
-	return f
+	return sink, f
 }
 
 func exportTestRows(n int, rowErr error, errorRow int) *sqlmock.Rows {
@@ -204,7 +203,7 @@ func TestShowInsertRows(t *testing.T) {
 			rows, err := db.Query("select id")
 			require.NoError(t, err)
 			defer rows.Close()
-			out := exportTestStdout(t)
+			out, expectFile := exportTestSink(t)
 			var buffers []*bytes.Buffer
 			pool := &sync.Pool{New: func() any {
 				buf := &bytes.Buffer{}
@@ -212,12 +211,12 @@ func TestShowInsertRows(t *testing.T) {
 				return buf
 			}}
 			var id sql.RawBytes
-			err = showInsert(rows, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, "t", pool, tc.bufferSize)
+			err = showInsert(rows, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, "t", pool, tc.bufferSize, out)
 			require.ErrorIs(t, err, tc.err)
 			for _, buf := range buffers {
 				require.Zero(t, buf.Len(), "pooled buffers must be reset on every return path")
 			}
-			data, err := os.ReadFile(out.Name())
+			data, err := os.ReadFile(expectFile.Name())
 			require.NoError(t, err)
 			require.Equal(t, tc.want, string(data))
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -237,7 +236,7 @@ func TestShowInsertScanError(t *testing.T) {
 		buffers = append(buffers, buf)
 		return buf
 	}}
-	err = showInsert(rows, nil, nil, "t", pool, 1024)
+	err = showInsert(rows, nil, nil, "t", pool, 1024, sinkOver(&bytes.Buffer{}))
 	require.ErrorContains(t, err, "expected 1 destination arguments")
 	for _, buf := range buffers {
 		require.Zero(t, buf.Len())
@@ -313,10 +312,10 @@ func TestToCsvFlushError(t *testing.T) {
 }
 
 func TestGenOutputClosesRows(t *testing.T) {
-	for _, mode := range []string{"sql_cancel", "sql_write_error", "csv_create_error"} {
+	for _, mode := range []string{"sql_cancel", "sql_write_error", "csv_row_error"} {
 		t.Run(mode, func(t *testing.T) {
 			_, mock := exportTestDB(t)
-			out := exportTestStdout(t)
+			out, expectFile := exportTestSink(t)
 			rows := exportTestRows(3, nil, 0)
 			conf := csvConfig{fieldDelimiter: ','}
 			database := "db"
@@ -324,22 +323,27 @@ func TestGenOutputClosesRows(t *testing.T) {
 			case "sql_cancel":
 				rows.RowError(2, context.Canceled)
 			case "sql_write_error":
-				require.NoError(t, out.Close())
-			case "csv_create_error":
+				require.NoError(t, expectFile.Close())
+			case "csv_row_error":
+				chdirToTemp(t)
 				conf.enable = true
-				database = filepath.Join(t.TempDir(), "missing", "db")
+				rows.RowError(1, io.ErrUnexpectedEOF)
 			}
 			mock.ExpectQuery("select * from `" + database + "`.`t`").WillReturnRows(rows).RowsWillBeClosed()
 			mock.ExpectClose()
 			pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
-			err := genOutput(database, "t", pool, 29, true, &conf, "")
+			err := genOutput(database, "t", out, pool, 29, true, &conf, "")
 			switch mode {
 			case "sql_cancel":
 				require.ErrorIs(t, err, context.Canceled)
 			case "sql_write_error":
 				require.ErrorIs(t, err, os.ErrClosed)
-			case "csv_create_error":
-				require.ErrorIs(t, err, os.ErrNotExist)
+			case "csv_row_error":
+				// A failed table removes its staged csv data file.
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+				for name := range readDirSnapshot(t) {
+					require.NotContains(t, name, ".mo-dump-", "staged csv must be cleaned")
+				}
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
@@ -348,6 +352,21 @@ func TestGenOutputClosesRows(t *testing.T) {
 
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
+		if mode == "all_system_dbs" {
+			_, mock := exportTestDB(t)
+			mock.ExpectQuery("show databases").
+				WillReturnRows(sqlmock.NewRows([]string{"Database"}).
+					AddRow("information_schema").
+					AddRow("mo_catalog").
+					AddRow("mysql").
+					AddRow("system").
+					AddRow("system_metrics"))
+			flag.CommandLine = flag.NewFlagSet("mo-dump", flag.ExitOnError)
+			os.Args = []string{"mo-dump", "-db", "all"}
+			main()
+			require.NoError(t, mock.ExpectationsWereMet())
+			return
+		}
 		_, mock := exportTestDB(t)
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
@@ -370,7 +389,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel"} {
+	for _, mode := range []string{"success", "cancel", "all_system_dbs"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -380,17 +399,25 @@ func TestDumpExitStatus(t *testing.T) {
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err := cmd.Run()
 			require.NoError(t, ctx.Err(), "child process did not terminate")
-			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
 			if mode == "cancel" {
 				var exitErr *exec.ExitError
 				require.ErrorAs(t, err, &exitErr)
 				require.Equal(t, 1, exitErr.ExitCode())
+				// The dump is staged until it completes: a canceled dump must
+				// leave stdout completely empty instead of a partial script.
+				require.Empty(t, stdout.String())
 				require.Contains(t, stderr.String(), "modump error: context canceled")
-				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
-				require.NotContains(t, stdout.String(), "SET foreign_key_checks = 1;")
+			} else if mode == "all_system_dbs" {
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr)
+				require.Equal(t, 1, exitErr.ExitCode())
+				require.Empty(t, stdout.String())
+				require.Contains(t, stderr.String(), "modump error")
+				require.Contains(t, stderr.String(), "only system databases")
 			} else {
 				require.NoError(t, err, stderr.String())
 				require.Empty(t, stderr.String())
+				require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "successful dump publishes its script")
 				require.Contains(t, stdout.String(), "MODUMP SUCCESS")
 				require.Contains(t, stdout.String(), "SET foreign_key_checks = 1;")
 			}
@@ -494,19 +521,14 @@ func TestShowInsertBit(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rows.Close()) })
 
-	output, err := os.CreateTemp(t.TempDir(), "insert-*.sql")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, output.Close()) })
-	oldStdout := os.Stdout
-	os.Stdout = output
-	t.Cleanup(func() { os.Stdout = oldStdout })
+	sink, sinkFile := exportTestSink(t)
 
 	var id, bit sql.RawBytes
 	pool := &sync.Pool{New: func() any { return new(bytes.Buffer) }}
-	err = showInsert(rows, []any{&id, &bit}, []*Column{{Name: "id", Type: "INT"}, {Name: "b", Type: "BIT"}}, "t", pool, defaultNetBufferLength)
+	err = showInsert(rows, []any{&id, &bit}, []*Column{{Name: "id", Type: "INT"}, {Name: "b", Type: "BIT"}}, "t", pool, defaultNetBufferLength, sink)
 	require.NoError(t, err)
 	require.NoError(t, rows.Err())
-	got, err := os.ReadFile(output.Name())
+	got, err := os.ReadFile(sinkFile.Name())
 	require.NoError(t, err)
 	require.Equal(t, "INSERT INTO `t` VALUES (1,0x27),(2,0x5C),(3,0x00),(4,NULL),(5,0x0001),(6,0x41);\n\n\n\n", string(got))
 }
@@ -555,20 +577,11 @@ func TestShowCreateTable(t *testing.T) {
 			res:          "create table t1 (a int, b int);\n\n\n",
 		},
 	}
-	old := os.Stdout
 	for _, v := range kases {
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-		showCreateTable(v.sql, v.withNextLine)
-
-		e := w.Close()
-		require.Nil(t, e)
 		var buf bytes.Buffer
-		_, e = buf.ReadFrom(r)
-		require.Nil(t, e)
+		showCreateTable(sinkOver(&buf), v.sql, v.withNextLine)
 		require.Equal(t, v.res, buf.String())
 	}
-	os.Stdout = old
 }
 
 func TestViewOrder(t *testing.T) {
@@ -737,14 +750,8 @@ func Test_showInsertOversizedRow(t *testing.T) {
 	cols := []*Column{{Name: "id", Type: "int"}, {Name: "payload", Type: "varchar"}}
 	bufPool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
 
-	old := os.Stdout
-	pr, pw, _ := os.Pipe()
-	os.Stdout = pw
-	err = showInsert(r, args, cols, "t", bufPool, 1024)
-	os.Stdout = old
-	_ = pw.Close()
 	var bb bytes.Buffer
-	_, _ = bb.ReadFrom(pr)
+	err = showInsert(r, args, cols, "t", bufPool, 1024, sinkOver(&bb))
 	out := bb.String()
 
 	require.Nil(t, err)
