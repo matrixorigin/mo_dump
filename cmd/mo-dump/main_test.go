@@ -20,11 +20,14 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
@@ -142,6 +145,257 @@ func runHelperProcess(t *testing.T, args ...string) (string, string, int) {
 		exitCode = exitErr.ExitCode()
 	}
 	return stdout.String(), stderr.String(), exitCode
+}
+
+func exportTestDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	oldConn := conn
+	conn = db
+	t.Cleanup(func() { conn = oldConn })
+	return db, mock
+}
+
+func exportTestStdout(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+	oldStdout := os.Stdout
+	os.Stdout = f
+	t.Cleanup(func() { os.Stdout = oldStdout })
+	return f
+}
+
+func exportTestRows(n int, rowErr error, errorRow int) *sqlmock.Rows {
+	rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("id").OfType("INT", int64(0)))
+	for i := 0; i < n; i++ {
+		rows.AddRow(i + 1)
+	}
+	if rowErr != nil {
+		rows.RowError(errorRow, rowErr)
+	}
+	return rows
+}
+
+func TestShowInsertRows(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		rows       int
+		bufferSize int
+		err        error
+		errorRow   int
+		want       string
+	}{
+		{name: "empty", bufferSize: 1024, want: "\n\n\n"},
+		{name: "single", rows: 1, bufferSize: 1024, want: "INSERT INTO `t` VALUES (1);\n\n\n\n"},
+		{name: "one_chunk", rows: 3, bufferSize: 1024, want: "INSERT INTO `t` VALUES (1),(2),(3);\n\n\n\n"},
+		{name: "multiple_chunks", rows: 3, bufferSize: 29, want: "INSERT INTO `t` VALUES (1);\nINSERT INTO `t` VALUES (2);\nINSERT INTO `t` VALUES (3);\n\n\n\n"},
+		{name: "cancel_before_first_row", rows: 1, bufferSize: 1024, err: context.Canceled},
+		{name: "cancel_with_buffered_row", rows: 2, bufferSize: 1024, err: context.Canceled, errorRow: 1},
+		{name: "cancel_after_chunk", rows: 3, bufferSize: 29, err: context.Canceled, errorRow: 2, want: "INSERT INTO `t` VALUES (1);\n"},
+		{name: "read_error", rows: 2, bufferSize: 1024, err: io.ErrUnexpectedEOF, errorRow: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := exportTestDB(t)
+			mock.ExpectQuery("select id").WillReturnRows(exportTestRows(tc.rows, tc.err, tc.errorRow)).RowsWillBeClosed()
+			rows, err := db.Query("select id")
+			require.NoError(t, err)
+			defer rows.Close()
+			out := exportTestStdout(t)
+			var buffers []*bytes.Buffer
+			pool := &sync.Pool{New: func() any {
+				buf := &bytes.Buffer{}
+				buffers = append(buffers, buf)
+				return buf
+			}}
+			var id sql.RawBytes
+			err = showInsert(rows, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, "t", pool, tc.bufferSize)
+			require.ErrorIs(t, err, tc.err)
+			for _, buf := range buffers {
+				require.Zero(t, buf.Len(), "pooled buffers must be reset on every return path")
+			}
+			data, err := os.ReadFile(out.Name())
+			require.NoError(t, err)
+			require.Equal(t, tc.want, string(data))
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestShowInsertScanError(t *testing.T) {
+	db, mock := exportTestDB(t)
+	mock.ExpectQuery("select id").WillReturnRows(exportTestRows(1, nil, 0)).RowsWillBeClosed()
+	rows, err := db.Query("select id")
+	require.NoError(t, err)
+	defer rows.Close()
+	var buffers []*bytes.Buffer
+	pool := &sync.Pool{New: func() any {
+		buf := &bytes.Buffer{}
+		buffers = append(buffers, buf)
+		return buf
+	}}
+	err = showInsert(rows, nil, nil, "t", pool, 1024)
+	require.ErrorContains(t, err, "expected 1 destination arguments")
+	for _, buf := range buffers {
+		require.Zero(t, buf.Len())
+	}
+	require.NoError(t, rows.Close())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestToCsvRows(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rows     int
+		err      error
+		errorRow int
+		want     string
+	}{
+		{name: "empty"},
+		{name: "success", rows: 2, want: "1\n2\n"},
+		{name: "cancel_before_first_row", rows: 1, err: context.Canceled},
+		// Buffered rows are flushed only after a successful EOF.
+		{name: "cancel_after_row", rows: 2, err: context.Canceled, errorRow: 1},
+		{name: "read_error", rows: 2, err: io.ErrUnexpectedEOF, errorRow: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := exportTestDB(t)
+			mock.ExpectQuery("select id").WillReturnRows(exportTestRows(tc.rows, tc.err, tc.errorRow)).RowsWillBeClosed()
+			rows, err := db.Query("select id")
+			require.NoError(t, err)
+			defer rows.Close()
+			var out bytes.Buffer
+			var id sql.RawBytes
+			err = toCsv(rows, &out, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, &csvConfig{fieldDelimiter: ','})
+			require.ErrorIs(t, err, tc.err)
+			require.Equal(t, tc.want, out.String())
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+type csvFlushErrorWriter struct {
+	writes int
+}
+
+func (w *csvFlushErrorWriter) Write([]byte) (int, error) {
+	w.writes++
+	return 0, io.ErrClosedPipe
+}
+
+func TestToCsvFlushError(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		rowErr error
+		want   error
+		writes int
+	}{
+		{name: "flush_error_at_eof", want: io.ErrClosedPipe, writes: 1},
+		{name: "row_error_does_not_flush", rowErr: context.Canceled, want: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := exportTestDB(t)
+			mock.ExpectQuery("select id").WillReturnRows(exportTestRows(2, tc.rowErr, 1)).RowsWillBeClosed()
+			rows, err := db.Query("select id")
+			require.NoError(t, err)
+			defer rows.Close()
+			out := &csvFlushErrorWriter{}
+			var id sql.RawBytes
+			err = toCsv(rows, out, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, &csvConfig{fieldDelimiter: ','})
+			require.ErrorIs(t, err, tc.want)
+			require.Equal(t, tc.writes, out.writes)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestGenOutputClosesRows(t *testing.T) {
+	for _, mode := range []string{"sql_cancel", "sql_write_error", "csv_create_error"} {
+		t.Run(mode, func(t *testing.T) {
+			_, mock := exportTestDB(t)
+			out := exportTestStdout(t)
+			rows := exportTestRows(3, nil, 0)
+			conf := csvConfig{fieldDelimiter: ','}
+			database := "db"
+			switch mode {
+			case "sql_cancel":
+				rows.RowError(2, context.Canceled)
+			case "sql_write_error":
+				require.NoError(t, out.Close())
+			case "csv_create_error":
+				conf.enable = true
+				database = filepath.Join(t.TempDir(), "missing", "db")
+			}
+			mock.ExpectQuery("select * from `" + database + "`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+			mock.ExpectClose()
+			pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
+			err := genOutput(database, "t", pool, 29, true, &conf, "")
+			switch mode {
+			case "sql_cancel":
+				require.ErrorIs(t, err, context.Canceled)
+			case "sql_write_error":
+				require.ErrorIs(t, err, os.ErrClosed)
+			case "csv_create_error":
+				require.ErrorIs(t, err, os.ErrNotExist)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestDumpExitStatus(t *testing.T) {
+	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
+		_, mock := exportTestDB(t)
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
+			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db' and relname in ('t')").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", "r"))
+		mock.ExpectQuery("show create table `db`.`t`").
+			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
+		payload := strings.Repeat("x", minNetBufferLength/2)
+		rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("TEXT", "")).
+			AddRow(payload).AddRow(payload).AddRow(payload)
+		if mode == "cancel" {
+			rows.RowError(2, context.Canceled)
+		}
+		mock.ExpectQuery("select * from `db`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+		mock.ExpectClose()
+		flag.CommandLine = flag.NewFlagSet("mo-dump", flag.ExitOnError)
+		os.Args = []string{"mo-dump", "-db", "db", "-tbl", "t", "-net-buffer-length", "16384"}
+		main()
+		require.NoError(t, mock.ExpectationsWereMet())
+		return
+	}
+
+	for _, mode := range []string{"success", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDumpExitStatus$")
+			cmd.Env = append(os.Environ(), "MO_DUMP_TEST_EXIT_STATUS="+mode)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			require.NoError(t, ctx.Err(), "child process did not terminate")
+			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
+			if mode == "cancel" {
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr)
+				require.Equal(t, 1, exitErr.ExitCode())
+				require.Contains(t, stderr.String(), "modump error: context canceled")
+				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
+				require.NotContains(t, stdout.String(), "SET foreign_key_checks = 1;")
+			} else {
+				require.NoError(t, err, stderr.String())
+				require.Empty(t, stderr.String())
+				require.Contains(t, stdout.String(), "MODUMP SUCCESS")
+				require.Contains(t, stdout.String(), "SET foreign_key_checks = 1;")
+			}
+		})
+	}
 }
 
 func TestConvertValue(t *testing.T) {

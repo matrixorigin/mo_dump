@@ -19,6 +19,8 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -551,7 +553,15 @@ func getCreateView(db, tbl string) (string, error) {
 func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		buf.Reset()
+		bufPool.Put(buf)
+	}()
 	curBuf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		curBuf.Reset()
+		bufPool.Put(curBuf)
+	}()
 	buf.Grow(netBufferLength)
 	initInert := "INSERT INTO `" + tbl + "` VALUES "
 	for {
@@ -606,6 +616,9 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			buf.Write(curBuf.Bytes())
 			curBuf.Reset()
 		}
+		if err := r.Err(); err != nil {
+			return err
+		}
 		if buf.Len() > preLen {
 			buf.WriteString(";\n")
 			_, err = buf.WriteTo(os.Stdout)
@@ -621,12 +634,8 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 			buf.Reset()
 			continue
 		}
-		buf.Reset()
-		curBuf.Reset()
 		break
 	}
-	bufPool.Put(buf)
-	bufPool.Put(curBuf)
 	fmt.Printf("\n\n\n")
 	return nil
 }
@@ -668,6 +677,9 @@ func toCsv(r *sql.Rows, output io.Writer, rowResults []any, cols []*Column, csvC
 		if err != nil {
 			return err
 		}
+	}
+	if err := r.Err(); err != nil {
+		return err
 	}
 	return w.Flush()
 }
@@ -760,15 +772,48 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 	return strings.ContainsRune(field, delim) || strings.ContainsAny(field, "\"\r\n")
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) error {
+func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
 	querySql := "select * from `" + db + "`.`" + tbl + "`"
 	if condition != "" {
 		querySql += " where " + condition
 	}
-	r, err := conn.Query(querySql)
+
+	// Match DB.Query's three-attempt budget, but retain exclusive ownership of
+	// the successful connection. Never retry once a result set is returned.
+	const maxQueryAttempts = 3
+	var queryConn *sql.Conn
+	var r *sql.Rows
+	for attempt := 0; attempt < maxQueryAttempts; attempt++ {
+		queryConn, err = conn.Conn(context.Background())
+		if err != nil {
+			return err
+		}
+		r, err = queryConn.QueryContext(context.Background(), querySql)
+		if err == nil {
+			break
+		}
+		_ = queryConn.Close()
+		if !errors.Is(err, driver.ErrBadConn) {
+			return err
+		}
+	}
 	if err != nil {
 		return err
 	}
+	defer queryConn.Close()
+	defer func() {
+		if err != nil {
+			// MySQL Rows.Close drains unread results. Abort the physical connection
+			// first so a local failure cannot wait for the source to send EOF.
+			_ = queryConn.Raw(func(raw any) error {
+				_ = raw.(driver.Conn).Close()
+				// Returning ErrBadConn here would make sql.Conn wait for the rows
+				// we still own. Release them before returning the connection.
+				return nil
+			})
+		}
+		_ = r.Close()
+	}()
 	colTypes, err := r.ColumnTypes()
 	if err != nil {
 		return err
