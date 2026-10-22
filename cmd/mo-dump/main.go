@@ -72,6 +72,26 @@ var usage = func() {
 	flag.PrintDefaults()
 }
 
+// parseDatabases splits the -db option value by comma, trims spaces and drops
+// empty items. It returns an invalid-input error when no valid database name
+// remains (e.g. -db ',,'), so callers never dump with an empty database list.
+func parseDatabases(ctx context.Context, raw string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, moerr.NewInvalidInput(ctx, "database must be specified")
+	}
+	var dbs []string
+	for _, db := range strings.Split(raw, ",") {
+		db = strings.TrimSpace(db)
+		if len(db) != 0 {
+			dbs = append(dbs, db)
+		}
+	}
+	if len(dbs) == 0 {
+		return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf("database '%s' contains no valid database name", raw))
+	}
+	return dbs, nil
+}
+
 func main() {
 	var (
 		err error
@@ -130,17 +150,9 @@ func main() {
 		opt.netBufferLength = maxNetBufferLength
 	}
 
-	if len(opt.database) == 0 {
-		err = moerr.NewInvalidInput(ctx, "database must be specified")
+	opt.dbs, err = parseDatabases(ctx, opt.database)
+	if err != nil {
 		return
-	} else {
-		dbs := strings.Split(opt.database, ",")
-		for _, db := range dbs {
-			db = strings.TrimSpace(db)
-			if len(db) != 0 {
-				opt.dbs = append(opt.dbs, db)
-			}
-		}
 	}
 
 	if len(opt.tbl) > 0 {

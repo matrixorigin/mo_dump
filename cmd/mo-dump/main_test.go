@@ -35,6 +35,118 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestParseDatabases(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		raw     string
+		want    []string
+		wantErr string
+	}{
+		{name: "empty option", raw: "", wantErr: "database must be specified"},
+		{name: "only commas", raw: ",,", wantErr: "contains no valid database name"},
+		{name: "single comma", raw: ",", wantErr: "contains no valid database name"},
+		{name: "commas and spaces", raw: " , , ", wantErr: "contains no valid database name"},
+		{name: "single database", raw: "db1", want: []string{"db1"}},
+		{name: "multiple databases", raw: "db1,db2", want: []string{"db1", "db2"}},
+		{name: "mixed list with empty and blank items", raw: "db1, , , db2", want: []string{"db1", "db2"}},
+		{name: "valid name with trailing comma", raw: "testdb,, ", want: []string{"testdb"}},
+		{name: "all", raw: "all", want: []string{"all"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDatabases(ctx, tt.raw)
+			if len(tt.wantErr) > 0 {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestMoDumpDbOptionValidation verifies process level behavior of the -db
+// validation added for https://github.com/matrixorigin/matrixone/issues/30573:
+// invalid database lists exit with code 1, print a controlled `modump error`
+// on stderr, keep stdout empty and never panic.
+func TestMoDumpDbOptionValidation(t *testing.T) {
+	if os.Getenv("MO_DUMP_TEST_HELPER") == "1" {
+		runHelperMain(t)
+		return
+	}
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantErr    string
+		notWantErr []string
+	}{
+		{name: "only commas", args: []string{"-db", ",,"}, wantErr: "contains no valid database name"},
+		{name: "single comma", args: []string{"-db", ","}, wantErr: "contains no valid database name"},
+		{name: "commas and spaces", args: []string{"-db", " , , "}, wantErr: "contains no valid database name"},
+		{name: "empty option", args: []string{"-db", ""}, wantErr: "database must be specified"},
+		{
+			// A list with at least one valid name must pass argument validation.
+			// The host check runs after -db parsing and before any connection,
+			// so -h ':' deterministically proves the -db list was accepted.
+			name:       "valid name with trailing comma",
+			args:       []string{"-db", "testdb,, ", "-h", ":"},
+			wantErr:    "host can not have character ':'",
+			notWantErr: []string{"contains no valid database name", "database must be specified"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, exitCode := runHelperProcess(t, tt.args...)
+			require.Equal(t, 1, exitCode)
+			require.Empty(t, stdout)
+			require.Contains(t, stderr, "modump error")
+			require.Contains(t, stderr, tt.wantErr)
+			for _, s := range tt.notWantErr {
+				require.NotContains(t, stderr, s)
+			}
+			require.NotContains(t, stderr, "panic")
+		})
+	}
+}
+
+// runHelperMain re-executes the real main() inside the test binary with the
+// arguments carried by MO_DUMP_TEST_ARGS. It only runs in the helper process.
+func runHelperMain(t *testing.T) {
+	t.Helper()
+	args := strings.Split(os.Getenv("MO_DUMP_TEST_ARGS"), "\x1f")
+	os.Args = append([]string{"mo-dump"}, args...)
+	// The testing framework has already parsed the go test flags; swap in a
+	// fresh flag set so that main() parses the mo-dump arguments instead.
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	main()
+}
+
+// runHelperProcess runs TestMoDumpDbOptionValidation in a helper process that
+// invokes the real main(), and returns its stdout, stderr and exit code.
+func runHelperProcess(t *testing.T, args ...string) (string, string, int) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMoDumpDbOptionValidation$")
+	cmd.Env = append(os.Environ(),
+		"MO_DUMP_TEST_HELPER=1",
+		"MO_DUMP_TEST_ARGS="+strings.Join(args, "\x1f"),
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		require.True(t, ok, "helper process failed to run: %v", err)
+		exitCode = exitErr.ExitCode()
+	}
+	return stdout.String(), stderr.String(), exitCode
+}
+
 func exportTestDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	t.Helper()
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
