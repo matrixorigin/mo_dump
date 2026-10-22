@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/csv"
 	"fmt"
 	"os"
 	"strings"
@@ -71,6 +70,11 @@ func TestConvertValue(t *testing.T) {
 
 func makeValue(val string) interface{} {
 	tmp := sql.RawBytes(val)
+	return &tmp
+}
+
+func makeNullValue() interface{} {
+	var tmp sql.RawBytes
 	return &tmp
 }
 
@@ -166,38 +170,111 @@ func TestViewOrder(t *testing.T) {
 }
 
 func Test_toCsvFields(t *testing.T) {
-	bys1 := []byte{0x5C, 0x31, 0x30, 0x5C, 0x33, 0x36, 0x5C, 0x38, 0x36, 0x5c}
-	args1 := []any{makeValue(string(bys1))}
-	cols1 := []*Column{
-		{
-			Name: "col1",
-			Type: "varchar",
-		},
+	text := func(s string) []any { return []any{makeValue(s)} }
+	textNull := func() []any { return []any{makeNullValue()} }
+	varcharCol := []*Column{{Name: "col1", Type: "varchar"}}
+
+	kases := []struct {
+		name         string
+		args         []any
+		cols         []*Column
+		enableEscape bool
+		wantLine     string
+		wantNull     bool
+	}{
+		// legacy: every backslash is escaped exactly once
+		{"backslashes", text("\\10\\36\\86\\"), varcharCol, false, "\\\\10\\\\36\\\\86\\\\", false},
+		// SQL NULL must not collide with the NULL marker \N
+		{"sql null", textNull(), varcharCol, false, "", true},
+		// a literal text \N is escaped so LOAD DATA reads it back as text
+		{"text marker N", text("\\N"), varcharCol, false, "\\\\N", false},
+		// a text \N must survive -enable-escape as well
+		{"text marker N escape", text("\\N"), varcharCol, true, "\\\\N", false},
+		{"text backslashes N", text("\\\\N"), varcharCol, false, "\\\\\\\\N", false},
+		{"text null word", text("NULL"), varcharCol, false, "NULL", false},
+		// -enable-escape escapes ',' for string columns exactly once
+		{"comma escape", text("a,b"), varcharCol, true, "a\\,b", false},
+		{"comma no escape", text("a,b"), varcharCol, false, "a,b", false},
 	}
-	line := make([]string, 1)
-	toCsvFields(args1, cols1, line, false)
-	want := "\\10\\36\\86\\"
-	assert.Equal(t, want, line[0])
+	for _, kase := range kases {
+		t.Run(kase.name, func(t *testing.T) {
+			line := make([]string, len(kase.args))
+			nulls := make([]bool, len(kase.args))
+			toCsvFields(kase.args, kase.cols, line, nulls, kase.enableEscape)
+			assert.Equal(t, kase.wantLine, line[0])
+			assert.Equal(t, kase.wantNull, nulls[0])
+		})
+	}
 }
 
 func Test_toCsvLine(t *testing.T) {
-	bys1 := []byte{0x5C, 0x31, 0x30, 0x5C, 0x33, 0x36, 0x5C, 0x38, 0x36, 0x5c}
-	args1 := []any{makeValue(string(bys1))}
-	cols1 := []*Column{
-		{
-			Name: "col1",
-			Type: "varchar",
-		},
+	text := func(s string) []any { return []any{makeValue(s)} }
+	varcharCol := []*Column{{Name: "col1", Type: "varchar"}}
+
+	kases := []struct {
+		name         string
+		args         []any
+		cols         []*Column
+		enableEscape bool
+		delim        rune
+		want         string
+	}{
+		// legacy content, no quoting needed
+		{"backslashes", text("\\10\\36\\86\\"), varcharCol, false, '\t', "\\\\10\\\\36\\\\86\\\\\n"},
+		// SQL NULL is written as the unquoted \N marker
+		{"sql null", []any{makeNullValue()}, varcharCol, false, ',', "\\N\n"},
+		// text \N
+		{"text marker N", text("\\N"), varcharCol, false, ',', "\\\\N\n"},
+		// a literal text NULL must be quoted, or LOAD DATA reads it as SQL NULL
+		{"text null word", text("NULL"), varcharCol, false, ',', "\"NULL\"\n"},
+		{"text null word lower", text("null"), varcharCol, false, ',', "\"null\"\n"},
+		// framing quotes
+		{"comma quoted", text("a,b"), varcharCol, false, ',', "\"a,b\"\n"},
+		{"double quote", text("a\"b"), varcharCol, false, ',', "\"a\"\"b\"\n"},
+		{"line feed", text("a\nb"), varcharCol, false, ',', "\"a\nb\"\n"},
+		{"empty string", text(""), varcharCol, false, ',', "\n"},
+		// -enable-escape: ',' escaped once, tab delimiter, no quotes
+		{"comma escaped no quote", text("a,b"), varcharCol, true, '\t', "a\\,b\n"},
+		// alternate field delimiter from -csv-field-delimiter
+		{"pipe delimiter", text("a|b"), varcharCol, false, '|', "\"a|b\"\n"},
+		{"text null with pipe delimiter", text("NULL"), varcharCol, false, '|', "\"NULL\"\n"},
+		// binary (non-UTF-8) values must survive byte-identical
+		{"binary", []any{makeValue("\xff\xfe")}, []*Column{{Name: "col1", Type: "blob"}}, false, ',', "\xff\xfe\n"},
+		{"binary with quote", []any{makeValue("\xff\"\xfe")}, []*Column{{Name: "col1", Type: "blob"}}, false, ',', "\"\xff\"\"\xfe\"\n"},
+		// whitespace-leading values must be quoted: unquoted whitespace-only
+		// records are dropped by older loaders
+		{"leading space", text(" a"), varcharCol, false, ',', "\" a\"\n"},
+		{"space only", text(" "), varcharCol, false, ',', "\" \"\n"},
+		{"tabs only", text("\t\t"), varcharCol, false, ',', "\"\t\t\"\n"},
+		{"nbsp only", text("  "), varcharCol, false, ',', "\"  \"\n"},
 	}
-	line := make([]string, 1)
+	for _, kase := range kases {
+		t.Run(kase.name, func(t *testing.T) {
+			line := make([]string, len(kase.args))
+			nulls := make([]bool, len(kase.args))
+			bb := bytes.Buffer{}
+			err := toCsvLine(&bb, kase.delim, kase.args, kase.cols, line, nulls, kase.enableEscape)
+			assert.NoError(t, err)
+			assert.Equal(t, kase.want, bb.String())
+		})
+	}
+}
+
+// Test_toCsvLine_whitespaceOnlyRows: every whitespace-only record must be
+// written quoted, so an older loader does not skip it as an empty line.
+func Test_toCsvLine_whitespaceOnlyRows(t *testing.T) {
+	cols := []*Column{{Name: "col1", Type: "varchar"}}
 	bb := bytes.Buffer{}
-	cw1 := csv.NewWriter(&bb)
-	cw1.Comma = '\t'
-	err := toCsvLine(cw1, args1, cols1, line, false)
-	assert.NoError(t, err)
-	want := "\\10\\36\\86\\"
-	assert.Equal(t, want, line[0])
-	assert.Equal(t, bb.Bytes()[:len(bys1)], bys1)
+	line := make([]string, 1)
+	nulls := make([]bool, 1)
+	rows := []string{" ", "\t", " ", "  \t "}
+	for _, row := range rows {
+		err := toCsvLine(&bb, ',', []any{makeValue(row)}, cols, line, nulls, false)
+		assert.NoError(t, err)
+	}
+	got := bb.String()
+	assert.Equal(t, len(rows), strings.Count(got, "\n"))
+	assert.Equal(t, "\" \"\n\"\t\"\n\" \"\n\"  \t \"\n", got)
 }
 
 func Test_checkFieldDelimiter(t *testing.T) {
@@ -259,6 +336,33 @@ func Test_checkFieldDelimiter(t *testing.T) {
 			want: defaultFieldDelimiter,
 			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
 				assert.NoError(t, err)
+				return false
+			},
+		},
+		{
+			name: "double quote",
+			args: args{ctx: nil, s: "\""},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
+				return false
+			},
+		},
+		{
+			name: "line feed",
+			args: args{ctx: nil, s: "\n"},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
+				return false
+			},
+		},
+		{
+			name: "carriage return",
+			args: args{ctx: nil, s: "\r"},
+			want: defaultFieldDelimiter,
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				assert.Error(t, err)
 				return false
 			},
 		},
