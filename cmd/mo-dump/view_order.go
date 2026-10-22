@@ -21,7 +21,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
 
@@ -57,78 +56,32 @@ func getViewCatalogMode(ctx context.Context) (viewSQLMode, error) {
 // Non-nil definitions are authoritative for every view. Nil selects explicit
 // standalone DDL inputs; it is never a fallback after a metadata-read failure.
 func adjustViewOrder(ctx context.Context, database string, createTable []string, tables Tables, start int, mode viewSQLMode, definitions map[string]viewDefinition) error {
-	n := len(tables) - start
-	positions := make(map[string]int, n)
+	views := make([]dumpView, 0, len(tables)-start)
+	positions := make(map[viewName]int)
 	for i, table := range tables[start:] {
-		name := mode.name(table.Name)
-		if _, exists := positions[name]; exists {
-			return fmt.Errorf("duplicate view identity in database %s: %s", database, table.Name)
-		}
-		positions[name] = i
-	}
-	counts := make([]int, n)
-	dependents := make([][]int, n)
-	for i, ddl := range createTable[start:] {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		parseMode, defaultDatabase := mode, database
+		view := dumpView{name: viewName{database, table.Name}, create: createTable[start+i]}
 		if definitions != nil {
-			definition, ok := definitions[tables[start+i].Name]
+			definition, ok := definitions[table.Name]
 			if !ok {
-				return fmt.Errorf("missing persisted definition for view %s.%s", database, tables[start+i].Name)
+				return fmt.Errorf("missing persisted definition for view %s.%s", database, table.Name)
 			}
-			var err error
-			parseMode, err = definition.parserMode(mode)
-			if err != nil {
-				return fmt.Errorf("cannot read creation context for view %s.%s: %w", database, tables[start+i].Name, err)
-			}
-			ddl = definition.Stmt
-			if definition.DefaultDatabase != "" {
-				defaultDatabase = definition.DefaultDatabase
-			}
+			view.definition = &definition
+			view.create = definition.Stmt
 		}
-		refs, err := viewDependenciesInContext(database, defaultDatabase, ddl, parseMode, mode)
-		if err != nil {
-			return fmt.Errorf("cannot order view %s.%s: %w", database, tables[start+i].Name, err)
-		}
-		for _, name := range refs {
-			if dependency, ok := positions[name]; ok {
-				counts[i]++
-				dependents[dependency] = append(dependents[dependency], i)
-			}
-		}
+		positions[view.name] = start + i
+		views = append(views, view)
 	}
-	order := make([]int, 0, n)
-	for i, count := range counts {
-		if count == 0 {
-			order = append(order, i)
-		}
+	ordered, err := orderDumpViews(ctx, views, mode)
+	if err != nil {
+		return err
 	}
-	for next := 0; next < len(order); next++ {
-		for _, dependent := range dependents[order[next]] {
-			counts[dependent]--
-			if counts[dependent] == 0 {
-				order = append(order, dependent)
-			}
-		}
+	ddl := make([]string, len(ordered))
+	orderedTables := make(Tables, len(ordered))
+	for i, view := range ordered {
+		old := positions[view.name]
+		ddl[i], orderedTables[i] = createTable[old], tables[old]
 	}
-	if len(order) != n {
-		blocked := make([]string, 0, n-len(order))
-		for i, count := range counts {
-			if count != 0 {
-				blocked = append(blocked, tables[start+i].Name)
-			}
-		}
-		return fmt.Errorf("cyclic view dependencies in database %s; blocked views: %s", database, strings.Join(blocked, ", "))
-	}
-	orderedDDL := make([]string, n)
-	orderedTables := make(Tables, n)
-	for i, old := range order {
-		orderedDDL[i] = createTable[start+old]
-		orderedTables[i] = tables[start+old]
-	}
-	copy(createTable[start:], orderedDDL)
+	copy(createTable[start:], ddl)
 	copy(tables[start:], orderedTables)
 	return nil
 }
@@ -138,42 +91,18 @@ func viewDependencies(database, ddl string, mode viewSQLMode) ([]string, error) 
 }
 
 func viewDependenciesInContext(database, defaultDatabase, ddl string, mode, catalogMode viewSQLMode) ([]string, error) {
-	sqlMode := mode.sqlMode
-	if mode.ansiQuotes {
-		sqlMode += ",ANSI_QUOTES"
-	}
-	if mode.noBackslashEscapes {
-		sqlMode += ",NO_BACKSLASH_ESCAPES"
-	}
-	statements, err := mysql.ParseWithSQLMode(context.Background(), ddl, mode.lowerCaseTableNames, sqlMode)
+	analysis, err := analyzeViewDependencies(defaultDatabase, ddl, mode)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		for _, statement := range statements {
-			statement.Free()
+	var names []string
+	for ref := range analysis.references {
+		if ref.database == database {
+			names = append(names, ref.name)
 		}
-	}()
-	if len(statements) != 1 {
-		return nil, fmt.Errorf("expected one CREATE VIEW statement")
 	}
-	var query *tree.Select
-	switch view := statements[0].(type) {
-	case *tree.CreateView:
-		query = view.AsSource
-	case *tree.AlterView:
-		query = view.AsSource
-	default:
-		return nil, fmt.Errorf("expected CREATE VIEW or ALTER VIEW")
-	}
-	collector := viewReferenceCollector{
-		database: catalogMode.name(database), defaultDatabase: catalogMode.name(defaultDatabase),
-		catalogMode: catalogMode, seen: make(map[string]bool),
-	}
-	if err := collector.walk(reflect.ValueOf(query), nil); err != nil {
-		return nil, err
-	}
-	return collector.names, nil
+	slices.Sort(names)
+	return names, nil
 }
 
 type viewCTE struct {
@@ -227,11 +156,9 @@ func (s *viewCTEScope) lookup(name string) *viewCTE {
 }
 
 type viewReferenceCollector struct {
-	database        string
-	defaultDatabase string
-	catalogMode     viewSQLMode
-	seen            map[string]bool
-	names           []string
+	defaultDatabase     string
+	refs                map[viewName]struct{}
+	usesDefaultDatabase bool
 }
 
 // Walk the complete AST, not token spellings. Only TableName is a relation;
@@ -255,18 +182,20 @@ func (c *viewReferenceCollector) walk(value reflect.Value, scope *viewCTEScope) 
 		switch node := value.Interface().(type) {
 		case *tree.Select:
 			return c.selectReferences(node, scope)
+		case *tree.SampleExpr:
+			columns, _ := node.GetColumns()
+			return c.walk(reflect.ValueOf(columns), scope)
+		case tree.SampleExpr:
+			columns, _ := node.GetColumns()
+			return c.walk(reflect.ValueOf(columns), scope)
 		case *tree.TableName:
-			if node.AtTsExpr != nil {
-				// Snapshot objects are not current restore-graph vertices.
-				return c.walk(reflect.ValueOf(node.AtTsExpr), scope)
-			}
 			name := string(node.ObjectName)
+			if name == "" {
+				return nil
+			}
 			// Like the server binder, unqualified DUAL is a virtual row
 			// source even when a same-named persistent relation exists.
 			if !node.ExplicitSchema && name == "dual" {
-				return nil
-			}
-			if node.ExplicitSchema && c.catalogMode.name(string(node.SchemaName)) != c.database {
 				return nil
 			}
 			if !node.ExplicitSchema {
@@ -289,14 +218,21 @@ func (c *viewReferenceCollector) walk(value reflect.Value, scope *viewCTEScope) 
 					return nil
 				}
 			}
-			if !node.ExplicitSchema && c.defaultDatabase != c.database {
-				return nil
+			database := c.defaultDatabase
+			if node.ExplicitSchema {
+				database = string(node.SchemaName)
+			} else {
+				c.usesDefaultDatabase = true
 			}
-			name = c.catalogMode.name(name)
-			if name != "" && !c.seen[name] {
-				c.seen[name] = true
-				// Returned names outlive the parser-owned AST and its Free.
-				c.names = append(c.names, strings.Clone(name))
+			if node.AtTsExpr != nil {
+				// DUAL/CTE binding above ignores qualifiers. Only a catalog
+				// historical relation excludes the current-object edge.
+				return c.walk(reflect.ValueOf(node.AtTsExpr), scope)
+			}
+			if name != "" {
+				// Token names were normalized by the saved parser context;
+				// the default database is already bound, not a token to fold.
+				c.refs[viewName{strings.Clone(database), strings.Clone(name)}] = struct{}{}
 			}
 			return nil
 		}

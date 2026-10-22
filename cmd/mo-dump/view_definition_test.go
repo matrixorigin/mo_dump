@@ -85,9 +85,9 @@ func TestViewPersistedParserContext(t *testing.T) {
 	t.Run("saved case rules are distinct from catalog identity", func(t *testing.T) {
 		refs, err := viewDependenciesInContext("D", "D", "CREATE VIEW v AS WITH Vb AS(SELECT 999 AS x) SELECT * FROM Vb", viewSQLMode{}, viewSQLMode{lowerCaseTableNames: 1})
 		require.NoError(t, err)
-		// Mode-0 Vb does not resolve the CTE declaration normalized to vb;
-		// the physical relation then matches the mode-1 catalog identity.
-		require.Equal(t, []string{"vb"}, refs)
+		// Mode-0 Vb does not resolve the CTE declaration normalized to vb.
+		// The exporting session cannot fold this already-bound identity.
+		require.Equal(t, []string{"Vb"}, refs)
 	})
 	for _, saved := range []*string{nil, &empty} {
 		mode, err := (viewDefinition{SQLMode: saved}).parserMode(viewSQLMode{ansiQuotes: true, noBackslashEscapes: true})

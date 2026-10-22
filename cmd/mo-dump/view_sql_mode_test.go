@@ -41,7 +41,11 @@ func TestViewNameModes(t *testing.T) {
 				{"with Vb as (select 1 as x) select * from D.Vb", []string{"Vb"}, []string{"vb"}},
 			} {
 				t.Run(tc.query, func(t *testing.T) {
-					refs, err := viewDependencies("D", "create view v as "+tc.query, viewSQLMode{lowerCaseTableNames: mode})
+					database := "D"
+					if mode == 1 {
+						database = "d"
+					} // Actual catalog spelling.
+					refs, err := viewDependencies(database, "create view v as "+tc.query, viewSQLMode{lowerCaseTableNames: mode})
 					require.NoError(t, err)
 					want := tc.folded
 					if mode != 1 {

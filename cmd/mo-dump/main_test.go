@@ -493,10 +493,16 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	require.NoError(t, adjustViewOrder(context.Background(), "d", createTable, tables, start, viewSQLMode{lowerCaseTableNames: 1}, nil))
-	for i := 0; i < len(createTable); i++ {
-		require.Equal(t, createTable[i], createTarget[i])
-		require.Equal(t, tables[i], tableTarget[i])
+	views := make([]dumpView, 0, len(tables)-start)
+	for i := start; i < len(tables); i++ {
+		views = append(views, dumpView{name: viewName{"db", tables[i].Name}, create: createTable[i]})
+	}
+	ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
+	require.NoError(t, err)
+	require.Len(t, ordered, len(tables)-start)
+	for i, view := range ordered {
+		require.Equal(t, createTarget[i+start], view.create)
+		require.Equal(t, tableTarget[i+start].Name, view.name.name)
 	}
 }
 
@@ -867,32 +873,16 @@ func TestGetCreateTable(t *testing.T) {
 	}
 }
 
-func TestGetCreateView(t *testing.T) {
-	// create mock database
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock database: %v", err)
-	}
-	defer db.Close()
-
-	rows := sqlmock.NewRows([]string{"Table", "Create"}).
-		AddRow("table1_view", "CREATE VIEW table1_view as SELECT * FROM table1")
-
-	mock.ExpectQuery("show create table").WillReturnRows(rows)
-	conn = db
-
-	// check the results
-	createTable, err := getCreateTable("db1", "table1_view")
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-
-	expectedCreateTable := "CREATE VIEW table1_view as SELECT * FROM table1"
-	if createTable != expectedCreateTable {
-		t.Errorf("Unexpected create table statement. Expected: %s, Got: %s", expectedCreateTable, createTable)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("Unfulfilled expectations: %s", err)
-	}
+func TestGetDumpView(t *testing.T) {
+	mock, _ := mockDumpOutput(t)
+	create := "CREATE VIEW table1_view as SELECT * FROM table1"
+	mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("table1_view", viewDefinitionJSON(t, "db1", create, "")))
+	view, err := getDumpView(context.Background(), "db1", "table1_view", false)
+	require.NoError(t, err)
+	require.Equal(t, viewName{"db1", "table1_view"}, view.name)
+	require.Equal(t, create, view.create)
+	require.NotNil(t, view.definition)
+	require.NotNil(t, view.definition.SQLMode)
+	require.Empty(t, *view.definition.SQLMode)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

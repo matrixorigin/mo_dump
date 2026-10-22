@@ -97,6 +97,9 @@ func readViewDefinitionBatch(ctx context.Context, database string, tables Tables
 		if strings.TrimSpace(definition.Stmt) == "" {
 			return fmt.Errorf("empty persisted statement for view %s.%s", database, name)
 		}
+		if _, err := definition.parserMode(viewSQLMode{}); err != nil {
+			return fmt.Errorf("invalid persisted definition for view %s.%s: %w", database, name, err)
+		}
 		if _, exists := definitions[name]; exists {
 			return fmt.Errorf("duplicate persisted definition for view %s.%s", database, name)
 		}

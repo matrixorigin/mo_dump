@@ -197,6 +197,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	var (
 		createDb    string
 		createTable []string
+		views       []dumpView
 		err         error
 	)
 
@@ -218,6 +219,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			return err
 		}
 
+		db = dbStruct.Name // Catalog identity, not the requested spelling.
 		if opt.emptyTables {
 			opt.tables = nil
 		}
@@ -261,10 +263,12 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 			case catalog.SystemViewRel:
-				createTableSql, err = getCreateView(db, tbl.Name)
+				view, err := getDumpView(ctx, db, tbl.Name, opt.sysAccount)
 				if err != nil {
 					return err
 				}
+				views = append(views, view)
+				createTableSql = view.create
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
@@ -275,36 +279,6 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			New: func() any {
 				return &bytes.Buffer{}
 			},
-		}
-		left, right := 0, len(createTable)-1
-		for left < right {
-			for left < len(createTable) && opt.tables[left].Kind != catalog.SystemViewRel {
-				left++
-			}
-			for right >= 0 && opt.tables[right].Kind == catalog.SystemViewRel {
-				right--
-			}
-			if left >= right {
-				break
-			}
-			createTable[left], createTable[right] = createTable[right], createTable[left]
-			opt.tables[left], opt.tables[right] = opt.tables[right], opt.tables[left]
-		}
-		for left < len(opt.tables) && opt.tables[left].Kind != catalog.SystemViewRel {
-			left++
-		}
-		if left < len(opt.tables) {
-			mode, err := getViewCatalogMode(ctx)
-			if err != nil {
-				return fmt.Errorf("cannot read view catalog mode: %w", err)
-			}
-			definitions, err := getViewDefinitions(ctx, db, opt.tables[left:], opt.sysAccount)
-			if err != nil {
-				return err
-			}
-			if err := adjustViewOrder(ctx, db, createTable, opt.tables, left, mode, definitions); err != nil {
-				return err
-			}
 		}
 		for i, create := range createTable {
 			tbl := opt.tables[i]
@@ -323,12 +297,28 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
-				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, true)
+				// The definition and its creation mode were captured together above.
+				continue
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
+		}
+	}
+	var mode viewSQLMode
+	if len(views) > 0 {
+		mode, err = getViewCatalogMode(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot read view catalog mode: %w", err)
+		}
+	}
+	orderedViews, err := orderDumpViews(ctx, views, mode)
+	if err != nil {
+		return err
+	}
+	for _, view := range orderedViews {
+		if err := showDumpView(view, mode); err != nil {
+			return err
 		}
 	}
 	// reset foreign_key_checks variable to dump file
@@ -489,18 +479,6 @@ func getCreateTable(db, tbl string) (string, error) {
 	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
 	var create string
 	err := r.Scan(&tbl, &create)
-	if err != nil {
-		return "", err
-	}
-	return create, nil
-}
-
-func getCreateView(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
-	var create string
-	var character_set_client string
-	var collation_connection string
-	err := r.Scan(&tbl, &create, &character_set_client, &collation_connection)
 	if err != nil {
 		return "", err
 	}

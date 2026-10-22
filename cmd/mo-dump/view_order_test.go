@@ -107,7 +107,7 @@ func TestViewDependencies(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			refs, err := viewDependencies("d", "create view va as "+tc.query, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
-			require.Equal(t, tc.refs, refs)
+			require.ElementsMatch(t, tc.refs, refs)
 		})
 	}
 }
@@ -130,16 +130,16 @@ func TestViewOrderBoundaries(t *testing.T) {
 		{name: "reverse edge deduplicated", names: []string{"va", "vb"}, ddls: []string{"create view va as select a.x from vb a join vb b using (x)", "create view vb as select 1 as x"}, want: []string{"vb", "va"}},
 		{name: "ordinary prefix preserved", names: []string{"t", "va", "vb"}, ddls: []string{"create table t(x int)", "create view va as select * from d.vb", "create view vb as select * from t"}, start: 1, want: []string{"t", "vb", "va"}},
 		{name: "external schema not local cycle", names: []string{"va", "vb"}, ddls: []string{"create view va as select * from other.vb", "create view vb as select * from va"}, want: []string{"va", "vb"}},
-		{name: "case folded", names: []string{"Va", "Vb"}, ddls: []string{"create view Va as select * from `D`.`VB`", "create view Vb as select 1"}, want: []string{"Vb", "Va"}},
+		{name: "case folded reference to catalog identity", names: []string{"va", "vb"}, ddls: []string{"create view Va as select * from `D`.`VB`", "create view Vb as select 1"}, want: []string{"vb", "va"}},
 		{name: "case sensitive identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select * from Va", "create view Va as select 1"}, want: []string{"Va", "va"}, mode: &viewSQLMode{}},
 		{name: "mode 2 preserves identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select * from Va", "create view Va as select 1"}, want: []string{"Va", "va"}, mode: &viewSQLMode{lowerCaseTableNames: 2}},
 		{name: "CTE declaration normalization", names: []string{"v"}, ddls: []string{"create view v as with V as (select 1 as x) select * from v"}, want: []string{"v"}, mode: &viewSQLMode{}},
-		{name: "folded duplicate identity", names: []string{"va", "Va"}, ddls: []string{"create view va as select 1", "create view Va as select 1"}, err: "duplicate view identity"},
+		{name: "duplicate catalog identity", names: []string{"va", "va"}, ddls: []string{"create view va as select 1", "create view va as select 1"}, err: "duplicate view"},
 		{name: "unused CTE no self cycle", names: []string{"v"}, ddls: []string{"create view v as with unused as (select * from v) select 1 as x"}, want: []string{"v"}},
-		{name: "cycle", names: []string{"va", "vb"}, ddls: []string{"create view va as select * from vb", "create view vb as select * from va"}, err: "blocked views: va, vb"},
-		{name: "self reference", names: []string{"va"}, ddls: []string{"create view va as select * from va"}, err: "blocked views: va"},
-		{name: "partial progress", names: []string{"va", "free", "vb", "downstream"}, ddls: []string{"create view va as select * from vb", "create view free as select 1", "create view vb as select * from va", "create view downstream as select * from va"}, err: "blocked views: va, vb, downstream"},
-		{name: "invalid DDL", names: []string{"va"}, ddls: []string{"create view va as select from"}, err: "cannot order view d.va"},
+		{name: "cycle", names: []string{"va", "vb"}, ddls: []string{"create view va as select * from vb", "create view vb as select * from va"}, err: "blocked views: d.va, d.vb"},
+		{name: "self reference", names: []string{"va"}, ddls: []string{"create view va as select * from va"}, err: "blocked views: d.va"},
+		{name: "partial progress", names: []string{"va", "free", "vb", "downstream"}, ddls: []string{"create view va as select * from vb", "create view free as select 1", "create view vb as select * from va", "create view downstream as select * from va"}, err: "blocked views: d.va, d.vb, d.downstream"},
+		{name: "invalid DDL", names: []string{"va"}, ddls: []string{"create view va as select from"}, err: "analyze view d.va"},
 		{name: "not a view", names: []string{"va"}, ddls: []string{"select 1"}, err: "expected CREATE VIEW"},
 		{name: "multiple statements", names: []string{"va"}, ddls: []string{"create view va as select 1; select 2"}, err: "expected one CREATE VIEW"},
 	}
@@ -182,7 +182,7 @@ func TestDumpDataViewOrder(t *testing.T) {
 	}{
 		{name: "independent views", kind: catalog.SystemViewRel, ddl: "create view va as select 'vb' as marker", second: "create view vb as select 'va' as marker"},
 		{name: "cycle error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select * from vb", second: "create view vb as select * from va", err: "cyclic view dependencies"},
-		{name: "parse error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select from", err: "cannot order view d.va"},
+		{name: "parse error propagated", kind: catalog.SystemViewRel, ddl: "create view va as select from", err: "analyze view d.va"},
 		{name: "mode query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read view catalog mode", modeError: true},
 		{name: "metadata query error", kind: catalog.SystemViewRel, ddl: "create view va as select 1", err: "cannot read persisted view definitions", metadataError: true},
 		{name: "one ordinary table", kind: catalog.SystemOrdinaryRel, ddl: "create table va (x int)"},
@@ -212,36 +212,30 @@ func TestDumpDataViewOrder(t *testing.T) {
 				rows.AddRow("vb", catalog.SystemViewRel)
 			}
 			mock.ExpectQuery("select relname,relkind").WillReturnRows(rows)
-			if tc.ddl != "" {
-				columns := []string{"View", "Create View", "character_set_client", "collation_connection"}
-				definition := sqlmock.NewRows(columns).AddRow("va", tc.ddl, "utf8mb4", "utf8mb4_bin")
-				if tc.kind != catalog.SystemViewRel {
-					definition = sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("va", tc.ddl)
-				}
-				mock.ExpectQuery("show create table `d`.`va`").WillReturnRows(definition)
-				if tc.second != "" {
-					mock.ExpectQuery("show create table `d`.`vb`").WillReturnRows(sqlmock.NewRows(columns).AddRow("vb", tc.second, "utf8mb4", "utf8mb4_bin"))
-				}
+			if tc.ddl != "" && tc.kind != catalog.SystemViewRel {
+				mock.ExpectQuery("show create table `d`.`va`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("va", tc.ddl))
 			}
 			if tc.kind == catalog.SystemViewRel {
-				query := mock.ExpectQuery("select @@lower_case_table_names")
-				if tc.modeError {
-					query.WillReturnError(errors.New("mode query failed"))
-				} else {
-					query.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
-					definitions := sqlmock.NewRows([]string{"relname", "viewdef"})
-					payload, err := json.Marshal(viewDefinition{Stmt: tc.ddl, DefaultDatabase: "d"})
-					require.NoError(t, err)
-					definitions.AddRow("va", string(payload))
-					if tc.second != "" {
-						payload, err = json.Marshal(viewDefinition{Stmt: tc.second, DefaultDatabase: "d"})
-						require.NoError(t, err)
-						definitions.AddRow("vb", string(payload))
+				for i, ddl := range []string{tc.ddl, tc.second} {
+					if ddl == "" {
+						continue
 					}
+					name := []string{"va", "vb"}[i]
+					query := mock.ExpectQuery("select relname,viewdef").WithArgs("d", name)
 					if tc.metadataError {
-						mock.ExpectQuery("select relname,viewdef").WillReturnError(errors.New("view metadata unavailable"))
+						query.WillReturnError(errors.New("view metadata unavailable"))
+						break
+					}
+					payload, err := json.Marshal(viewDefinition{Stmt: ddl, DefaultDatabase: "d"})
+					require.NoError(t, err)
+					query.WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow(name, string(payload))).RowsWillBeClosed()
+				}
+				if !tc.metadataError {
+					query := mock.ExpectQuery("select @@lower_case_table_names")
+					if tc.modeError {
+						query.WillReturnError(errors.New("mode query failed"))
 					} else {
-						mock.ExpectQuery("select relname,viewdef").WillReturnRows(definitions).RowsWillBeClosed()
+						query.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 					}
 				}
 			}
