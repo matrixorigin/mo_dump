@@ -459,6 +459,35 @@ func TestShowCreateTable(t *testing.T) {
 	os.Stdout = old
 }
 
+func TestShowExternalTableMarker(t *testing.T) {
+	kases := []struct {
+		name string
+		res  string
+	}{
+		{name: "e", res: "/* EXTERNAL TABLE `e` */\n"},
+		{name: "ext_1", res: "/* EXTERNAL TABLE `ext_1` */\n"},
+	}
+	old := os.Stdout
+	for _, v := range kases {
+		r, w, _ := os.Pipe()
+		os.Stdout = w
+		showExternalTableMarker(v.name)
+
+		e := w.Close()
+		require.Nil(t, e)
+		var buf bytes.Buffer
+		_, e = buf.ReadFrom(r)
+		require.Nil(t, e)
+		require.Equal(t, v.res, buf.String())
+		// regression guard: a regular mysql client sends /*! ... */ comment
+		// content to the server during restore, so the marker must never be
+		// an executable comment (issue 30559).
+		require.False(t, strings.HasPrefix(buf.String(), "/*!"),
+			"external table marker must be a non-executable comment")
+	}
+	os.Stdout = old
+}
+
 func TestViewOrder(t *testing.T) {
 	start := 1
 	createTable := []string{

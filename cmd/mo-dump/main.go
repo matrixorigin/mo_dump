@@ -304,7 +304,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("/*!EXTERNAL TABLE `%s`*/\n", tbl.Name)
+				showExternalTableMarker(tbl.Name)
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
@@ -402,6 +402,14 @@ func showCreateTable(createSql string, withNextLine bool) {
 		suffix += "\n\n"
 	}
 	fmt.Printf("%s%s\n", createSql, suffix)
+}
+
+// showExternalTableMarker prints an informational marker that the following
+// section belongs to an external table. The marker must stay a plain, non-executable
+// comment: MySQL-style executable comments (/*! ... */) make a regular MySQL client
+// send their content to the server during restore and abort with a syntax error.
+func showExternalTableMarker(name string) {
+	fmt.Printf("/* EXTERNAL TABLE `%s` */\n", name)
 }
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
