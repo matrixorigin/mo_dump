@@ -419,6 +419,13 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: rows are owned by the connected account. The sys
+		// account sees catalog rows of every tenant, so without this scope a
+		// same-named tenant database either fails as "not exists" or leaks that
+		// tenant's data. The mo_catalog row stays reachable for every account,
+		// matching the server's SHOW DATABASES visibility.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and datname = 'mo_catalog'))"
 	}
 	r, err := conn.Query(sql)
 	if err != nil {
@@ -445,7 +452,30 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: same account scoping as the server's SHOW TABLES
+		// plan: the connected account's own rows plus the always-visible catalog
+		// metadata tables and cluster tables owned by the sys account.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
+			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 	}
+	// Internal helper relations, same predicates the server's SHOW TABLES uses:
+	//   - mo_increment_columns and __mo_account_lock are mo_catalog helpers;
+	//   - hidden index tables (unique/secondary/fulltext/vector) are named with
+	//     the __mo_index_ prefix since MO v1.0;
+	//   - partition members are catalog rows with relkind 'partition' (the
+	//     physical '%!%part%!%table' names of pre-1.0 dumps);
+	//   - session temporary tables are relkind 'temporary_table' since the
+	//     v4.2 catalog rework, and before that physical names shaped
+	//     '^__mo_tmp_[0-9a-f]{32}_' with relkind 'r'.
+	// #30562: a user table legally named with any other `__mo_` prefix is a
+	// regular dump payload and must not be skipped silently.
+	sql += " and relname != 'mo_increment_columns'" +
+		" and relname not like '__mo_index_%'" +
+		" and relname != '__mo_account_lock'" +
+		" and relkind != 'partition'" +
+		" and relkind != 'temporary_table'" +
+		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
 	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
 		sql += " and relname in ("
@@ -458,7 +488,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		}
 		sql += ")"
 	}
-	r, err := conn.Query(sql) //TODO: after unified sys table prefix, add condition in where clause
+	r, err := conn.Query(sql)
 	if err != nil {
 		return nil, err
 	}
@@ -474,9 +504,6 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		err = r.Scan(&table, &kind)
 		if err != nil {
 			return nil, err
-		}
-		if strings.HasPrefix(table, "__mo_") || strings.HasPrefix(table, "%!%") { //TODO: after adding condition in where clause, remove this
-			continue
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true

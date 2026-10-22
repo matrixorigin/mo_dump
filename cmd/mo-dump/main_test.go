@@ -349,9 +349,10 @@ func TestGenOutputClosesRows(t *testing.T) {
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
 		_, mock := exportTestDB(t)
-		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'" + dbScopePredicate).
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
-		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db' and relname in ('t')").
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'" +
+			tablesScopePredicate + hiddenTablesPredicate + " and relname in ('t')").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", "r"))
 		mock.ExpectQuery("show create table `db`.`t`").
 			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
