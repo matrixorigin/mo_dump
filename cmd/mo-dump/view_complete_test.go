@@ -27,6 +27,12 @@ func TestViewCompleteSyntax(t *testing.T) {
 		name, query string
 		refs        []string
 	}{
+		{"active mask precedes inner declaration", "WITH used AS(WITH z_root AS(SELECT 999 AS x) SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used", []string{"z_root"}},
+		{"active mask inherited by derived child", "WITH used AS(WITH z_root AS(SELECT 999 AS x) SELECT * FROM(SELECT x FROM z_root)s), z_root AS(SELECT 2 AS x) SELECT * FROM used", []string{"z_root"}},
+		{"active mask inherited by UNION branches", "WITH used AS(WITH z_root AS(SELECT 999 AS x) SELECT x FROM z_root UNION ALL SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used", []string{"z_root"}},
+		{"parent active barrier survives state replacement", "WITH used AS(WITH next_cte AS(SELECT x FROM z_root) SELECT * FROM next_cte), z_root AS(SELECT 2 AS x) SELECT * FROM used", []string{"z_root"}},
+		{"earlier name is not actively masked", "WITH z_root AS(SELECT 2 AS x), used AS(WITH z_root AS(SELECT 999 AS x) SELECT x FROM z_root) SELECT * FROM used", nil},
+		{"nested binding replaces rather than unions masks", "WITH used AS(WITH z_root AS(SELECT 999 AS x), next_cte AS(SELECT x FROM z_root) SELECT * FROM next_cte), z_root AS(SELECT 2 AS x) SELECT * FROM used", nil},
 		{"parenthesized WITH visible to outer ORDER BY", "SELECT * FROM ((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x) ORDER BY (SELECT x FROM q))s", []string{"z_root"}},
 		{"parenthesized WITH prevents false self edge", "SELECT * FROM ((WITH a_dep AS(SELECT 1 AS x) SELECT 1 AS x) ORDER BY (SELECT x FROM a_dep))s", nil},
 		{"unwrapped WITH ORDER BY control", "SELECT * FROM (WITH q AS(SELECT x FROM z_root) SELECT 1 AS x ORDER BY (SELECT x FROM q))s", []string{"z_root"}},
@@ -60,6 +66,7 @@ func TestViewCompleteSyntax(t *testing.T) {
 
 func TestViewCompleteRestoreOrder(t *testing.T) {
 	for _, query := range []string{
+		"WITH used AS(WITH z_root AS(SELECT 999 AS x) SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used",
 		"SELECT * FROM ((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x) ORDER BY (SELECT x FROM q))s",
 		"SELECT * FROM ((((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x))) ORDER BY (SELECT x FROM q))s",
 		"WITH z_root AS(SELECT 999 AS x) SELECT * FROM(WITH used AS(SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used)s",

@@ -52,7 +52,6 @@ func TestViewDependencies(t *testing.T) {
 		{"union", "select * from vb union all select * from vc", []string{"vb", "vc"}},
 		{"CTE shadows view", "with vb as (select 1 as x) select * from vb", nil},
 		{"CTE body dependency", "with vb as (select * from vc) select * from vb", []string{"vc"}},
-		{"nonrecursive CTE own name", "with vb as (select * from vb) select * from vb", []string{"vb"}},
 		{"earlier CTE", "with vb as (select 1 as x), vc as (select * from vb) select * from vc", nil},
 		{"recursive CTE", "with recursive vb as (select 1 as x union all select x+1 from vb where x<2) select * from vb", nil},
 		{"qualified bypasses CTE", "with vb as (select 1 as x) select * from d.vb", []string{"vb"}},

@@ -179,22 +179,48 @@ func viewDependenciesInContext(database, defaultDatabase, ddl string, mode, cata
 type viewCTE struct {
 	statement tree.Statement
 	scope     *viewCTEScope
+	name      string
+	positions map[string]int
+	ordinal   int
+	recursive bool
 	visiting  bool
 	done      bool
 }
 
+func (c *viewCTE) masked(name string) bool {
+	if c == nil {
+		return false
+	}
+	position, exists := c.positions[name]
+	return exists && position > c.ordinal
+}
+
+// A query block has both lexical declarations and an active binding state.
+// An inner WITH replaces declarations, but cannot shadow its active mask.
 type viewCTEScope struct {
-	parent  *viewCTEScope
-	name    string
-	binding *viewCTE
+	parent   *viewCTEScope
+	bindings map[string]*viewCTE
+	active   *viewCTE
+}
+
+func newViewCTEScope(parent *viewCTEScope) *viewCTEScope {
+	scope := &viewCTEScope{parent: parent}
+	// Match NewBindContext: CTE binding children inherit the current local
+	// map and state. Replacing the active state later does not erase parents.
+	if parent != nil && parent.active != nil {
+		scope.bindings = parent.bindings
+		scope.active = parent.active
+	}
+	return scope
 }
 
 func (s *viewCTEScope) lookup(name string) *viewCTE {
 	for ; s != nil; s = s.parent {
-		if s.name == name {
-			// A nil binding masks outer declarations, like findCTE's
-			// masked-name barrier; the reference is then physical.
-			return s.binding
+		if s.active.masked(name) {
+			return nil
+		}
+		if binding := s.bindings[name]; binding != nil {
+			return binding
 		}
 	}
 	return nil
@@ -244,13 +270,16 @@ func (c *viewReferenceCollector) walk(value reflect.Value, scope *viewCTEScope) 
 				return nil
 			}
 			if !node.ExplicitSchema {
+				if scope != nil && scope.active != nil && !scope.active.recursive && scope.active.name == name {
+					return fmt.Errorf("nonrecursive CTE %s references itself", name)
+				}
 				if binding := scope.lookup(name); binding != nil {
 					if binding.statement == nil {
 						return fmt.Errorf("empty CTE definition: %s", name)
 					}
 					if !binding.visiting && !binding.done {
 						binding.visiting = true
-						err := c.walk(reflect.ValueOf(binding.statement), binding.scope)
+						err := c.cteReferences(binding)
 						binding.visiting = false
 						if err != nil {
 							return err
@@ -300,18 +329,36 @@ func (c *viewReferenceCollector) children(value reflect.Value, scope *viewCTESco
 	return nil
 }
 
-func (c *viewReferenceCollector) selectReferences(query *tree.Select, scope *viewCTEScope) error {
+func (c *viewReferenceCollector) cteReferences(binding *viewCTE) error {
+	// bindCte replaces the active state on a child of the declaration
+	// context, rather than accumulating every mask from its use site.
+	scope := newViewCTEScope(binding.scope)
+	scope.active = binding
+	switch statement := binding.statement.(type) {
+	case *tree.Select:
+		return c.selectInScope(statement, scope)
+	case *tree.ParenSelect:
+		return c.selectInScope(statement.Select, scope)
+	default:
+		return fmt.Errorf("expected query in CTE %s", binding.name)
+	}
+}
+
+func (c *viewReferenceCollector) selectReferences(query *tree.Select, parent *viewCTEScope) error {
+	return c.selectInScope(query, newViewCTEScope(parent))
+}
+
+func (c *viewReferenceCollector) selectInScope(query *tree.Select, scope *viewCTEScope) error {
 	// bindSelect strips this entire parenthesis chain in one BindContext.
 	// All tails therefore see the final block's WITH, not the scope that
 	// happened to be active before entering a ParenSelect child.
-	outer := scope
 	var layers []*tree.Select
 	for {
 		layers = append(layers, query)
 		if query.With != nil {
 			// A later WITH replaces this block's local declarations; it
 			// does not turn the previous local declarations into a parent.
-			scope = viewScopeForWith(query, outer)
+			scope = viewScopeForWith(query, scope)
 		}
 		paren, ok := query.Select.(*tree.ParenSelect)
 		if !ok {
@@ -331,22 +378,21 @@ func (c *viewReferenceCollector) selectReferences(query *tree.Select, scope *vie
 }
 
 func viewScopeForWith(query *tree.Select, scope *viewCTEScope) *viewCTEScope {
-	if query.With != nil {
-		// Own/later declarations are not yet visible while a CTE body
-		// binds, and must not accidentally expose a same-named outer CTE.
-		for _, cte := range query.With.CTEs {
-			scope = &viewCTEScope{parent: scope, name: string(cte.Name.Alias)}
-		}
-		for _, cte := range query.With.CTEs {
-			binding := &viewCTE{statement: cte.Stmt, scope: scope}
-			// Both names and references have already passed the server's
-			// own catalog/CTE name rules in the complete parser.
-			scope = &viewCTEScope{parent: scope, name: string(cte.Name.Alias), binding: binding}
-			if query.With.IsRecursive {
-				binding.scope = scope
-			}
+	bindings := make(map[string]*viewCTE, len(query.With.CTEs))
+	positions := make(map[string]int, len(query.With.CTEs))
+	for i, cte := range query.With.CTEs {
+		positions[string(cte.Name.Alias)] = i
+	}
+	scope.bindings = bindings
+	for i, cte := range query.With.CTEs {
+		// Match newCTEDeclarationContext: retain this block's local map
+		// and active state, but detach the declaration from this block.
+		declaration := &viewCTEScope{parent: scope.parent, bindings: bindings, active: scope.active}
+		name := string(cte.Name.Alias)
+		bindings[name] = &viewCTE{
+			statement: cte.Stmt, scope: declaration, name: name,
+			positions: positions, ordinal: i, recursive: query.With.IsRecursive,
 		}
 	}
-	// Definitions remain lazy and retain their declaration environment.
 	return scope
 }

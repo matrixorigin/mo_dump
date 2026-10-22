@@ -90,6 +90,9 @@ func TestViewDependencyMalformedStructure(t *testing.T) {
 		"create view v as select ((select * from))",
 		"create view v as with a as (select * from) select * from a",
 		"create view v as select * from f((select * from))",
+		// The real binder rejects this as a nonrecursive CTE self-reference,
+		// even if a same-named physical relation exists.
+		"create view v as with vb as (select * from vb) select * from vb",
 	} {
 		t.Run(ddl, func(t *testing.T) {
 			_, err := viewDependencies("d", ddl, viewSQLMode{})
