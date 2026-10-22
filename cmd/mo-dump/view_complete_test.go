@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,8 +66,80 @@ func TestViewCompleteSyntax(t *testing.T) {
 	}
 }
 
+func TestViewCTEEntryUnwrapping(t *testing.T) {
+	cases := []struct {
+		name, query        string
+		required, advisory []string
+	}{
+		{"ignored outer self reference", "WITH c AS ((SELECT 7 AS x) ORDER BY (SELECT x FROM a)) SELECT x FROM c", nil, nil},
+		{"all entry wrappers discarded", "WITH c AS (((SELECT 7 AS x) ORDER BY (SELECT x FROM z_root)) ORDER BY (SELECT x FROM a)) SELECT x FROM c", nil, nil},
+		{"body dependency retained", "WITH c AS ((SELECT x FROM z_root) ORDER BY (SELECT x FROM a)) SELECT x FROM c", []string{"z_root"}, nil},
+		{"inner tail retained", "WITH c AS ((SELECT 7 AS x ORDER BY (SELECT x FROM z_root)) ORDER BY (SELECT x FROM a)) SELECT x FROM c", []string{"z_root"}, nil},
+		{"inner WITH retained", "WITH c AS ((WITH z_root AS (SELECT 7 AS x) SELECT x FROM z_root) ORDER BY (SELECT x FROM a)) SELECT x FROM c", nil, nil},
+		{"recursive entry unwrapped", "WITH RECURSIVE c AS ((SELECT 7 AS x UNION ALL SELECT x+1 FROM c WHERE x<9) ORDER BY (SELECT x FROM a)) SELECT x FROM c", nil, nil},
+		{"unused CTE wrapper is not advisory", "WITH c AS ((SELECT 7 AS x) ORDER BY (SELECT x FROM z_root)) SELECT 7 AS x", nil, nil},
+		{"unused CTE body remains advisory", "WITH c AS ((SELECT x FROM z_root) ORDER BY (SELECT x FROM a)) SELECT 7 AS x", nil, []string{"z_root"}},
+		{"ordinary derived tail retained", "SELECT x FROM ((SELECT 7 AS x) ORDER BY (SELECT x FROM z_root)) c", []string{"z_root"}, nil},
+		{"derived tail inside CTE retained", "WITH c AS (SELECT x FROM ((SELECT 7 AS x) ORDER BY (SELECT x FROM z_root)) s) SELECT x FROM c", []string{"z_root"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ddl := "CREATE VIEW a AS " + tc.query
+			analysis, err := analyzeView(context.Background(), "d", ddl, viewSQLMode{lowerCaseTableNames: 1})
+			require.NoError(t, err)
+			for _, refs := range []struct {
+				got  map[viewName]struct{}
+				want []string
+			}{{analysis.references, tc.required}, {analysis.advisory, tc.advisory}} {
+				want := make(map[viewName]struct{}, len(refs.want))
+				for _, name := range refs.want {
+					want[viewName{"d", name}] = struct{}{}
+				}
+				require.Equal(t, want, refs.got)
+			}
+			require.Equal(t, len(tc.required) > 0, analysis.usesDefaultDatabase)
+			require.Equal(t, ddl, analysis.create, "analysis must not strip emitted source text")
+			_, err = orderDumpViews(context.Background(), []dumpView{{name: viewName{"d", "a"}, create: ddl}}, viewSQLMode{lowerCaseTableNames: 1})
+			require.NoError(t, err, "ignored CTE entry tails must not create self cycles")
+		})
+	}
+}
+
+// bindCte accepts both statement forms, even though SQL fixtures normally
+// arrive as Select. Exercise that internal contract without changing the AST.
+func TestViewCTEEntryStatementForms(t *testing.T) {
+	statement, err := mysql.ParseOne(context.Background(), "(SELECT 7 AS x) ORDER BY (SELECT x FROM ignored)", 1)
+	require.NoError(t, err)
+	defer statement.Free()
+	query, ok := statement.(*tree.Select)
+	require.True(t, ok)
+	for _, tc := range []struct {
+		name      string
+		statement tree.Statement
+	}{
+		{"select", query},
+		{"paren select", &tree.ParenSelect{Select: query}},
+		{"invalid statement", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			collector := viewReferenceCollector{defaultDatabase: "d", refs: make(map[viewName]struct{})}
+			err := collector.cteReferences(&viewCTE{name: "c", statement: tc.statement})
+			if tc.statement == nil {
+				require.ErrorContains(t, err, "expected query in CTE c")
+			} else {
+				require.NoError(t, err)
+			}
+			require.Empty(t, collector.refs)
+			require.False(t, collector.usesDefaultDatabase)
+		})
+	}
+}
+
 func TestViewCompleteRestoreOrder(t *testing.T) {
 	for _, query := range []string{
+		"WITH c AS ((SELECT x FROM z_root) ORDER BY (SELECT x FROM a_dep)) SELECT x FROM c",
+		"WITH c AS ((SELECT 7 AS x ORDER BY (SELECT x FROM z_root)) ORDER BY (SELECT x FROM a_dep)) SELECT x FROM c",
+		"WITH c AS (SELECT x FROM ((SELECT 7 AS x) ORDER BY (SELECT x FROM z_root)) s) SELECT x FROM c",
 		"WITH used AS(WITH z_root AS(SELECT 999 AS x) SELECT x FROM z_root), z_root AS(SELECT 2 AS x) SELECT * FROM used",
 		"SELECT * FROM ((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x) ORDER BY (SELECT x FROM q))s",
 		"SELECT * FROM ((((WITH q AS(SELECT x FROM z_root) SELECT 1 AS x))) ORDER BY (SELECT x FROM q))s",

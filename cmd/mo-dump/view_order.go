@@ -210,14 +210,26 @@ func (c *viewReferenceCollector) cteReferences(binding *viewCTE) error {
 	// context, rather than accumulating every mask from its use site.
 	scope := newViewCTEScope(binding.scope)
 	scope.active = binding
+	var query *tree.Select
 	switch statement := binding.statement.(type) {
 	case *tree.Select:
-		return c.selectInScope(statement, scope)
+		query = statement
 	case *tree.ParenSelect:
-		return c.selectInScope(statement.Select, scope)
+		query = statement.Select
 	default:
 		return fmt.Errorf("expected query in CTE %s", binding.name)
 	}
+	// bindCte calls getSelectTree before binding the body: discarded CTE
+	// entry wrappers contribute neither WITH nor tails. This is distinct
+	// from ordinary bindSelect, which retains its parenthesis-chain tails.
+	for {
+		paren, ok := query.Select.(*tree.ParenSelect)
+		if !ok {
+			break
+		}
+		query = paren.Select
+	}
+	return c.selectInScope(query, scope)
 }
 
 func (c *viewReferenceCollector) selectReferences(query *tree.Select, parent *viewCTEScope) error {
