@@ -42,7 +42,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 			mock, output := mockDumpOutput(t)
 			dbs := tt.dbs
 			for _, name := range dbs {
-				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = '" + name + "'").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(name, ""))
+				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(name, ""))
 				mock.ExpectQuery("show create database `" + name + "`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow(name, "CREATE DATABASE `"+name+"`"))
 				rows := sqlmock.NewRows([]string{"relname", "relkind"})
 				if name == "view_db" {
@@ -50,7 +50,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 				} else {
 					rows.AddRow("t", catalog.SystemOrdinaryRel)
 				}
-				mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + name + "'").WillReturnRows(rows)
+				mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs(name).WillReturnRows(rows)
 				if name == "view_db" {
 					mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("view_db", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", viewDefinitionJSON(t, "view_db", "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "")))
 				} else {
@@ -122,9 +122,9 @@ func TestDumpViewsFailure(t *testing.T) {
 				rows        *sqlmock.Rows
 			}
 			steps := []queryStep{
-				{"database", "select datname, dat_type from mo_catalog.mo_database where datname = 'db'", sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", "")},
+				{"database", "select datname, dat_type from mo_catalog.mo_database where datname = ?", sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", "")},
 				{"database_ddl", "show create database `db`", sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db")},
-				{"tables", "select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'", sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("v", catalog.SystemViewRel).AddRow("t", catalog.SystemOrdinaryRel)},
+				{"tables", "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?", sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("v", catalog.SystemViewRel).AddRow("t", catalog.SystemOrdinaryRel)},
 				{"view_ddl", "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)", sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", viewDefinitionJSON(t, "db", create, ""))},
 				{"table_ddl", "show create table `db`.`t`", sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)")},
 			}
@@ -135,6 +135,9 @@ func TestDumpViewsFailure(t *testing.T) {
 			}
 			for _, step := range steps {
 				expect := mock.ExpectQuery(step.query)
+				if step.name == "database" || step.name == "tables" {
+					expect.WithArgs("db")
+				}
 				if step.name == "view_ddl" {
 					expect.WithArgs("db", "v")
 				}
@@ -167,13 +170,13 @@ func TestDumpWithoutViews(t *testing.T) {
 	for _, kind := range []string{"", catalog.SystemOrdinaryRel, catalog.SystemExternalRel} {
 		t.Run("kind="+kind, func(t *testing.T) {
 			mock, output := mockDumpOutput(t)
-			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
+			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 			mock.ExpectQuery("show create database `db`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
 			tables := sqlmock.NewRows([]string{"relname", "relkind"})
 			if kind != "" {
 				tables.AddRow("t", kind)
 			}
-			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'").WillReturnRows(tables)
+			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs("db").WillReturnRows(tables)
 			if kind != "" {
 				mock.ExpectQuery("show create table `db`.`t`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)"))
 			}

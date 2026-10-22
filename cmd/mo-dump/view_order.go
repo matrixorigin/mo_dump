@@ -31,14 +31,6 @@ type viewSQLMode struct {
 	sqlMode             string
 }
 
-func (m viewSQLMode) name(name string) string {
-	// Match MatrixOne's GetDbOrTblName, including its mode-2 behavior.
-	if m.lowerCaseTableNames != 1 {
-		return name
-	}
-	return strings.ToLower(name)
-}
-
 // The export session supplies catalog identity rules only, never view syntax.
 func getViewCatalogMode(ctx context.Context) (viewSQLMode, error) {
 	var mode viewSQLMode
@@ -50,59 +42,6 @@ func getViewCatalogMode(ctx context.Context) (viewSQLMode, error) {
 		return mode, fmt.Errorf("unsupported lower_case_table_names: %d", mode.lowerCaseTableNames)
 	}
 	return mode, nil
-}
-
-// adjustViewOrder orders only the view suffix. Neither slice is changed on error.
-// Non-nil definitions are authoritative for every view. Nil selects explicit
-// standalone DDL inputs; it is never a fallback after a metadata-read failure.
-func adjustViewOrder(ctx context.Context, database string, createTable []string, tables Tables, start int, mode viewSQLMode, definitions map[string]viewDefinition) error {
-	views := make([]dumpView, 0, len(tables)-start)
-	positions := make(map[viewName]int)
-	for i, table := range tables[start:] {
-		view := dumpView{name: viewName{database, table.Name}, create: createTable[start+i]}
-		if definitions != nil {
-			definition, ok := definitions[table.Name]
-			if !ok {
-				return fmt.Errorf("missing persisted definition for view %s.%s", database, table.Name)
-			}
-			view.definition = &definition
-			view.create = definition.Stmt
-		}
-		positions[view.name] = start + i
-		views = append(views, view)
-	}
-	ordered, err := orderDumpViews(ctx, views, mode)
-	if err != nil {
-		return err
-	}
-	ddl := make([]string, len(ordered))
-	orderedTables := make(Tables, len(ordered))
-	for i, view := range ordered {
-		old := positions[view.name]
-		ddl[i], orderedTables[i] = createTable[old], tables[old]
-	}
-	copy(createTable[start:], ddl)
-	copy(tables[start:], orderedTables)
-	return nil
-}
-
-func viewDependencies(database, ddl string, mode viewSQLMode) ([]string, error) {
-	return viewDependenciesInContext(database, database, ddl, mode, mode)
-}
-
-func viewDependenciesInContext(database, defaultDatabase, ddl string, mode, catalogMode viewSQLMode) ([]string, error) {
-	analysis, err := analyzeViewDependencies(defaultDatabase, ddl, mode)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for ref := range analysis.references {
-		if ref.database == database {
-			names = append(names, ref.name)
-		}
-	}
-	slices.Sort(names)
-	return names, nil
 }
 
 type viewCTE struct {
@@ -159,6 +98,7 @@ type viewReferenceCollector struct {
 	defaultDatabase     string
 	refs                map[viewName]struct{}
 	usesDefaultDatabase bool
+	pending             []*viewCTE
 }
 
 // Walk the complete AST, not token spellings. Only TableName is a relation;
@@ -294,7 +234,7 @@ func (c *viewReferenceCollector) selectInScope(query *tree.Select, scope *viewCT
 		if query.With != nil {
 			// A later WITH replaces this block's local declarations; it
 			// does not turn the previous local declarations into a parent.
-			scope = viewScopeForWith(query, scope)
+			scope = c.viewScopeForWith(query, scope)
 		}
 		paren, ok := query.Select.(*tree.ParenSelect)
 		if !ok {
@@ -313,7 +253,7 @@ func (c *viewReferenceCollector) selectInScope(query *tree.Select, scope *viewCT
 	return nil
 }
 
-func viewScopeForWith(query *tree.Select, scope *viewCTEScope) *viewCTEScope {
+func (c *viewReferenceCollector) viewScopeForWith(query *tree.Select, scope *viewCTEScope) *viewCTEScope {
 	bindings := make(map[string]*viewCTE, len(query.With.CTEs))
 	positions := make(map[string]int, len(query.With.CTEs))
 	for i, cte := range query.With.CTEs {
@@ -329,6 +269,7 @@ func viewScopeForWith(query *tree.Select, scope *viewCTEScope) *viewCTEScope {
 			statement: cte.Stmt, scope: declaration, name: name,
 			positions: positions, ordinal: i, recursive: query.With.IsRecursive,
 		}
+		c.pending = append(c.pending, bindings[name])
 	}
 	return scope
 }

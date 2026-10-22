@@ -31,56 +31,89 @@ func (view dumpView) defaultDatabase() string {
 	if view.definition != nil {
 		return view.definition.DefaultDatabase
 	}
-	// Bare in-memory views have no captured creation context.
 	return view.name.database
 }
 
-// orderDumpViews sorts only dependencies within this export. Base tables have
-// already been emitted; references outside the selection remain the caller's
-// responsibility, just as for a single-database or selected-table dump.
+type viewEdge struct {
+	child    int
+	required bool
+}
+
+// orderDumpViews includes only selected views. Base tables/data precede this
+// phase; omitted objects and historical snapshots remain restore prerequisites.
+// Catalog identities are never folded under the exporting session's mode.
 func orderDumpViews(ctx context.Context, views []dumpView, mode viewSQLMode) ([]dumpView, error) {
 	positions := make(map[viewName]int, len(views))
 	for i, view := range views {
-		// Catalog names are already object identities. Only references are
-		// normalized by their owning view's parser environment.
-		key := view.name
-		if _, exists := positions[key]; exists {
+		if _, exists := positions[view.name]; exists {
 			return nil, fmt.Errorf("duplicate view %s.%s", view.name.database, view.name.name)
 		}
-		positions[key] = i
+		positions[view.name] = i
 	}
-	pending := make([]int, len(views))
-	dependents := make([][]int, len(views))
+	dependents := make([][]viewEdge, len(views))
 	for i, view := range views {
-		refs, err := viewReferences(ctx, view, mode)
+		analysis, err := analyzeDumpView(ctx, view, mode)
 		if err != nil {
 			return nil, err
 		}
-		for ref := range refs {
-			if dependency, ok := positions[ref]; ok {
-				pending[i]++
-				dependents[dependency] = append(dependents[dependency], i)
+		for ref := range analysis.references {
+			if parent, ok := positions[ref]; ok {
+				dependents[parent] = append(dependents[parent], viewEdge{i, true})
+			}
+		}
+		for ref := range analysis.advisory {
+			if _, required := analysis.references[ref]; required {
+				continue
+			}
+			if parent, ok := positions[ref]; ok {
+				dependents[parent] = append(dependents[parent], viewEdge{i, false})
 			}
 		}
 	}
-	ready := make([]int, 0, len(views))
-	for i, n := range pending {
-		if n == 0 {
-			ready = append(ready, i)
-		}
-	}
-	ordered := make([]dumpView, 0, len(views))
-	for next := 0; next < len(ready); next++ {
-		i := ready[next]
-		ordered = append(ordered, views[i])
-		for _, dependent := range dependents[i] {
-			pending[dependent]--
-			if pending[dependent] == 0 {
-				ready = append(ready, dependent)
+	sort := func(requiredOnly bool) ([]int, []int, error) {
+		pending := make([]int, len(views))
+		for _, edges := range dependents {
+			for _, edge := range edges {
+				if !requiredOnly || edge.required {
+					pending[edge.child]++
+				}
 			}
 		}
+		ready := make([]int, 0, len(views))
+		for i, n := range pending {
+			if n == 0 {
+				ready = append(ready, i)
+			}
+		}
+		for next := 0; next < len(ready); next++ {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
+			for _, edge := range dependents[ready[next]] {
+				if requiredOnly && !edge.required {
+					continue
+				}
+				pending[edge.child]--
+				if pending[edge.child] == 0 {
+					ready = append(ready, edge.child)
+				}
+			}
+		}
+		return ready, pending, nil
 	}
-	if len(ordered) != len(views) {
+	// Prefer optional prerequisites when jointly sortable, never reject or lose
+	// a required edge because of an unused-CTE cycle. At most two linear passes.
+	order, pending, err := sort(false)
+	if err != nil {
+		return nil, err
+	}
+	if len(order) != len(views) {
+		order, pending, err = sort(true)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(order) != len(views) {
 		var blocked []string
 		for i, n := range pending {
 			if n > 0 {
@@ -89,12 +122,11 @@ func orderDumpViews(ctx context.Context, views []dumpView, mode viewSQLMode) ([]
 		}
 		return nil, fmt.Errorf("cyclic view dependencies; blocked views: %s", strings.Join(blocked, ", "))
 	}
+	ordered := make([]dumpView, 0, len(order))
+	for _, i := range order {
+		ordered = append(ordered, views[i])
+	}
 	return ordered, nil
-}
-
-func viewReferences(ctx context.Context, view dumpView, mode viewSQLMode) (map[viewName]struct{}, error) {
-	analysis, err := analyzeDumpView(ctx, view, mode)
-	return analysis.references, err
 }
 
 func analyzeDumpView(ctx context.Context, view dumpView, mode viewSQLMode) (viewAnalysis, error) {
@@ -115,4 +147,11 @@ func analyzeDumpView(ctx context.Context, view dumpView, mode viewSQLMode) (view
 	return analysis, nil
 }
 
+// quoteIdentifier quotes one identifier, not a qualified name.
 func quoteIdentifier(name string) string { return "`" + strings.ReplaceAll(name, "`", "``") + "`" }
+
+// quoteString uses the same backslash-escape mode as ordinary dump data.
+func quoteString(value string) string {
+	value = strings.ReplaceAll(value, "\\", "\\\\")
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}

@@ -27,12 +27,9 @@ import (
 
 type viewAnalysis struct {
 	references          map[viewName]struct{}
+	advisory            map[viewName]struct{}
 	usesDefaultDatabase bool
 	create              string
-}
-
-func analyzeViewDependencies(database, ddl string, mode viewSQLMode) (viewAnalysis, error) {
-	return analyzeView(context.Background(), database, ddl, mode)
 }
 
 func analyzeView(ctx context.Context, database, ddl string, mode viewSQLMode) (viewAnalysis, error) {
@@ -80,5 +77,24 @@ func analyzeView(ctx context.Context, database, ddl string, mode viewSQLMode) (v
 	if err := collector.walk(reflect.ValueOf(query), nil); err != nil {
 		return viewAnalysis{}, err
 	}
-	return viewAnalysis{references: collector.refs, usesDefaultDatabase: collector.usesDefaultDatabase, create: ddl}, nil
+	analysis := viewAnalysis{references: collector.refs, usesDefaultDatabase: collector.usesDefaultDatabase, create: ddl}
+	// Required expansion finishes first. Optional prerequisites can improve
+	// portability to older eager binders, but never invalidate a lazy view.
+	collector.refs = make(map[viewName]struct{})
+	for i := 0; i < len(collector.pending); i++ {
+		binding := collector.pending[i]
+		if binding.done {
+			continue
+		}
+		binding.visiting = true
+		err := collector.cteReferences(binding)
+		binding.visiting = false
+		binding.done = true
+		if err != nil {
+			collector.refs = nil
+			break
+		}
+	}
+	analysis.advisory = collector.refs
+	return analysis, nil
 }

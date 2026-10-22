@@ -225,16 +225,16 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		}
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
-				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", db)
+				createDb = "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db)
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
 					return err
 				}
 			}
-			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
+			fmt.Printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
 			fmt.Println(createDb, ";")
-			fmt.Printf("USE `%s`;\n\n\n", db)
+			fmt.Printf("USE %s;\n\n\n", quoteIdentifier(db))
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -284,7 +284,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
 			case catalog.SystemOrdinaryRel:
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
+				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, false)
 				if !opt.noData {
 					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
@@ -293,8 +293,8 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("/*!EXTERNAL TABLE `%s`*/\n", tbl.Name)
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
+				fmt.Printf("/*!EXTERNAL TABLE %s*/\n", quoteIdentifier(tbl.Name))
+				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
 				// The definition and its creation mode were captured together above.
@@ -363,11 +363,11 @@ func showCreateTable(createSql string, withNextLine bool) {
 	fmt.Printf("%s%s\n", createSql, suffix)
 }
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
-	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
+	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {
 		sql += " and account_id = 0"
 	}
-	r, err := conn.Query(sql)
+	r, err := conn.QueryContext(ctx, sql, db)
 	if err != nil {
 		return Db{}, err
 	}
@@ -382,6 +382,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 		}
 		dbs = append(dbs, Db{dbName, dbType})
 	}
+	if err := r.Err(); err != nil {
+		return Db{}, err
+	}
 	if len(dbs) != 1 {
 		return Db{}, moerr.NewInvalidInput(ctx, fmt.Sprintf("database %s not exists", db))
 	}
@@ -389,7 +392,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 }
 
 func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
-	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
+	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
+	args := make([]any, 0, len(tables)+1)
+	args = append(args, db)
 	if isSys {
 		sql += " and account_id = 0"
 	}
@@ -400,12 +405,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 			if i != 0 {
 				sql += ","
 			}
-			sql += "'" + tbl.Name + "'"
+			sql += "?"
+			args = append(args, tbl.Name)
 			tableNames[tbl.Name] = false
 		}
 		sql += ")"
 	}
-	r, err := conn.Query(sql) //TODO: after unified sys table prefix, add condition in where clause
+	r, err := conn.QueryContext(ctx, sql, args...) //TODO: after unified sys table prefix, add condition in where clause
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +448,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 }
 
 func getCreateDB(db string) (string, error) {
-	r := conn.QueryRow("show create database `" + db + "`")
+	r := conn.QueryRow("show create database " + quoteIdentifier(db))
 	var create string
 	err := r.Scan(&db, &create)
 	if err != nil {
@@ -476,7 +482,7 @@ func getDatabases(ctx context.Context) ([]string, error) {
 }
 
 func getCreateTable(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
+	r := conn.QueryRow("show create table " + quoteIdentifier(db) + "." + quoteIdentifier(tbl))
 	var create string
 	err := r.Scan(&tbl, &create)
 	if err != nil {
@@ -498,7 +504,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		bufPool.Put(curBuf)
 	}()
 	buf.Grow(netBufferLength)
-	initInert := "INSERT INTO `" + tbl + "` VALUES "
+	initInert := "INSERT INTO " + quoteIdentifier(tbl) + " VALUES "
 	for {
 		buf.WriteString(initInert)
 		preLen := buf.Len()
@@ -589,9 +595,9 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		return err
 	}
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quoteString(fmt.Sprintf("%s/%s", pwd, fname)), quoteIdentifier(tbl), quoteString(string(csvConf.fieldDelimiter)))
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quoteString(fmt.Sprintf("%s/%s", pwd, fname)), quoteIdentifier(tbl), quoteString(string(csvConf.fieldDelimiter)))
 	}
 	return nil
 }
@@ -708,7 +714,7 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 }
 
 func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
-	querySql := "select * from `" + db + "`.`" + tbl + "`"
+	querySql := "select * from " + quoteIdentifier(db) + "." + quoteIdentifier(tbl)
 	if condition != "" {
 		querySql += " where " + condition
 	}

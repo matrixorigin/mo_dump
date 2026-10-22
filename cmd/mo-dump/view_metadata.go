@@ -82,14 +82,14 @@ func showDumpView(view dumpView, mode viewSQLMode) error {
 		flags := viewParserMode(view.definition.parserSQLMode())
 		fmt.Printf("SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH ',' FROM %s), ''), NULLIF(X'%x', ''));\n", target, flags)
 	}
-	if database := view.defaultDatabase(); database != "" {
-		// A saved default is not itself a prerequisite. Constants, CTEs and
-		// qualified relations can survive deletion of that database.
-		context := view.name.database
-		if analysis.usesDefaultDatabase {
-			context = database
-		}
-		fmt.Printf("USE %s;\n\n", quoteIdentifier(context))
+	// An unused saved default is not a prerequisite. Select the owner even
+	// for legacy empty defaults, so unqualified CREATE targets remain stable.
+	database := view.name.database
+	if analysis.usesDefaultDatabase {
+		database = view.defaultDatabase()
+	}
+	if database != "" {
+		fmt.Printf("USE %s;\n\n", quoteIdentifier(database))
 	}
 	fmt.Printf("DROP VIEW IF EXISTS %s.%s;\n", quoteIdentifier(view.name.database), quoteIdentifier(view.name.name))
 	showCreateTable(analysis.create, true)
