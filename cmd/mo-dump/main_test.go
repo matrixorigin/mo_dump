@@ -352,6 +352,38 @@ func Test_toCsvLine_whitespaceOnlyRows(t *testing.T) {
 	assert.Equal(t, "\" \"\n\"\t\"\n\" \"\n\"  \t \"\n", got)
 }
 
+// matrixone#30638: a single row larger than net-buffer-length must be
+// emitted exactly once: the carried-over oversized row must not duplicate
+// the INSERT header in the output statement.
+func Test_showInsertOversizedRow(t *testing.T) {
+	payload := strings.Repeat("x", 2048)
+	db, mock, err := sqlmock.New()
+	require.Nil(t, err)
+	defer db.Close()
+	mock.ExpectQuery(".*").WillReturnRows(
+		sqlmock.NewRows([]string{"id", "payload"}).AddRow("1", payload))
+	r, err := db.Query("select id, payload from t")
+	require.Nil(t, err)
+
+	args := []any{new(sql.RawBytes), new(sql.RawBytes)}
+	cols := []*Column{{Name: "id", Type: "int"}, {Name: "payload", Type: "varchar"}}
+	bufPool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
+
+	old := os.Stdout
+	pr, pw, _ := os.Pipe()
+	os.Stdout = pw
+	err = showInsert(r, args, cols, "t", bufPool, 1024)
+	os.Stdout = old
+	_ = pw.Close()
+	var bb bytes.Buffer
+	_, _ = bb.ReadFrom(pr)
+	out := bb.String()
+
+	require.Nil(t, err)
+	require.Equal(t, 1, strings.Count(out, "INSERT INTO `t` VALUES "), out)
+	require.Contains(t, out, payload)
+}
+
 func Test_checkFieldDelimiter(t *testing.T) {
 	type args struct {
 		ctx context.Context
