@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -325,6 +326,79 @@ func TestConvertValue(t *testing.T) {
 	}
 }
 
+func TestConvertValueBit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  sql.RawBytes
+		want string
+	}{
+		{"null", nil, "NULL"},
+		{"empty", sql.RawBytes{}, "''"},
+		{"zero", sql.RawBytes{0}, "0x00"},
+		{"one", sql.RawBytes{1}, "0x01"},
+		{"quote", sql.RawBytes{0x27}, "0x27"},
+		{"backslash", sql.RawBytes{0x5c}, "0x5C"},
+		{"ordinary", sql.RawBytes{0x41}, "0x41"},
+		{"high_byte", sql.RawBytes{0xff}, "0xFF"},
+		{"leading_zero", sql.RawBytes{0, 1}, "0x0001"},
+		{"special_bytes", sql.RawBytes{0x27, 0x5c}, "0x275C"},
+		{"max_width", sql.RawBytes{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, "0xFFFFFFFFFFFFFFFF"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, typ := range []string{"bit", "BIT"} {
+				require.Equal(t, tc.want, convertValue(&tc.val, typ))
+			}
+		})
+	}
+
+	t.Run("all_bytes", func(t *testing.T) {
+		for i := 0; i < 256; i++ {
+			raw := sql.RawBytes{byte(i)}
+			literal := convertValue(&raw, "BIT")
+			require.True(t, strings.HasPrefix(literal, "0x"), "byte %d: %q", i, literal)
+			decoded, err := hex.DecodeString(literal[2:])
+			require.NoError(t, err, "byte %d", i)
+			require.Equal(t, []byte(raw), decoded, "byte %d", i)
+		}
+	})
+}
+
+func TestShowInsertBit(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"id", "b"}).
+		AddRow(1, []byte{0x27}).
+		AddRow(2, []byte{0x5c}).
+		AddRow(3, []byte{0}).
+		AddRow(4, nil).
+		AddRow(5, []byte{0, 1}).
+		AddRow(6, []byte{0x41}))
+	mock.ExpectClose()
+	rows, err := db.Query("SELECT id, b FROM t")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rows.Close()) })
+
+	output, err := os.CreateTemp(t.TempDir(), "insert-*.sql")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, output.Close()) })
+	oldStdout := os.Stdout
+	os.Stdout = output
+	t.Cleanup(func() { os.Stdout = oldStdout })
+
+	var id, bit sql.RawBytes
+	pool := &sync.Pool{New: func() any { return new(bytes.Buffer) }}
+	err = showInsert(rows, []any{&id, &bit}, []*Column{{Name: "id", Type: "INT"}, {Name: "b", Type: "BIT"}}, "t", pool, defaultNetBufferLength)
+	require.NoError(t, err)
+	require.NoError(t, rows.Err())
+	got, err := os.ReadFile(output.Name())
+	require.NoError(t, err)
+	require.Equal(t, "INSERT INTO `t` VALUES (1,0x27),(2,0x5C),(3,0x00),(4,NULL),(5,0x0001),(6,0x41);\n\n\n\n", string(got))
+}
+
 func makeValue(val string) interface{} {
 	tmp := sql.RawBytes(val)
 	return &tmp
@@ -532,6 +606,38 @@ func Test_toCsvLine_whitespaceOnlyRows(t *testing.T) {
 	got := bb.String()
 	assert.Equal(t, len(rows), strings.Count(got, "\n"))
 	assert.Equal(t, "\" \"\n\"\t\"\n\" \"\n\"  \t \"\n", got)
+}
+
+// matrixone#30638: a single row larger than net-buffer-length must be
+// emitted exactly once: the carried-over oversized row must not duplicate
+// the INSERT header in the output statement.
+func Test_showInsertOversizedRow(t *testing.T) {
+	payload := strings.Repeat("x", 2048)
+	db, mock, err := sqlmock.New()
+	require.Nil(t, err)
+	defer db.Close()
+	mock.ExpectQuery(".*").WillReturnRows(
+		sqlmock.NewRows([]string{"id", "payload"}).AddRow("1", payload))
+	r, err := db.Query("select id, payload from t")
+	require.Nil(t, err)
+
+	args := []any{new(sql.RawBytes), new(sql.RawBytes)}
+	cols := []*Column{{Name: "id", Type: "int"}, {Name: "payload", Type: "varchar"}}
+	bufPool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
+
+	old := os.Stdout
+	pr, pw, _ := os.Pipe()
+	os.Stdout = pw
+	err = showInsert(r, args, cols, "t", bufPool, 1024)
+	os.Stdout = old
+	_ = pw.Close()
+	var bb bytes.Buffer
+	_, _ = bb.ReadFrom(pr)
+	out := bb.String()
+
+	require.Nil(t, err)
+	require.Equal(t, 1, strings.Count(out, "INSERT INTO `t` VALUES "), out)
+	require.Contains(t, out, payload)
 }
 
 func Test_checkFieldDelimiter(t *testing.T) {
