@@ -459,23 +459,37 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
 			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 	}
-	// Internal helper relations, same predicates the server's SHOW TABLES uses:
-	//   - mo_increment_columns and __mo_account_lock are mo_catalog helpers;
-	//   - hidden index tables (unique/secondary/fulltext/vector) are named with
-	//     the __mo_index_ prefix since MO v1.0;
+	// Internal helper relations, identified by object metadata instead of
+	// name-based guesses:
+	//   - hidden index tables (unique/secondary/fulltext/vector) carry
+	//     catalog.SystemIndexRel, written by the server since MO v3.0. A
+	//     name prefix is not a safe substitute: in LIKE patterns '_' is a
+	//     single-character wildcard, so a plain 'not like' pattern also
+	//     swallowed ordinary tables such as demo_index_data, while a
+	//     literal-escaped match would swallow a user table legally named
+	//     __mo_index_data. On clusters older than v3.0 the dump therefore
+	//     fails loudly on an index table instead of silently dropping it.
 	//   - partition members are catalog rows with relkind 'partition' (the
-	//     physical '%!%part%!%table' names of pre-1.0 dumps);
+	//     physical '%!%part%!%table' names that motivated the original
+	//     client-side prefix filter).
 	//   - session temporary tables are relkind 'temporary_table' since the
 	//     v4.2 catalog rework, and before that physical names shaped
 	//     '^__mo_tmp_[0-9a-f]{32}_' with relkind 'r'.
-	// #30562: a user table legally named with any other `__mo_` prefix is a
-	// regular dump payload and must not be skipped silently.
-	sql += " and relname != 'mo_increment_columns'" +
-		" and relname not like '__mo_index_%'" +
-		" and relname != '__mo_account_lock'" +
-		" and relkind != 'partition'" +
-		" and relkind != 'temporary_table'" +
+	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
+	// with the name of a catalog helper are regular dump payloads and must
+	// never be skipped silently.
+	sql += " and relkind <> '" + catalog.SystemIndexRel + "'" +
+		" and relkind <> 'partition'" +
+		" and relkind <> 'temporary_table'" +
 		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
+	// mo_increment_columns and __mo_account_lock (the latter has no
+	// matching constant in the pinned matrixone dependency) only exist in
+	// mo_catalog, and ordinary databases may legally contain same-named
+	// tables or views: apply the exclusion only when dumping that catalog.
+	if db == catalog.MO_CATALOG {
+		sql += " and relname != '" + catalog.MOAutoIncrTable + "'" +
+			" and relname != '__mo_account_lock'"
+	}
 	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
 		sql += " and relname in ("
