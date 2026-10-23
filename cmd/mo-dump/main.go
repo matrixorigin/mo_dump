@@ -411,7 +411,7 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 }
 
 func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
-	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
+	sql := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"
 	args := make([]any, 0, len(tables)+2)
 	args = append(args, db)
 	if isSys {
@@ -428,21 +428,21 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	// this exact name from MO v1.2 on), joined through mo_database with the
 	// same account scoping as getDatabaseType so helpers of other databases
 	// can never match a same-named user object here. Name- and kind-based
-	// identification were removed across review rounds 2-5: each variant
+	// identification were removed across review rounds 2-6: each variant
 	// proved able to silently swallow named or renamed user tables behind a
 	// MODUMP SUCCESS — the exact omission class this change forbids.
 	// What remains is per-kind metadata:
 	//   - partition members carry relkind 'partition';
 	//   - session temporary tables carry relkind 'temporary_table' since
-	//     the v4.2 catalog rework, and on the earlier v4.0/v4.1 releases
-	//     their backing rows are distinguishable by metadata too: the
-	//     backing row keeps relkind 'r' but rel_createsql holds the user's
-	//     original CREATE TEMPORARY TABLE statement (GetRootSql), so the
-	//     dump excludes rows whose root statement is temporary and still
-	//     keeps persistent user tables under any __mo_tmp_ name shape
-	//     (review round 6; identified from the v4.0.x/v4.1.x
-	//     buildTableDefinition source: the Kind property of these rows is
-	//     written through the ordinary-table path).
+	//     the v4.2 catalog rework. Rows written by v4.0/v4.1 releases keep
+	//     relkind 'r' and are classified row-by-row by isLegacyTemporaryTable
+	//     (see legacy_temporary.go), which associates the backing physical
+	//     name with the CREATE statements of the request the same way the
+	//     server does: a permanent table's physical-looking name is explicit
+	//     in its own CREATE statement and wins over a matching temporary
+	//     alias in the same request, while a temporary table's generated
+	//     physical name never appears in its statement (review round 7);
+	//     rel_createsql prefix matching misfired in both directions.
 	// Anything that still reaches the export switch with an unsupported
 	// relkind fails loudly there; the empty relkind is exported as an
 	// ordinary table, with getCreateTable rejecting fragments that lack
@@ -457,8 +457,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'" +
-		" and not (lower(coalesce(rel_createsql, '')) like 'create temporary%')"
+		" and relkind <> 'temporary_table'"
 	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
@@ -494,9 +493,16 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	for r.Next() {
 		var table string
 		var kind string
-		err = r.Scan(&table, &kind)
+		var createSQL, extraInfo nullStr
+		err = r.Scan(&table, &kind, &createSQL, &extraInfo)
 		if err != nil {
 			return nil, err
+		}
+		// Row classification for v4.0/v4.1 temporary backing rows — see
+		// legacy_temporary.go; on current clusters these rows already carry
+		// relkind 'temporary_table' and are rejected by the query itself.
+		if isLegacyTemporaryTable(kind, table, db, createSQL.String, extraInfo.String) {
+			continue
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true

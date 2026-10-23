@@ -108,7 +108,7 @@ func TestCatalogIdentifiers(t *testing.T) {
 				mock := newIdentifierMock(t)
 				const dbName = "d'`\\b"
 				dbQuery := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
-				tblQuery := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
+				tblQuery := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"
 				if sys {
 					dbQuery += " and account_id = 0"
 					tblQuery += " and account_id = 0" + hiddenHelpersPredicate
@@ -125,10 +125,10 @@ func TestCatalogIdentifiers(t *testing.T) {
 				names := []string{"plain", "a'b", "a`b", "x') OR 1=1 --", "a\\'b"}
 				want := make(Tables, 0, len(names))
 				args := []driver.Value{dbName, dbName}
-				rows := sqlmock.NewRows([]string{"relname", "relkind"})
+				rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})
 				for _, name := range names {
 					want = append(want, Table{Name: name, Kind: catalog.SystemOrdinaryRel})
-					rows.AddRow(name, catalog.SystemOrdinaryRel)
+					rows.AddRow(name, catalog.SystemOrdinaryRel, "", "")
 					if selected {
 						args = append(args, name)
 					}
@@ -148,7 +148,7 @@ func TestCatalogIdentifiers(t *testing.T) {
 }
 
 func TestCatalogIdentifierErrors(t *testing.T) {
-	query := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersPredicate + " and relname in (?)"
+	query := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersPredicate + " and relname in (?)"
 	injected := errors.New("catalog unavailable")
 	for _, scenario := range []string{"query", "missing", "scan", "iteration"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -158,11 +158,11 @@ func TestCatalogIdentifierErrors(t *testing.T) {
 			case "query":
 				expect.WillReturnError(injected)
 			case "missing":
-				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"})).RowsWillBeClosed()
+				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})).RowsWillBeClosed()
 			case "scan":
-				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(nil, "r")).RowsWillBeClosed()
+				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow(nil, "r", "", "")).RowsWillBeClosed()
 			case "iteration":
-				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a'b", "r").RowError(0, injected)).RowsWillBeClosed()
+				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("a'b", "r", "", "").RowError(0, injected)).RowsWillBeClosed()
 			}
 			_, err := getTables(context.Background(), "d'b", Tables{{Name: "a'b"}}, false)
 			switch scenario {
@@ -215,7 +215,7 @@ func TestIdentifierQueryErrors(t *testing.T) {
 	}{
 		{"database", "show create database `d'``b`", func() error { _, err := getCreateDB("d'`b"); return err }},
 		{"table", "show create table `d'``b`.`a'``b`", func() error { _, err := getCreateTable("d'`b", "a'`b"); return err }},
-		{"view", "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)", func() error { _, err := getDumpView(context.Background(), "d'`b", "a'`b", false); return err }},
+		{"view", "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)", func() error { _, err := getDumpView(context.Background(), "d'`b", "a'`b", false); return err }},
 		{"select", "select * from `d'``b`.`a'``b`", func() error { return genOutput("d'`b", "a'`b", nil, 1024, false, &csvConfig{}, "") }},
 	} {
 		t.Run(query.name, func(t *testing.T) {
@@ -241,7 +241,7 @@ func TestDumpIdentifiers(t *testing.T) {
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 					WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "")).RowsWillBeClosed()
 				want := "SET foreign_key_checks = 0;\n\n"
-				query := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersPredicate
+				query := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersPredicate
 				args := []driver.Value{dbName, dbName}
 				if opt.emptyTables {
 					mock.ExpectQuery("show create database " + quotedDB).
@@ -254,7 +254,7 @@ func TestDumpIdentifiers(t *testing.T) {
 					args = append(args, tc.name)
 				}
 				mock.ExpectQuery(query).WithArgs(args...).
-					WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tc.name, catalog.SystemOrdinaryRel)).RowsWillBeClosed()
+					WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow(tc.name, catalog.SystemOrdinaryRel, "", "")).RowsWillBeClosed()
 				ddl := "CREATE TABLE " + tc.quoted + " (id INT, v VARCHAR(20))"
 				mock.ExpectQuery("show create table " + quotedDB + "." + tc.quoted).
 					WillReturnRows(sqlmock.NewRows([]string{"Table", "Create"}).AddRow(tc.name, ddl)).RowsWillBeClosed()
@@ -284,8 +284,8 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a`b"}}, noData: true}
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 				WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", "")).RowsWillBeClosed()
-			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "a`b").
-				WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a`b", kind)).RowsWillBeClosed()
+			mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "a`b").
+				WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("a`b", kind, "", "")).RowsWillBeClosed()
 			var ddl, drop string
 			var rows *sqlmock.Rows
 			if kind == catalog.SystemViewRel {
@@ -298,7 +298,7 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 				rows = sqlmock.NewRows([]string{"Table", "Create"}).AddRow("a`b", ddl)
 			}
 			if kind == catalog.SystemViewRel {
-				mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("d", "a`b").WillReturnRows(rows).RowsWillBeClosed()
+				mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("d", "a`b").WillReturnRows(rows).RowsWillBeClosed()
 				mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 			} else {
 				mock.ExpectQuery("show create table `d`.`a``b`").WillReturnRows(rows).RowsWillBeClosed()

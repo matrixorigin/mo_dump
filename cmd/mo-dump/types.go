@@ -63,6 +63,10 @@ var (
 	nullBytes = []byte("\\N")
 )
 
+// nullStr is database/sql.NullString: the local `sql` identifier in several
+// functions of main.go shadows the package name.
+type nullStr = sql.NullString
+
 type Column struct {
 	Name string
 	Type string

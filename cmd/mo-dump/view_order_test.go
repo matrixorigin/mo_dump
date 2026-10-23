@@ -202,16 +202,16 @@ func TestDumpDataViewOrder(t *testing.T) {
 			oldStdout := os.Stdout
 			os.Stdout = file
 			t.Cleanup(func() { os.Stdout = oldStdout })
-			mock.ExpectQuery("select datname, dat_type").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
+			mock.ExpectQuery("select datname, dat_type").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 			mock.ExpectQuery("show create database").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("d", "create database d"))
-			rows := sqlmock.NewRows([]string{"relname", "relkind"})
+			rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})
 			if tc.ddl != "" {
-				rows.AddRow("va", tc.kind)
+				rows.AddRow("va", tc.kind, "", "")
 			}
 			if tc.second != "" {
-				rows.AddRow("vb", catalog.SystemViewRel)
+				rows.AddRow("vb", catalog.SystemViewRel, "", "")
 			}
-			mock.ExpectQuery("select relname,relkind").WillReturnRows(rows)
+			mock.ExpectQuery("select relname,relkind").WithArgs("d", "d").WillReturnRows(rows)
 			if tc.ddl != "" && tc.kind != catalog.SystemViewRel {
 				mock.ExpectQuery("show create table `d`.`va`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("va", tc.ddl))
 			}

@@ -355,13 +355,13 @@ func TestDumpExitStatus(t *testing.T) {
 		if mode == "empty_default" {
 			kind = "v"
 		}
-		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+
 			tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("db", "db", "t").
-			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("t", kind, "", ""))
 		if mode == "empty_default" {
 			// Inject incomplete persisted metadata at the catalog boundary,
 			// then exercise the real CLI's error/exit/success-marker contract.
-			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "t").
+			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "t").
 				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`)).RowsWillBeClosed()
 			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 		} else {
@@ -1011,7 +1011,7 @@ func TestGetCreateTable(t *testing.T) {
 func TestGetDumpView(t *testing.T) {
 	mock, _ := mockDumpOutput(t)
 	create := "CREATE VIEW table1_view as SELECT * FROM table1"
-	mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("table1_view", viewDefinitionJSON(t, "db1", create, "")))
+	mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("table1_view", viewDefinitionJSON(t, "db1", create, "")))
 	view, err := getDumpView(context.Background(), "db1", "table1_view", false)
 	require.NoError(t, err)
 	require.Equal(t, viewName{"db1", "table1_view"}, view.name)
