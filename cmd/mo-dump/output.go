@@ -22,13 +22,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // spoolPrefix names the hidden staging file that holds the complete SQL
-// script until the whole dump succeeded. A failed dump never publishes a
-// half script, so a restore can not drop a database it then fails to
-// recreate (matrixorigin/matrixone#30577).
+// script until the whole dump succeeded. Nothing reaches stdout before
+// the publication step, so no failure on the way to a complete script can
+// ever emit the destructive prefix of a half dump
+// (matrixorigin/matrixone#30577).
 const spoolPrefix = ".mo-dump-script-"
+
+// publishedFileMode is the mode csv data files carry once published: the
+// operator's umask policy applied to 0666, exactly like os.Create — a
+// umask of 022 publishes 0644, umask 002 publishes 0664. It is probed once
+// at process start; probing flips the process umask, so it must never race
+// with concurrent file creation.
+var publishedFileMode = os.FileMode(0o644)
+
+// probeFileMode records the umask-derived publish mode exactly once. Go
+// offers no read-only umask accessor, so flip to zero (returning the old
+// mask) and restore immediately.
+func probeFileMode() {
+	old := syscall.Umask(0)
+	syscall.Umask(old)
+	publishedFileMode = os.FileMode(0o666) &^ os.FileMode(old)
+}
 
 // csvArtifact tracks one staged csv file on its way to publish or discard.
 type csvArtifact struct {
@@ -232,6 +250,14 @@ func (s *dumpSink) publish() error {
 		if a.dropped || a.published {
 			continue
 		}
+		// CreateTemp stages the file as 0600; the published form follows the
+		// operator's umask policy like os.Create, because restore pipelines
+		// often run as a different Unix user than the one who dumped. The
+		// chmod rides the same exclusivity window as the reservation, before
+		// the name is handed over by the rename (matrixorigin/matrixone#30577).
+		if err := os.Chmod(a.tmp, publishedFileMode); err != nil {
+			return err
+		}
 		if err := os.Rename(a.tmp, a.dst); err != nil {
 			return err
 		}
@@ -241,8 +267,13 @@ func (s *dumpSink) publish() error {
 		if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		if _, err := io.Copy(os.Stdout, s.f); err != nil {
-			return err
+		emitted, err := io.Copy(os.Stdout, s.f)
+		if err != nil {
+			// Bytes already handed to stdout cannot be taken back: report
+			// exactly how much of the script escaped so the operator knows the
+			// stream is a unusable prefix, keep the failure exit code, and leave
+			// cleanup of the owned artifacts to discard.
+			return fmt.Errorf("stdout failed after %d bytes of the script were already emitted; the emitted prefix is incomplete and must not be restored: %w", emitted, err)
 		}
 		if err := s.f.Close(); err != nil {
 			return err

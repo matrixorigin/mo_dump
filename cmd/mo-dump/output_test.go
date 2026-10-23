@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -305,4 +306,67 @@ func TestDumpSinkSpoolFallback(t *testing.T) {
 	spoolName := sink.f.Name()
 	sink.discard()
 	require.NoFileExists(t, spoolName)
+}
+
+// TestProbeFileMode pins the umask policy: the flipped umask probe derives
+// 0666 &^ umask, and nothing else. umask math is hidden behind the probe so
+// the published csv still carries os.Create-compatible permissions
+// (0644 under umask 022, 0664 under umask 002, not the private 0600
+// mode of the staged CreateTemp file).
+func TestProbeFileMode(t *testing.T) {
+	old := syscall.Umask(0)
+	syscall.Umask(old)
+	t.Cleanup(func() { syscall.Umask(old) })
+	saved := publishedFileMode
+	t.Cleanup(func() { publishedFileMode = saved })
+
+	syscall.Umask(0o022)
+	probeFileMode()
+	require.Equal(t, os.FileMode(0o644), publishedFileMode, "umask 022 publishes 0644")
+
+	syscall.Umask(0o002)
+	probeFileMode()
+	require.Equal(t, os.FileMode(0o664), publishedFileMode, "umask 002 publishes 0664")
+}
+
+// TestDumpSinkPublishesUmaskMode verifies the chmod rides the reservation
+// window: the published csv data file answers with the probed mode even
+// though the staged CreateTemp file was 0600.
+func TestDumpSinkPublishesUmaskMode(t *testing.T) {
+	chdirToTemp(t)
+	saved := publishedFileMode
+	t.Cleanup(func() { publishedFileMode = saved })
+
+	for _, tc := range []struct {
+		umask int
+		want  os.FileMode
+	}{
+		{0o022, 0o644},
+		{0o002, 0o664},
+	} {
+		syscall.Umask(tc.umask)
+		probeFileMode()
+		sink, err := newDumpSink()
+		require.NoError(t, err)
+		require.Equal(t, tc.want, publishedFileMode)
+		_, published := stageCsvOne(t, sink, "db", "t", "1,2\n")
+
+		require.True(t, sink.csv[0].published == false)
+		_, err = os.ReadFile(published)
+		require.NoError(t, err)
+
+		devnull, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		require.NoError(t, err)
+		oldStdout := os.Stdout
+		os.Stdout = devnull
+		pubErr := sink.publish()
+		os.Stdout = oldStdout
+		require.NoError(t, pubErr)
+
+		info, err := os.Stat(published)
+		require.NoError(t, err)
+		require.Equal(t, tc.want, info.Mode().Perm(), "published file must follow the umask policy")
+	}
+	syscall.Umask(0o022)
+	probeFileMode()
 }

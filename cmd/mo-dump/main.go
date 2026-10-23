@@ -118,6 +118,9 @@ func main() {
 	}()
 
 	ctx := context.Background()
+	// The published csv mode follows the process umask; probing mutates the
+	// process umask, so it must happen before any other file creation.
+	probeFileMode()
 	flag.StringVar(&opt.username, "u", defaultUsername, "username")
 	flag.StringVar(&opt.password, "p", defaultPassword, "password")
 	flag.StringVar(&opt.host, "h", defaultHost, "hostname")
