@@ -16,6 +16,7 @@ package main
 
 import (
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -334,8 +335,17 @@ func TestProbeFileMode(t *testing.T) {
 // though the staged CreateTemp file was 0600.
 func TestDumpSinkPublishesUmaskMode(t *testing.T) {
 	chdirToTemp(t)
+	// The umask belongs to the process: restore whatever it was when the
+	// test ends (077 must not leak as 022, review finding) and re-derive the
+	// global probe so later tests see a consistent pair.
+	oldUmask := syscall.Umask(0)
+	syscall.Umask(oldUmask)
 	saved := publishedFileMode
-	t.Cleanup(func() { publishedFileMode = saved })
+	t.Cleanup(func() {
+		publishedFileMode = saved
+		syscall.Umask(oldUmask)
+		probeFileMode()
+	})
 
 	for _, tc := range []struct {
 		umask int
@@ -367,6 +377,42 @@ func TestDumpSinkPublishesUmaskMode(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, tc.want, info.Mode().Perm(), "published file must follow the umask policy")
 	}
-	syscall.Umask(0o022)
-	probeFileMode()
+}
+
+// TestDumpSinkPublishAgainstClosedStdout covers the review finding that a
+// reader closing stdout early used to kill the process with SIGPIPE before
+// the deferred cleanup could run: main ignores SIGPIPE, so the same write
+// surfaces as an error, the emitted prefix byte count is reported, and
+// discard still removes the spool and the already-renamed csv file.
+func TestDumpSinkPublishAgainstClosedStdout(t *testing.T) {
+	// The test process does not run main(); ignore SIGPIPE here the same way
+	// the CLI does, or a regression would kill the whole test binary.
+	signal.Ignore(syscall.SIGPIPE)
+
+	chdirToTemp(t)
+	sink, err := newDumpSink()
+	require.NoError(t, err)
+	sink.printf("SET foreign_key_checks = 0;\n\n")
+	_, published := stageCsvOne(t, sink, "db", "t", "1,2\n")
+
+	pipeR, pipeW, err := os.Pipe()
+	require.NoError(t, err)
+	oldStdout := os.Stdout
+	os.Stdout = pipeW
+	// Close the read end first: every write to stdout now hits EPIPE.
+	require.NoError(t, pipeR.Close())
+	pubErr := sink.publish()
+	os.Stdout = oldStdout
+	require.NoError(t, pipeW.Close())
+
+	require.Error(t, pubErr)
+	require.ErrorIs(t, pubErr, syscall.EPIPE)
+	require.Contains(t, pubErr.Error(), "already emitted")
+	require.True(t, sink.csv[0].published, "csv files were renamed before stdout streaming")
+
+	sink.discard()
+	require.NoFileExists(t, published)
+	hasNoStagingLeftover(t)
+	files := readDirSnapshot(t)
+	require.Empty(t, files)
 }

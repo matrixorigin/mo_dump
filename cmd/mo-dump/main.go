@@ -25,8 +25,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -118,6 +120,13 @@ func main() {
 	}()
 
 	ctx := context.Background()
+	// A reader closing stdout early (a broken pipe) must surface as a write
+	// error instead of the default SIGPIPE death: dying at fd 1 would skip
+	// the deferred cleanup and leave the staged spool and csv files behind.
+	// Go escalates SIGPIPE on fd 1/2 to a kill only while the signal is
+	// unhandled, so ignoring it turns the write into EPIPE
+	// (matrixorigin/matrixone#30577).
+	signal.Ignore(syscall.SIGPIPE)
 	// The published csv mode follows the process umask; probing mutates the
 	// process umask, so it must happen before any other file creation.
 	probeFileMode()
