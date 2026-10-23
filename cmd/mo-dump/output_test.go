@@ -86,6 +86,14 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 
 		staged, published := stageCsvOne(t, sink, "db", "t", "1,2\n")
 
+		// The published name is exclusively reserved before any data flows:
+		// it exists as an empty placeholder and cannot be taken by another run.
+		_, resErr := os.OpenFile(published, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		require.ErrorIs(t, resErr, os.ErrExist, "the published name must be reserved")
+		placeholder, err := os.ReadFile(published)
+		require.NoError(t, err)
+		require.Empty(t, placeholder)
+
 		// publish streams the spool to real stdout; capture it with a pipe.
 		pipeR, pipeW, err := os.Pipe()
 		require.NoError(t, err)
@@ -121,35 +129,45 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 		require.Len(t, readDirSnapshot(t), 2)
 	})
 
-	t.Run("publish rename failure removes the partial set", func(t *testing.T) {
+	t.Run("publish stream failure removes the partial set", func(t *testing.T) {
 		chdirToTemp(t)
 		// A previous backup set (legacy name) that must survive a failed run.
 		legacyFile := csvFileName("db", "t")
 		require.NoError(t, os.WriteFile(legacyFile, []byte("old backup\n"), 0o644))
 
-		sink := sinkOver(discardWriter{})
+		sink, err := newDumpSink()
+		require.NoError(t, err)
+		sink.printf("SET foreign_key_checks = 0;\n")
+
 		_, firstPublished := stageCsvOne(t, sink, "db", "t", "new t\n")
 		_, secondPublished := stageCsvOne(t, sink, "db", "v", "new v\n")
-		// Make the second rename fail deterministically: its published name
-		// is occupied by a directory.
-		require.NoError(t, os.Mkdir(secondPublished, 0o755))
 
-		err := sink.publish()
-		var linkErr *os.LinkError
-		require.ErrorAs(t, err, &linkErr)
-		require.True(t, sink.csv[0].published, "first rename happened before the failure")
+		// Fail the publish after both renames succeeded: the spool stream
+		// writes into a dead stdout.
+		dead, err := os.Create(filepath.Join(t.TempDir(), "dead-stdout"))
+		require.NoError(t, err)
+		require.NoError(t, dead.Close())
+		oldStdout := os.Stdout
+		os.Stdout = dead
+		pubErr := sink.publish()
+		os.Stdout = oldStdout
+		require.ErrorIs(t, pubErr, os.ErrClosed)
+		require.True(t, sink.csv[0].published, "both renames happened before the failure")
+		require.True(t, sink.csv[1].published)
 
 		sink.discard()
 
-		// The partially published files of the failed run are gone, the
-		// old backup is intact, and only the blocking directory remains.
+		// The partially published files of the failed run are gone and the
+		// old backup is intact.
 		require.NoFileExists(t, firstPublished)
-		require.NoFileExists(t, sink.csv[1].tmp)
+		require.NoFileExists(t, secondPublished)
 		legacy, err := os.ReadFile(legacyFile)
 		require.NoError(t, err)
 		require.Equal(t, "old backup\n", string(legacy))
-		require.DirExists(t, secondPublished)
 		hasNoStagingLeftover(t)
+		files := readDirSnapshot(t)
+		require.Len(t, files, 1)
+		require.True(t, files[legacyFile])
 	})
 
 	t.Run("discard", func(t *testing.T) {
@@ -172,6 +190,27 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 		require.NoFileExists(t, keptPublished)
 		require.NoFileExists(t, csvFileName("db", "t"))
 		require.NoFileExists(t, csvFileName("db", "v"))
+		require.Empty(t, readDirSnapshot(t))
+	})
+
+	t.Run("startCsv reserves distinct published names", func(t *testing.T) {
+		chdirToTemp(t)
+		sink := sinkOver(discardWriter{})
+		seen := map[string]bool{}
+		for i := 0; i < 4; i++ {
+			f, published, err := sink.startCsv("db", "t")
+			require.NoError(t, err)
+			require.False(t, seen[published], "published name reused across stagings: %s", published)
+			seen[published] = true
+			// Each reservation exists and is exclusive...
+			_, err = os.Stat(published)
+			require.NoError(t, err)
+			// ...and abandoning the table releases both files.
+			sink.abortCsv(f)
+			require.NoFileExists(t, published, "abort releases the reservation")
+		}
+
+		sink.discard()
 		require.Empty(t, readDirSnapshot(t))
 	})
 }

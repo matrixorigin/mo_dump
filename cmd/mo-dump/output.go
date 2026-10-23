@@ -16,6 +16,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,43 +117,70 @@ func csvFileName(db, tbl string) string {
 	return fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
 }
 
-// startCsv stages the csv data file of one table in a hidden temporary file.
-// It returns the staged file and the name it will be published under after
-// the whole run succeeds; the LOAD DATA statement references that name.
-// Both names are resolved against the current directory, which is also
-// where the final file has to live.
+// stageCsvAttempt bounds how many random name candidates one csv file may
+// burn through before the dump gives up on finding a free published name.
+const stageCsvAttempt = 16
+
+// startCsv stages the csv data file of one table in a hidden temporary file
+// and reserves its published name exclusively in the same directory. It
+// returns the staged file and the reserved published name; the LOAD DATA
+// statement references that name.
+//
+// CreateTemp only guarantees the hidden staged name is unused: the published
+// name is a different name, and once an earlier run published its file the
+// hidden slot is free again, so a random collision could rename straight
+// onto — and a later failure even delete — that other run's data file.
+// Reserving the published name with O_CREATE|O_EXCL before ever writing data
+// turns any collision into a retry with a new random candidate
+// (matrixorigin/matrixone#30577).
 func (s *dumpSink) startCsv(db, tbl string) (*os.File, string, error) {
-	f, err := os.CreateTemp(".", "."+csvFileName(db, tbl)+".mo-dump-")
-	if err != nil {
-		return nil, "", err
+	base := csvFileName(db, tbl)
+	for attempt := 0; attempt < stageCsvAttempt; attempt++ {
+		f, err := os.CreateTemp(".", "."+base+".mo-dump-")
+		if err != nil {
+			return nil, "", err
+		}
+		// CreateTemp returns the directory-qualified name ("./.<file>"); work
+		// on the base name alone and strip exactly the one leading dot that
+		// hides the staged file.
+		staged := filepath.Base(f.Name())
+		dst := strings.TrimPrefix(staged, ".")
+		reserve, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			_ = reserve.Close()
+			s.csv = append(s.csv, csvArtifact{tmp: staged, dst: dst})
+			return f, dst, nil
+		}
+		_ = f.Close()
+		_ = os.Remove(staged)
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
 	}
-	// CreateTemp returns the directory-qualified name ("./.<file>"); work
-	// on the base name alone and strip exactly the one leading dot that hides
-	// the staged file.
-	staged := filepath.Base(f.Name())
-	dst := strings.TrimPrefix(staged, ".")
-	s.csv = append(s.csv, csvArtifact{tmp: staged, dst: dst})
-	return f, dst, nil
+	return nil, "", fmt.Errorf("no free published csv name for %s after %d attempts", base, stageCsvAttempt)
 }
 
-// abortCsv removes a staged csv file after the table failed; a later
-// failed-run discard must not remove it again.
+// abortCsv removes a staged csv file after the table failed — the staged file
+// and its published-name reservation — so a later failed-run discard must not
+// remove either again.
 func (s *dumpSink) abortCsv(f *os.File) {
 	name := filepath.Base(f.Name())
 	_ = f.Close()
 	_ = os.Remove(name)
 	for i := range s.csv {
 		if s.csv[i].tmp == name {
+			_ = os.Remove(s.csv[i].dst)
 			s.csv[i].dropped = true
 		}
 	}
 }
 
 // discard drops every artifact a failed run leaves behind: the staged SQL
-// script, all staged csv files, and any csv file already published by a
-// partially succeeded publish — a new backup set that was never completed
-// must vanish rather than coexist with the operator's previous files. After
-// a complete publish it is a no-op: nothing is owned anymore.
+// script, all staged csv files, their published-name reservations, and any
+// csv file already published by a partially succeeded publish — a new backup
+// set that was never completed must vanish rather than coexist with the
+// operator's previous files, which the reservation guarantees were never
+// touched. After a complete publish it is a no-op: nothing is owned anymore.
 func (s *dumpSink) discard() {
 	if s.publishedAll {
 		return
@@ -163,15 +191,15 @@ func (s *dumpSink) discard() {
 		s.f = nil
 	}
 	for i := range s.csv {
-		if s.csv[i].dst != "" && s.csv[i].published {
-			_ = os.Remove(s.csv[i].dst)
-			s.csv[i].published = false
-		}
 		if s.csv[i].dropped {
 			continue
 		}
 		_ = os.Remove(s.csv[i].tmp)
+		// The published name carries either this run's empty reservation or
+		// its already renamed data; both belong to the failed run and go.
+		_ = os.Remove(s.csv[i].dst)
 		s.csv[i].dropped = true
+		s.csv[i].published = false
 	}
 }
 

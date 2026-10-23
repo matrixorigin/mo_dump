@@ -293,11 +293,12 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 			case catalog.SystemSequenceRel:
 				// A sequence's current definition and allocation state live in
 				// its backing row, not in SHOW CREATE TABLE
-				// (matrixorigin/matrixone#30577).
-				// isSys scopes the catalog metadata query to the sys account,
-				// where mo_catalog is not tenant-isolated.
+				// (matrixorigin/matrixone#30577). isSys scopes the catalog
+				// metadata query to the sys account, where mo_catalog is not
+				// tenant-isolated; a state-carrying dump exports the allocation
+				// replay, -no-data the legal definition only.
 				var state string
-				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount)
+				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount, !opt.noData)
 				stateSQL[i] = state
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))

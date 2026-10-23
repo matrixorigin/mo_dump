@@ -33,15 +33,17 @@ const sequenceStateQuery = "select last_seq_num, min_value, max_value, start_val
 
 // getCreateSequence builds the restore SQL for one user sequence.
 //
-// createSQL recreates the sequence with its current definition; stateSQL
-// repeats last_seq_num/is_called so a restored sequence does not hand out
-// values the source already consumed. A state that cannot be replayed
-// exactly — for example a last_seq_num outside [min_value, max_value], which
-// ALTER SEQUENCE can produce — fails the dump instead of writing a script
-// whose restore breaks after dropping the old objects
-// (matrixorigin/matrixone#30577). -no-data callers may drop stateSQL, which
-// makes the restored sequence continue from its START value.
-func getCreateSequence(ctx context.Context, db, seq string, isSys bool) (createSQL string, stateSQL string, err error) {
+// createSQL recreates the sequence with its current definition; when
+// withState is set, stateSQL repeats last_seq_num/is_called so a restored
+// sequence does not hand out values the source already consumed. Only a
+// state that the script will actually replay is held to replay rules: a
+// last_seq_num outside [min_value, max_value] — which ALTER SEQUENCE can
+// produce — fails a state-carrying dump instead of writing a script whose
+// restore breaks after dropping the old objects (matrixorigin/matrixone#30577),
+// while a definition-only (-no-data) dump still exports the legal definition
+// and leaves the sequence to continue from its START value; a broken
+// definition is rejected in both modes.
+func getCreateSequence(ctx context.Context, db, seq string, isSys bool, withState bool) (createSQL string, stateSQL string, err error) {
 	columnType, err := sequenceColumnType(ctx, db, seq, isSys)
 	if err != nil {
 		return "", "", err
@@ -51,15 +53,11 @@ func getCreateSequence(ctx context.Context, db, seq string, isSys bool) (createS
 	if err != nil {
 		return "", "", err
 	}
-	if err := checkSequenceRange(ctx, db, seq, state); err != nil {
+	if err := checkSequenceDefinition(ctx, db, seq, state); err != nil {
 		return "", "", err
 	}
 
 	cycle, err := sequenceBool(ctx, db, seq, "cycle", state.cycle)
-	if err != nil {
-		return "", "", err
-	}
-	isCalled, err := sequenceBool(ctx, db, seq, "is_called", state.isCalled)
 	if err != nil {
 		return "", "", err
 	}
@@ -73,6 +71,17 @@ func getCreateSequence(ctx context.Context, db, seq string, isSys bool) (createS
 		"CREATE SEQUENCE %s AS %s INCREMENT BY %s MINVALUE %s MAXVALUE %s START WITH %s %s",
 		name, columnType, state.increment, state.minimum, state.maximum, state.start, cycleWord,
 	)
+	if !withState {
+		return createSQL, "", nil
+	}
+
+	if err := checkSequenceAllocation(ctx, db, seq, state); err != nil {
+		return "", "", err
+	}
+	isCalled, err := sequenceBool(ctx, db, seq, "is_called", state.isCalled)
+	if err != nil {
+		return "", "", err
+	}
 	// The statements are not database-qualified, matching the table DDL in
 	// the same script: the whole-db form emits a USE before them, and a
 	// -tbl restore is replayed inside the operator's chosen database.
@@ -192,29 +201,25 @@ func readSequenceState(ctx context.Context, db, seq string) (sequenceState, erro
 	return state, nil
 }
 
-// checkSequenceRange verifies the allocation state against the sequence's own
-// bounds. SETVAL — the only user-reachable state writer on restore — rejects a
-// value outside [min_value, max_value], and ALTER SEQUENCE can leave a
-// sequence in exactly such a state (it pre-advances last_seq_num in the
-// session that called NEXTVAL). A dump that would later fail on restore
-// because of this must fail now, at export time, before any old objects are
-// dropped by the script (matrixorigin/matrixone#30577).
-func checkSequenceRange(ctx context.Context, db, seq string, state sequenceState) error {
-	minimum, ok := new(big.Int).SetString(state.minimum, 10)
+// sequenceBounds parses the sequence's definitional [min, max] bounds.
+func sequenceBounds(ctx context.Context, db, seq string, state sequenceState) (*big.Int, *big.Int, error) {
+	minimum, okMin := new(big.Int).SetString(state.minimum, 10)
 	maximum, okMax := new(big.Int).SetString(state.maximum, 10)
-	if !ok || !okMax {
-		return moerr.NewInternalErrorf(
+	if !okMin || !okMax {
+		return nil, nil, moerr.NewInternalErrorf(
 			ctx, "sequence %s.%s has non-numeric min/max bounds %q, %q", db, seq, state.minimum, state.maximum)
 	}
-	lastValue, ok := new(big.Int).SetString(state.lastValue, 10)
-	if !ok {
-		return moerr.NewInternalErrorf(
-			ctx, "sequence %s.%s has non-numeric last_seq_num %q", db, seq, state.lastValue)
-	}
-	if lastValue.Cmp(minimum) < 0 || lastValue.Cmp(maximum) > 0 {
-		return moerr.NewInternalErrorf(
-			ctx, "sequence %s.%s allocation state last_seq_num %s is outside its bounds [%s, %s]: sequence bounds are not enforced on ALTER SEQUENCE, and SETVAL cannot restore such a state",
-			db, seq, state.lastValue, state.minimum, state.maximum)
+	return minimum, maximum, nil
+}
+
+// checkSequenceDefinition validates the parts of the sequence that every
+// dump emits as the CREATE SEQUENCE definition: the bounds must be numeric
+// and start_value must lie inside them. A broken definition is rejected in
+// both full and -no-data dumps, because both generate the same CREATE.
+func checkSequenceDefinition(ctx context.Context, db, seq string, state sequenceState) error {
+	minimum, maximum, err := sequenceBounds(ctx, db, seq, state)
+	if err != nil {
+		return err
 	}
 	startValue, ok := new(big.Int).SetString(state.start, 10)
 	if !ok {
@@ -225,6 +230,32 @@ func checkSequenceRange(ctx context.Context, db, seq string, state sequenceState
 		return moerr.NewInternalErrorf(
 			ctx, "sequence %s.%s start_value %s is outside its bounds [%s, %s]",
 			db, seq, state.start, state.minimum, state.maximum)
+	}
+	return nil
+}
+
+// checkSequenceAllocation validates the allocation replay a state-carrying
+// dump performs: SETVAL — the only user-reachable state writer on restore —
+// rejects a value outside [min_value, max_value], and ALTER SEQUENCE can
+// leave a sequence in exactly such a state (it pre-advances last_seq_num in
+// the session that called NEXTVAL). A dump that would later fail on restore
+// because of this must fail now, at export time, before any old objects are
+// dropped by the script (matrixorigin/matrixone#30577); the definition-only
+// -no-data mode does not replay the state and stays available.
+func checkSequenceAllocation(ctx context.Context, db, seq string, state sequenceState) error {
+	minimum, maximum, err := sequenceBounds(ctx, db, seq, state)
+	if err != nil {
+		return err
+	}
+	lastValue, ok := new(big.Int).SetString(state.lastValue, 10)
+	if !ok {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s has non-numeric last_seq_num %q", db, seq, state.lastValue)
+	}
+	if lastValue.Cmp(minimum) < 0 || lastValue.Cmp(maximum) > 0 {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s allocation state last_seq_num %s is outside its bounds [%s, %s]: sequence bounds are not enforced on ALTER SEQUENCE, and SETVAL cannot restore such a state; run with -no-data to export the definition without the allocation state",
+			db, seq, state.lastValue, state.minimum, state.maximum)
 	}
 	return nil
 }

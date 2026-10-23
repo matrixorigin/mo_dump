@@ -105,7 +105,7 @@ func TestGetCreateSequence(t *testing.T) {
 				WillReturnRows(sqlmock.NewRows([]string{"atttyp"}).AddRow(tc.columnType))
 			mock.ExpectQuery(stateQuery("db", tc.seq)).WillReturnRows(oneState(tc.state...))
 
-			createSQL, stateSQL, err := getCreateSequence(ctx, "db", tc.seq, false)
+			createSQL, stateSQL, err := getCreateSequence(ctx, "db", tc.seq, false, true)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantCreate, createSQL)
 			require.Equal(t, tc.wantState, stateSQL)
@@ -229,7 +229,7 @@ func TestGetCreateSequence(t *testing.T) {
 			if tc.hasState {
 				mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(tc.state)
 			}
-			_, _, err := getCreateSequence(ctx, "db", "sq", false)
+			_, _, err := getCreateSequence(ctx, "db", "sq", false, true)
 			require.Error(t, err)
 			switch tc.name {
 			case "missing type row", "empty type text":
@@ -251,10 +251,43 @@ func TestGetCreateSequence(t *testing.T) {
 		mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(
 			emptyState().AddRow("5", "1", "3000", "5", "3", "0", "1"))
 
-		createSQL, stateSQL, err := getCreateSequence(ctx, "db", "sq", true)
+		createSQL, stateSQL, err := getCreateSequence(ctx, "db", "sq", true, true)
 		require.NoError(t, err)
 		require.Equal(t, "CREATE SEQUENCE `sq` AS smallint INCREMENT BY 3 MINVALUE 1 MAXVALUE 3000 START WITH 5 NO CYCLE", createSQL)
 		require.Equal(t, "SELECT setval('sq', 5, false)", stateSQL)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	// A definition-only (-no-data) dump never replays the allocation state,
+	// so an unreplayable state must keep the — still legal — definition
+	// exportable, while a broken definition is rejected in both modes
+	// (matrixorigin/matrixone#30577).
+	t.Run("definition only tolerates an unreplayable allocation", func(t *testing.T) {
+		_, mock := exportTestDB(t)
+		mock.ExpectQuery(typeQuery("db", "sq", false)).
+			WillReturnRows(sqlmock.NewRows([]string{"atttyp"}).AddRow("bigint"))
+		// last=11 outside [1,10]: ALTER SEQUENCE on a called session leaves
+		// exactly this state.
+		mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(
+			emptyState().AddRow("11", "1", "10", "10", "1", "0", "0"))
+
+		createSQL, stateSQL, err := getCreateSequence(ctx, "db", "sq", false, false)
+		require.NoError(t, err)
+		require.Equal(t, "", stateSQL)
+		require.Equal(t, "CREATE SEQUENCE `sq` AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 10 START WITH 10 NO CYCLE", createSQL)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("definition only still rejects a broken definition", func(t *testing.T) {
+		_, mock := exportTestDB(t)
+		mock.ExpectQuery(typeQuery("db", "sq", false)).
+			WillReturnRows(sqlmock.NewRows([]string{"atttyp"}).AddRow("bigint"))
+		mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(
+			emptyState().AddRow("5", "1", "10", "99", "1", "0", "1"))
+
+		_, _, err := getCreateSequence(ctx, "db", "sq", false, false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "start_value 99 is outside")
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 }
