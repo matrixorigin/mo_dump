@@ -48,15 +48,12 @@ const (
 	tablesScopePredicate = " and (account_id = current_account_id() or (account_id = 0 and " +
 		"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 
-	// Hidden helpers are excluded by a compound predicate: the literal
-	// __mo_index_ name prefix (underscores escaped, '_' is a single-character
-	// LIKE wildcard that also swallowed demo_index_data) combined with a
-	// dumpable-relkind gate (r/v/e). A bare kind predicate cannot cover all
-	// hidden kinds: unique/secondary are 'i' since MO v3.0 and empty before,
-	// fulltext/vector helpers carry per-role kinds (fulltext, metadata,
-	// centroids, entries, ...). User objects legally named __mo_index_* with a
-	// dumpable relkind stay dump payloads.
-	hiddenHelpersPredicate = " and not (relname like '\\_\\_mo\\_index\\_%' and relkind not in ('r','v','e'))" +
+	// Hidden index helpers are identified by their registration in
+	// mo_catalog.mo_indexes.index_table_name (the column exists under this
+	// exact name from MO v1.2 on); name or kind shortcuts silently dropped
+	// user objects, see getTables.
+	hiddenHelpersPredicate = " and relname not in (select index_table_name from mo_catalog.mo_indexes" +
+		" where index_table_name is not null and index_table_name <> '')" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'" +
 		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
@@ -133,9 +130,12 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			// Review regression #R1: '_' is a LIKE wildcard; demo_index_data is
 			// an ordinary table that a not-like '__mo_index_%' pattern matched.
 			AddRow("demo_index_data", "r").
-			// A user table legally named with the literal index-table prefix is
-			// identified as ordinary by its relkind, not by its name.
-			AddRow("__mo_index_data", "r")
+			// Review regression #R5: a user table legally named with the
+			// literal index-table prefix is not registered in mo_indexes, so it
+			// is dumped whatever kind its row carries ('r' on first creation,
+			// '' once the server blanks the kind after rename/restore).
+			AddRow("__mo_index_data", "r").
+			AddRow("__mo_index_renamed", "")
 		mock.ExpectQuery(defaultSQL).WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", nil, false)
@@ -147,6 +147,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			{Name: "%!%plain", Kind: "r"},
 			{Name: "demo_index_data", Kind: "r"},
 			{Name: "__mo_index_data", Kind: "r"},
+			{Name: "__mo_index_renamed", Kind: ""},
 		}, tables)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})

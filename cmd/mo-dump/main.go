@@ -262,7 +262,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for i, tbl := range opt.tables {
 			var createTableSql string
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
+			case catalog.SystemOrdinaryRel, emptyRelKind:
 				createTableSql, err = getCreateTable(db, tbl.Name)
 				if err != nil {
 					return err
@@ -306,7 +306,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
+			case catalog.SystemOrdinaryRel, emptyRelKind:
 				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
 				showCreateTable(create, false)
 				if !opt.noData {
@@ -459,28 +459,29 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
 			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 	}
-	// Internal helper relations, identified by a compound predicate instead
-	// of a name or kind guess (review rounds 2 and 3):
-	//   - All hidden index tables are named with the literal __mo_index_
-	//   prefix, enforced by the server since MO v1.0 (unique, secondary,
-	//   fulltext, ivfflat metadata/centroids/entries, hnsw, cagra, ivfpq).
-	//   The LIKE pattern escapes the underscores, because '_' is a
-	//   single-character wildcard that made an ordinary table named
-	//   demo_index_data vanish from a dump that still reported success.
-	//   All server versions since v1.0 translate '\_' to a literal
-	//   underscore, so the pattern also covers pre-v3.0 clusters where the
-	//   unique/secondary hidden rows carry an empty relkind and modern
-	//   clusters where vector/fulltext helpers carry per-role kinds that
-	//   cannot be enumerated (fulltext, metadata, centroids, entries, ...).
-	//   - The relkind gate protects dumpable user objects: only the kinds
-	//   the export switch can emit (r/v/e, see dumpData) are exempted, so
-	//   a user table legally named __mo_index_data with relkind r/v/e is
-	//   still dumped. Any new index algorithm kind stays hidden without a
-	//   mo-dump release.
+	// Hidden index helpers are identified by the real index association,
+	// not by name or relkind guesses (review rounds 2-4): every index writes
+	// its helper table name into mo_catalog.mo_indexes.index_table_name (the
+	// column exists under this exact name from MO v1.2 through current
+	// releases), so anything registered there is a helper and is excluded,
+	// regardless of which relkind its row carries ('i', 'fulltext',
+	// 'metadata'/'centroids'/'entries', '' on pre-v3.0 clusters, or a kind a
+	// future index algorithm introduces).
+	// Name- and kind-based shortcuts were rejected because they silently
+	// dropped user objects: a plain '_' wildcard pattern swallowed
+	// demo_index_data, and an unrecognizable relkind swallowed user tables
+	// the server records with an empty kind after e.g. a rename/restore to
+	// a __mo_index_* colliding name. Objects that reach the export switch
+	// with an unsupported (non r/v/e) relkind now fail loudly instead; the
+	// empty relkind itself is handled as an ordinary user table in
+	// dumpData, because the server only blanks the kind of colliding
+	// CREATE TABLE names while the object stays a fully usable table
+	// (verified via SHOW CREATE TABLE / SELECT).
 	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
 	// with the name of a catalog helper are regular dump payloads and must
 	// never be skipped silently.
-	sql += " and not (relname like '\\_\\_mo\\_index\\_%' and relkind not in ('r','v','e'))" +
+	sql += " and relname not in (select index_table_name from mo_catalog.mo_indexes" +
+		" where index_table_name is not null and index_table_name <> '')" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'" +
 		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"

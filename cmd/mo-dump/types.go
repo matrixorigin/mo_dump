@@ -47,6 +47,15 @@ const (
 	quoteFmt   = "%q"
 	defaultFmt = "%s"
 	jsonFmt    = "\"%s\""
+
+	// emptyRelKind is the relkind the server records for CREATE TABLE names
+	// that collide with internal naming (e.g. a user table named
+	// __mo_index_renamed, or restored from such a dump). The object itself
+	// stays a fully usable ordinary table (SHOW CREATE TABLE and SELECT are
+	// verified to work); only the kind column is blank. Treat it as an
+	// ordinary table so the dump/restore cycle converges instead of making
+	// the whole database undumpable.
+	emptyRelKind = ""
 )
 
 var (
