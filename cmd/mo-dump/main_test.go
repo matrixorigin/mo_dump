@@ -31,6 +31,7 @@ import (
 	"unicode/utf8"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -591,6 +592,56 @@ func TestShowCreateTable(t *testing.T) {
 		require.Equal(t, v.res, buf.String())
 	}
 	os.Stdout = old
+}
+
+// TestDumpDataExternalTableCommentInjection guards the restore contract: an
+// external-table section must not emit any /* ... */ marker comment. Table names
+// are legal identifiers that may contain */ (e.g. `a*/b`), which would terminate
+// the comment early and inject bare SQL into the restore script, aborting restore
+// just like the original executable-comment marker (issue 30559).
+func TestDumpDataExternalTableCommentInjection(t *testing.T) {
+	dbName := "e2e_db"
+	tblName := "a*/b"
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("Failed to create mock database: %v", err)
+	}
+	defer db.Close()
+
+	oldConn, oldStdout := conn, os.Stdout
+	conn = db
+	defer func() { conn = oldConn }()
+
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs(dbName).
+		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "user"))
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs(dbName, tblName).
+		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tblName, catalog.SystemExternalRel))
+	createSQL := "CREATE EXTERNAL TABLE `a*/b` (id INT) INFILE{'filepath'='/tmp/rows.csv'}"
+	mock.ExpectQuery("show create table `" + dbName + "`.`" + tblName + "`").
+		WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow(tblName, createSQL))
+
+	opt := &Options{dbs: []string{dbName}, tables: Tables{{tblName, ""}}}
+
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err = opt.dumpData(context.Background())
+
+	e := w.Close()
+	require.Nil(t, e)
+	var out bytes.Buffer
+	_, e = out.ReadFrom(r)
+	require.Nil(t, e)
+	os.Stdout = oldStdout
+
+	require.NoError(t, err)
+	// A regular mysql client executes /*! ... */ comment content during restore,
+	// and plain /* ... */ comments are terminated early by legal table names
+	// containing */, so the external-table section must carry no comment at all.
+	require.False(t, strings.Contains(out.String(), "/*"),
+		"external table section must not emit comments, table %q can terminate block comments early", tblName)
+	require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestViewOrder(t *testing.T) {

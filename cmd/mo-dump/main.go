@@ -305,7 +305,6 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("/*!EXTERNAL TABLE %s*/\n", quoteIdentifier(tbl.Name))
 				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
@@ -374,6 +373,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 	}
 	fmt.Printf("%s%s\n", createSql, suffix)
 }
+
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {

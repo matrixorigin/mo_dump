@@ -293,7 +293,7 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 				rows = sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("a`b", viewDefinitionJSON(t, "d", ddl, ""))
 			} else {
 				ddl = "CREATE EXTERNAL TABLE `a``b` (id INT)"
-				drop = "/*!EXTERNAL TABLE `a``b`*/\nDROP TABLE IF EXISTS `a``b`;\n"
+				drop = "DROP TABLE IF EXISTS `a``b`;\n"
 				rows = sqlmock.NewRows([]string{"Table", "Create"}).AddRow("a`b", ddl)
 			}
 			if kind == catalog.SystemViewRel {
