@@ -97,7 +97,7 @@ func getCreateSequence(ctx context.Context, db, seq string, isSys bool, withStat
 	// setval(last, true) and the next NEXTVAL returns last.
 	stateSQL = fmt.Sprintf(
 		"SELECT setval(%s, %s, %t)",
-		quoteSQLLiteral(seq), state.lastValue, !isCalled,
+		quoteString(seq), state.lastValue, !isCalled,
 	)
 	return createSQL, stateSQL, nil
 }
@@ -108,7 +108,7 @@ func getCreateSequence(ctx context.Context, db, seq string, isSys bool, withStat
 // anything else is an ambiguous sequence and fails the dump.
 func sequenceColumnType(ctx context.Context, db, seq string, isSys bool) (string, error) {
 	query := "select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = " +
-		quoteSQLLiteral(db) + " and att_relname = " + quoteSQLLiteral(seq) + " and attname = 'last_seq_num'"
+		quoteString(db) + " and att_relname = " + quoteString(seq) + " and attname = 'last_seq_num'"
 	if isSys {
 		// A sys account's mo_catalog view is not tenant-isolated: without this
 		// filter the same-name sequence of another tenant can answer the query
@@ -292,21 +292,4 @@ func sequenceBool(ctx context.Context, db, seq, column, value string) (bool, err
 		return false, moerr.NewInternalErrorf(
 			ctx, "sequence %s.%s column %s has invalid boolean value %q", db, seq, column, value)
 	}
-}
-
-// quoteIdentifier backticks an identifier for generated SQL, doubling any
-// embedded backtick so a sequence named s`q (matrixorigin/matrixone#28245)
-// round-trips through the restore script.
-func quoteIdentifier(s string) string {
-	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
-}
-
-// quoteSQLLiteral quotes a string for a literal in the catalog queries the
-// dump itself runs, using the same escaping as the MatrixOne frontend.
-func quoteSQLLiteral(s string) string {
-	replacer := strings.NewReplacer(
-		`\`, `\\`,
-		`'`, `''`,
-	)
-	return "'" + replacer.Replace(s) + "'"
 }

@@ -20,8 +20,8 @@ import (
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,7 +34,7 @@ func TestGetCreateSequence(t *testing.T) {
 
 	typeQuery := func(db, seq string, isSys bool) string {
 		query := "select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = " +
-			quoteSQLLiteral(db) + " and att_relname = " + quoteSQLLiteral(seq) + " and attname = 'last_seq_num'"
+			quoteString(db) + " and att_relname = " + quoteString(seq) + " and attname = 'last_seq_num'"
 		if isSys {
 			query += " and account_id = 0"
 		}
@@ -292,8 +292,9 @@ func TestGetCreateSequence(t *testing.T) {
 	})
 }
 
-// TestReorderDumpObjects checks the stable three-way partition that puts
-// sequences before the tables depending on them and views last.
+// TestReorderDumpObjects checks the stable partition that puts sequences
+// before the tables depending on them while every other entry — tables and
+// the collected view markers alike — keeps its catalog order.
 func TestReorderDumpObjects(t *testing.T) {
 	t.Run("mixed kinds", func(t *testing.T) {
 		create := []string{"C:t1", "C:sq1", "C:v1", "C:e1", "C:sq2"}
@@ -305,20 +306,19 @@ func TestReorderDumpObjects(t *testing.T) {
 			{Name: "e1", Kind: catalog.SystemExternalRel},
 			{Name: "sq2", Kind: catalog.SystemSequenceRel},
 		}
-		firstView := reorderDumpObjects(create, tables, state)
-		require.Equal(t, 4, firstView)
-		require.Equal(t, []string{"C:sq1", "C:sq2", "C:t1", "C:e1", "C:v1"}, create)
+		reorderDumpObjects(create, tables, state)
+		require.Equal(t, []string{"C:sq1", "C:sq2", "C:t1", "C:v1", "C:e1"}, create)
 		require.Equal(t, []string{"U:sq1", "U:sq2", "", "", ""}, state)
 		require.Equal(t, Tables{
 			{Name: "sq1", Kind: catalog.SystemSequenceRel},
 			{Name: "sq2", Kind: catalog.SystemSequenceRel},
 			{Name: "t1", Kind: catalog.SystemOrdinaryRel},
-			{Name: "e1", Kind: catalog.SystemExternalRel},
 			{Name: "v1", Kind: catalog.SystemViewRel},
+			{Name: "e1", Kind: catalog.SystemExternalRel},
 		}, tables)
 	})
 
-	t.Run("view first in catalog still emitted last", func(t *testing.T) {
+	t.Run("sequence leads even when the catalog returns it last", func(t *testing.T) {
 		create := []string{"C:v1", "C:t1", "C:sq1"}
 		state := []string{"", "", "U"}
 		tables := Tables{
@@ -326,14 +326,13 @@ func TestReorderDumpObjects(t *testing.T) {
 			{Name: "t1", Kind: catalog.SystemOrdinaryRel},
 			{Name: "sq1", Kind: catalog.SystemSequenceRel},
 		}
-		firstView := reorderDumpObjects(create, tables, state)
-		require.Equal(t, 2, firstView)
-		require.Equal(t, []string{"C:sq1", "C:t1", "C:v1"}, create)
+		reorderDumpObjects(create, tables, state)
+		require.Equal(t, []string{"C:sq1", "C:v1", "C:t1"}, create)
 		require.Equal(t, []string{"U", "", ""}, state)
 		require.Equal(t, Tables{
 			{Name: "sq1", Kind: catalog.SystemSequenceRel},
-			{Name: "t1", Kind: catalog.SystemOrdinaryRel},
 			{Name: "v1", Kind: catalog.SystemViewRel},
+			{Name: "t1", Kind: catalog.SystemOrdinaryRel},
 		}, tables)
 	})
 }
@@ -356,11 +355,11 @@ func TestFilterUserDatabases(t *testing.T) {
 func TestDumpDataExternalTableScript(t *testing.T) {
 	ctx := context.Background()
 	_, mock := exportTestDB(t)
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 	mock.ExpectQuery("show create database `db`").
 		WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'").
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs("db").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("ext", catalog.SystemExternalRel))
 	mock.ExpectQuery("show create table `db`.`ext`").
@@ -373,7 +372,7 @@ func TestDumpDataExternalTableScript(t *testing.T) {
 	require.NoError(t, opt.dumpData(ctx, sink))
 	expected := "SET foreign_key_checks = 0;\n\n" +
 		"DROP DATABASE IF EXISTS `db`;\n" +
-		"CREATE DATABASE db;\n" +
+		"CREATE DATABASE db ;\n" +
 		"USE `db`;\n\n\n" +
 		"/*!EXTERNAL TABLE `ext`*/\n" +
 		"DROP TABLE IF EXISTS `ext`;\n" +

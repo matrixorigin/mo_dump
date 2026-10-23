@@ -32,8 +32,8 @@ import (
 	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 )
 
 type Options struct {
@@ -233,6 +233,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 		createDb    string
 		createTable []string
 		stateSQL    []string
+		views       []dumpView
 		err         error
 	)
 
@@ -254,12 +255,13 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 			return err
 		}
 
+		db = dbStruct.Name // Catalog identity, not the requested spelling.
 		if opt.emptyTables {
 			opt.tables = nil
 		}
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
-				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(db))
+				createDb = "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db)
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
@@ -267,7 +269,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				}
 			}
 			out.printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
-			out.printf("%s;\n", createDb)
+			out.printf("%s ;\n", createDb)
 			out.printf("USE %s;\n\n\n", quoteIdentifier(db))
 		}
 
@@ -288,8 +290,16 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 			switch tbl.Kind {
 			case catalog.SystemOrdinaryRel, catalog.SystemExternalRel:
 				createTable[i], err = getCreateTable(db, tbl.Name)
+				if err != nil {
+					return err
+				}
 			case catalog.SystemViewRel:
-				createTable[i], err = getCreateView(db, tbl.Name)
+				view, err := getDumpView(ctx, db, tbl.Name, opt.sysAccount)
+				if err != nil {
+					return err
+				}
+				views = append(views, view)
+				createTable[i] = view.create
 			case catalog.SystemSequenceRel:
 				// A sequence's current definition and allocation state live in
 				// its backing row, not in SHOW CREATE TABLE
@@ -299,19 +309,19 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				// replay, while -no-data exports the legal definition only.
 				var state string
 				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount, !opt.noData)
+				if err != nil {
+					return err
+				}
 				stateSQL[i] = state
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
-			}
-			if err != nil {
 				return err
 			}
 		}
 		// Sequences must be created before the tables whose DEFAULT nextval
-		// references them; views are emitted after everything they select
-		// from.
-		firstView := reorderDumpObjects(createTable, opt.tables, stateSQL)
-		adjustViewOrder(createTable, opt.tables, firstView)
+		// references them; views are collected and emitted after everything
+		// they can select from.
+		reorderDumpObjects(createTable, opt.tables, stateSQL)
 		bufPool := &sync.Pool{
 			New: func() any {
 				return &bytes.Buffer{}
@@ -346,8 +356,8 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(out, create, true)
 			case catalog.SystemViewRel:
-				out.printf("DROP VIEW IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
-				showCreateTable(out, create, true)
+				// The definition and its creation mode were captured together above.
+				continue
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
@@ -355,6 +365,25 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 			if e := out.Err(); e != nil {
 				return e
 			}
+		}
+	}
+	var mode viewSQLMode
+	if len(views) > 0 {
+		mode, err = getViewCatalogMode(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot read view catalog mode: %w", err)
+		}
+	}
+	orderedViews, err := orderDumpViews(ctx, views, mode)
+	if err != nil {
+		return err
+	}
+	for _, view := range orderedViews {
+		if err := showDumpView(out, view, mode); err != nil {
+			return err
+		}
+		if e := out.Err(); e != nil {
+			return e
 		}
 	}
 	// reset foreign_key_checks variable to dump file
@@ -367,30 +396,25 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 
 // reorderDumpObjects stably partitions one database's objects for restore:
 // sequences first — a table DEFAULT nextval requires the sequence to exist at
-// create time — then ordinary and external tables, then views, which may
-// depend on any earlier object. The parallel slices are reordered in place;
-// it returns the index of the first view (or len(tables) when there is none).
-func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) int {
+// create time — while every other entry keeps its registry order; collected
+// views produce no per-object output in this loop and are emitted globally
+// after all selected databases. The parallel slices are reordered in place.
+func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) {
 	n := len(tables)
-	rank := func(kind string) int {
-		switch kind {
-		case catalog.SystemSequenceRel:
-			return 0
-		case catalog.SystemViewRel:
-			return 2
-		default:
-			return 1
-		}
-	}
-	counts := [3]int{}
+	counts := [2]int{}
 	ranks := make([]int, n)
 	for i, tbl := range tables {
-		r := rank(tbl.Kind)
+		r := 1
+		if tbl.Kind == catalog.SystemSequenceRel {
+			r = 0
+		}
 		ranks[i] = r
 		counts[r]++
 	}
-	starts := [3]int{}
-	for r := 1; r < 3; r++ {
+	starts := [2]int{}
+	// starts[1] is the number of sequence entries and doubles as the length of
+	// the non-view prefix the emit loop walks in registry order.
+	for r := 1; r < 2; r++ {
 		starts[r] = starts[r-1] + counts[r-1]
 	}
 	next := starts
@@ -407,7 +431,6 @@ func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) 
 	copy(createTable, newCreate)
 	copy(stateSQL, newState)
 	copy(tables, newTables)
-	return starts[2]
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
@@ -436,52 +459,6 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	return conn, nil
 }
 
-func adjustViewOrder(createTable []string, tables Tables, start int) {
-	viewName := make([]string, 0)
-	viewPos := make(map[string]int)
-	cnt := len(tables)
-	for i := start; i < cnt; i++ {
-		viewPos[tables[i].Name] = i - start
-		viewName = append(viewName, tables[i].Name)
-	}
-	viewCount := make([]int, len(viewName))
-	viewRef := make([][]int, len(viewName))
-	for i := start; i < cnt; i++ {
-		for j := start; j < cnt; j++ {
-			if i == j {
-				continue
-			}
-			if strings.Count(createTable[i], tables[j].Name) > 0 {
-				viewCount[viewPos[tables[i].Name]]++
-				viewRef[viewPos[tables[j].Name]] = append(viewRef[viewPos[tables[j].Name]], viewPos[tables[i].Name])
-			}
-		}
-	}
-	order := 0
-	orderArr := make([]int, 0)
-	visit := make([]bool, len(viewName))
-	for order < len(viewName) {
-		for i := 0; i < len(viewName); i++ {
-			if viewCount[i] == 0 && !visit[i] {
-				visit[i] = true
-				order++
-				orderArr = append(orderArr, i)
-				for j := 0; j < len(viewRef[i]); j++ {
-					viewCount[viewRef[i][j]]--
-				}
-			}
-		}
-	}
-	newCreate := make([]string, cnt)
-	newTables := make([]Table, cnt)
-	for i := 0; i < len(orderArr); i++ {
-		newCreate[i] = createTable[orderArr[i]+start]
-		newTables[i] = tables[orderArr[i]+start]
-	}
-	_ = copy(createTable[start:], newCreate)
-	_ = copy(tables[start:], newTables)
-}
-
 func showCreateTable(out *dumpSink, createSql string, withNextLine bool) {
 	var suffix string
 	if !strings.HasSuffix(createSql, ";") {
@@ -492,12 +469,13 @@ func showCreateTable(out *dumpSink, createSql string, withNextLine bool) {
 	}
 	out.printf("%s%s\n", createSql, suffix)
 }
+
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
-	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
+	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {
 		sql += " and account_id = 0"
 	}
-	r, err := conn.Query(sql)
+	r, err := conn.QueryContext(ctx, sql, db)
 	if err != nil {
 		return Db{}, err
 	}
@@ -512,6 +490,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 		}
 		dbs = append(dbs, Db{dbName, dbType})
 	}
+	if err := r.Err(); err != nil {
+		return Db{}, err
+	}
 	if len(dbs) != 1 {
 		return Db{}, moerr.NewInvalidInput(ctx, fmt.Sprintf("database %s not exists", db))
 	}
@@ -519,7 +500,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 }
 
 func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
-	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
+	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
+	args := make([]any, 0, len(tables)+1)
+	args = append(args, db)
 	if isSys {
 		sql += " and account_id = 0"
 	}
@@ -530,12 +513,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 			if i != 0 {
 				sql += ","
 			}
-			sql += "'" + tbl.Name + "'"
+			sql += "?"
+			args = append(args, tbl.Name)
 			tableNames[tbl.Name] = false
 		}
 		sql += ")"
 	}
-	r, err := conn.Query(sql) //TODO: after unified sys table prefix, add condition in where clause
+	r, err := conn.QueryContext(ctx, sql, args...) //TODO: after unified sys table prefix, add condition in where clause
 	if err != nil {
 		return nil, err
 	}
@@ -571,8 +555,38 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	return tables, nil
 }
 
+// systemDatabases are the databases the MatrixOne platform itself creates
+// in every account. -db all is a whole user backup, and these relations are
+// engine internals: mo_catalog alone contains every relkind, and sending
+// them through the ordinary-table dispatcher fails a clean tenant's export
+// (matrixorigin/matrixone#30601). The list mirrors catalog.SystemDatabases
+// from the MatrixOne server.
+var systemDatabases = map[string]struct{}{
+	"information_schema": {},
+	"mo_catalog":         {},
+	"mo_debug":           {},
+	"mo_task":            {},
+	"mysql":              {},
+	"system":             {},
+	"system_metrics":     {},
+}
+
+// filterUserDatabases removes built-in system databases from a SHOW
+// DATABASES result. Matching is exact: a user database whose name merely
+// starts like a system name is kept.
+func filterUserDatabases(dbs []string) []string {
+	kept := make([]string, 0, len(dbs))
+	for _, db := range dbs {
+		if _, isSystem := systemDatabases[db]; isSystem {
+			continue
+		}
+		kept = append(kept, db)
+	}
+	return kept
+}
+
 func getCreateDB(db string) (string, error) {
-	r := conn.QueryRow("show create database `" + db + "`")
+	r := conn.QueryRow("show create database " + quoteIdentifier(db))
 	var create string
 	err := r.Scan(&db, &create)
 	if err != nil {
@@ -605,52 +619,10 @@ func getDatabases(ctx context.Context) ([]string, error) {
 	return dbs, nil
 }
 
-// systemDatabases are the databases the MatrixOne platform itself creates
-// in every account. -db all is a whole user backup, and these relations are
-// engine internals: mo_catalog alone contains every relkind, and sending
-// them through the ordinary-table dispatcher fails a clean tenant's export
-// (matrixorigin/matrixone#30601). The list mirrors catalog.SystemDatabases
-// from the MatrixOne server.
-var systemDatabases = map[string]struct{}{
-	"information_schema": {},
-	"mo_catalog":         {},
-	"mo_debug":           {},
-	"mo_task":            {},
-	"mysql":              {},
-	"system":             {},
-	"system_metrics":     {},
-}
-
-// filterUserDatabases removes built-in system databases from a SHOW
-// DATABASES result. Matching is exact: a user database whose name merely
-// starts like a system name is kept.
-func filterUserDatabases(dbs []string) []string {
-	kept := make([]string, 0, len(dbs))
-	for _, db := range dbs {
-		if _, isSystem := systemDatabases[db]; isSystem {
-			continue
-		}
-		kept = append(kept, db)
-	}
-	return kept
-}
-
 func getCreateTable(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
+	r := conn.QueryRow("show create table " + quoteIdentifier(db) + "." + quoteIdentifier(tbl))
 	var create string
 	err := r.Scan(&tbl, &create)
-	if err != nil {
-		return "", err
-	}
-	return create, nil
-}
-
-func getCreateView(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
-	var create string
-	var character_set_client string
-	var collation_connection string
-	err := r.Scan(&tbl, &create, &character_set_client, &collation_connection)
 	if err != nil {
 		return "", err
 	}
@@ -670,7 +642,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		bufPool.Put(curBuf)
 	}()
 	buf.Grow(netBufferLength)
-	initInert := "INSERT INTO `" + tbl + "` VALUES "
+	initInert := "INSERT INTO " + quoteIdentifier(tbl) + " VALUES "
 	for {
 		buf.WriteString(initInert)
 		preLen := buf.Len()
@@ -769,10 +741,12 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		return err
 	}
 	pwd := os.Getenv("PWD")
+	quotedPath := quoteString(fmt.Sprintf("%s/%s", pwd, publishedName))
+	quotedDelim := quoteString(string(csvConf.fieldDelimiter))
 	if localInfile {
-		out.printf("LOAD DATA LOCAL INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, publishedName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	} else {
-		out.printf("LOAD DATA INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, publishedName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	}
 	return out.Err()
 }
@@ -889,7 +863,7 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 }
 
 func genOutput(db string, tbl string, out *dumpSink, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
-	querySql := "select * from `" + db + "`.`" + tbl + "`"
+	querySql := "select * from " + quoteIdentifier(db) + "." + quoteIdentifier(tbl)
 	if condition != "" {
 		querySql += " where " + condition
 	}

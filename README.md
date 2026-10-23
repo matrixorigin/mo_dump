@@ -35,7 +35,13 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 
 ### 构建 mo-dump 二进制文件
-__Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需要安装部署 <a href="https://go.dev/doc/install" target="_blank">Go</a> 语言。
+__Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</a>（支持自动工具链选择的 Go 1.21 或更新版本）、C/C++ 编译器、`make`、`tar` 和 `shasum`。构建会选用 `go.mod` 指定的 Go 1.26.4，从固定版本 MatrixOne 模块的已校验源码归档构建静态 jemalloc，不需要安装整个 MatrixOne 内核或在运行时携带 jemalloc 动态库。
+
+视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集，对真实循环返回错误而不是无限重排。分析和恢复使用每个视图在 `mo_catalog.mo_tables.viewdef` 中持久化的源语句、默认库及解析模式，不使用导出连接的 SQL mode 猜测视图语法。保留源语句内容；持久化语句为 `ALTER VIEW` 时，仅将首个语句动词改为 `CREATE`，用于在空目标上重建视图。历史记录缺少模式字段时遵循服务端 legacy 规则。元数据缺失或损坏会明确报错；若 `DefaultDatabase` 缺失、为 null 或空字符串，且视图需要解析未限定数据库的物理关系，也会明确拒绝导出，不猜测其所属库就是创建默认库。无需默认库的常量、CTE-only 和全限定引用仍可导出。
+
+恢复脚本会为每个视图保存当前 `@@SESSION.sql_mode`，通过 `SET SESSION sql_mode` 临时应用其持久化解析标志，并保留目标会话的非解析策略；成功执行该视图段落后恢复原 SQL mode。不修改全局 SQL mode 或目标的 `lower_case_table_names`，目标仍需兼容的名称解析规则。导入客户端必须正确切分语句并支持这些会话设置，尤其是 `NO_BACKSLASH_ESCAPES` 字面量；不能仅凭导入退出码判断恢复完整。恢复不是原子操作，出错时可能留下部分对象或尚未恢复的会话设置。
+
+导出时先输出所有选中数据库的普通表及数据，再对选中的跨库视图统一依赖排序。未选中的外部对象和历史快照仍需在恢复环境中可用。
 
 1. 执行下面的代码即可从 MatrixOrigin/mo_dump 源代码构建 `mo-dump` 二进制文件：
 
@@ -46,6 +52,15 @@ __Tips:__ 由于 `mo-dump` 是基于 Go 语言进行开发，所以你同时需�
     ```
 
 2. 你可以在 mo_dump 文件夹中找到 `mo-dump` 可执行文件：*mo-dump*。
+
+3. `make test` 会使用相同 Go 工具链及当前工作区 native 依赖运行测试。直接执行 Go 命令时先运行 `make jemalloc`，并设置：
+
+    ```sh
+    export GOTOOLCHAIN=go1.26.4 GOWORK=off
+    export CGO_CFLAGS="-I$PWD/thirdparties/install/include"
+    export CGO_LDFLAGS="-L$PWD/thirdparties/install/lib"
+    go test -mod=readonly ./...
+    ```
 
 !!! note
     构建好的 `mo-dump` 文件也可以在相同的硬件平台上工作。但是需要注意在 x86 平台中构建的 `mo-dump` 二进制文件在 Darwin ARM 平台中则无法正常工作。你可以在同一套操作系统和硬件平台内构建并使用 `mo-dump` 二进制文件。`mo-dump` 目前只支持 Linux 和 macOS。

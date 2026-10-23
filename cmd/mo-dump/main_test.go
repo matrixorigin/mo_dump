@@ -368,19 +368,31 @@ func TestDumpExitStatus(t *testing.T) {
 			return
 		}
 		_, mock := exportTestDB(t)
-		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
-		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db' and relname in ('t')").
-			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", "r"))
-		mock.ExpectQuery("show create table `db`.`t`").
-			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
-		payload := strings.Repeat("x", minNetBufferLength/2)
-		rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("TEXT", "")).
-			AddRow(payload).AddRow(payload).AddRow(payload)
-		if mode == "cancel" {
-			rows.RowError(2, context.Canceled)
+		kind := "r"
+		if mode == "empty_default" {
+			kind = "v"
 		}
-		mock.ExpectQuery("select * from `db`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs("db", "t").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
+		if mode == "empty_default" {
+			// Inject incomplete persisted metadata at the catalog boundary,
+			// then exercise the real CLI's error/exit/success-marker contract.
+			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "t").
+				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`)).RowsWillBeClosed()
+			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
+		} else {
+			mock.ExpectQuery("show create table `db`.`t`").
+				WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
+			payload := strings.Repeat("x", minNetBufferLength/2)
+			rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("TEXT", "")).
+				AddRow(payload).AddRow(payload).AddRow(payload)
+			if mode == "cancel" {
+				rows.RowError(2, context.Canceled)
+			}
+			mock.ExpectQuery("select * from `db`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+		}
 		mock.ExpectClose()
 		flag.CommandLine = flag.NewFlagSet("mo-dump", flag.ExitOnError)
 		os.Args = []string{"mo-dump", "-db", "db", "-tbl", "t", "-net-buffer-length", "16384"}
@@ -389,7 +401,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel", "all_system_dbs"} {
+	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -399,6 +411,16 @@ func TestDumpExitStatus(t *testing.T) {
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err := cmd.Run()
 			require.NoError(t, ctx.Err(), "child process did not terminate")
+			if mode == "empty_default" {
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr)
+				require.Equal(t, 1, exitErr.ExitCode())
+				require.Contains(t, stderr.String(), "modump error: analyze view db.t: empty default database")
+				// The dump is staged until it completes, so the failed view
+				// analysis leaves stdout completely unpublished.
+				require.Empty(t, stdout.String(), "a failed dump must publish nothing")
+				return
+			}
 			if mode == "cancel" {
 				var exitErr *exec.ExitError
 				require.ErrorAs(t, err, &exitErr)
@@ -618,10 +640,16 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	adjustViewOrder(createTable, tables, start)
-	for i := 0; i < len(createTable); i++ {
-		require.Equal(t, createTable[i], createTarget[i])
-		require.Equal(t, tables[i], tableTarget[i])
+	views := make([]dumpView, 0, len(tables)-start)
+	for i := start; i < len(tables); i++ {
+		views = append(views, dumpView{name: viewName{"db", tables[i].Name}, create: createTable[i]})
+	}
+	ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
+	require.NoError(t, err)
+	require.Len(t, ordered, len(tables)-start)
+	for i, view := range ordered {
+		require.Equal(t, createTarget[i+start], view.create)
+		require.Equal(t, tableTarget[i+start].Name, view.name.name)
 	}
 }
 
@@ -986,32 +1014,37 @@ func TestGetCreateTable(t *testing.T) {
 	}
 }
 
-func TestGetCreateView(t *testing.T) {
-	// create mock database
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock database: %v", err)
+func TestGetDumpView(t *testing.T) {
+	mock, _ := mockDumpOutput(t)
+	create := "CREATE VIEW table1_view as SELECT * FROM table1"
+	mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("table1_view", viewDefinitionJSON(t, "db1", create, "")))
+	view, err := getDumpView(context.Background(), "db1", "table1_view", false)
+	require.NoError(t, err)
+	require.Equal(t, viewName{"db1", "table1_view"}, view.name)
+	require.Equal(t, create, view.create)
+	require.NotNil(t, view.definition)
+	require.NotNil(t, view.definition.SQLMode)
+	require.Empty(t, *view.definition.SQLMode)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// runDumpDataOverStdout executes dumpData on a buffered sink and mirrors the
+// produced script to real stdout whether or not the dump succeeded. The CLI
+// itself stages the script and only publishes complete dumps; this helper
+// keeps the merged view tests' "capture stdout" fixtures meaningful by
+// reproducing the old streaming observation points for assertions, including
+// the sub-prefix a failed dump produced before its error.
+func runDumpDataOverStdout(t *testing.T, opt *Options, ctx context.Context) error {
+	t.Helper()
+	var buf bytes.Buffer
+	sink := sinkOver(&buf)
+	err := opt.dumpData(ctx, sink)
+	if err == nil {
+		err = sink.Err()
 	}
-	defer db.Close()
-
-	rows := sqlmock.NewRows([]string{"Table", "Create"}).
-		AddRow("table1_view", "CREATE VIEW table1_view as SELECT * FROM table1")
-
-	mock.ExpectQuery("show create table").WillReturnRows(rows)
-	conn = db
-
-	// check the results
-	createTable, err := getCreateTable("db1", "table1_view")
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
+	_, werr := os.Stdout.WriteString(buf.String())
+	if err == nil {
+		err = werr
 	}
-
-	expectedCreateTable := "CREATE VIEW table1_view as SELECT * FROM table1"
-	if createTable != expectedCreateTable {
-		t.Errorf("Unexpected create table statement. Expected: %s, Got: %s", expectedCreateTable, createTable)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("Unfulfilled expectations: %s", err)
-	}
+	return err
 }

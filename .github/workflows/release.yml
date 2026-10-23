@@ -24,7 +24,7 @@ jobs:
       - name: Use Golang
         uses: actions/setup-go@v4
         with:
-          go-version: "1.20.11"
+          go-version-file: go.mod
           cache: false
       - name: Build normal
         run: |
@@ -32,6 +32,7 @@ jobs:
 
           mkdir -p mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-x86_64
           mv mo-dump mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-x86_64/
+          cp LICENSE thirdparties/LICENSE.jemalloc mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-x86_64/
           zip -r mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-x86_64.zip mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-x86_64
       - name: Upload Release normal linux x86_64
         uses: actions/upload-release-asset@v1.0.1
@@ -60,7 +61,7 @@ jobs:
       - name: Use Golang
         uses: actions/setup-go@v4
         with:
-          go-version: "1.20.11"
+          go-version-file: go.mod
           cache: false
       - name: Build normal
         run: |
@@ -68,6 +69,7 @@ jobs:
           
           mkdir -p mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-arm64/
           mv mo-dump mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-arm64/
+          cp LICENSE thirdparties/LICENSE.jemalloc mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-arm64/
           zip -r mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-arm64.zip mo-dump-${{ steps.get_release.outputs.tag_name }}-linux-arm64
 
       - name: Upload Release normal linux arm64
@@ -104,7 +106,7 @@ jobs:
       - name: Use Golang
         uses: actions/setup-go@v4
         with:
-          go-version: "1.20.11"
+          go-version-file: go.mod
           cache: false
       - name: Build normal
         run: |
@@ -146,6 +148,7 @@ jobs:
         
           # rename filepath
           cd .. && mv ./mo-dump-darwin mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-x86_64
+          cp LICENSE thirdparties/LICENSE.jemalloc mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-x86_64/
           
           zip -r mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-x86_64.zip mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-x86_64
 
@@ -180,9 +183,11 @@ jobs:
         uses: bruceadams/get-release@v1.3.2
         env:
           GITHUB_TOKEN: ${{ secrets.TOKEN_ACTION }}
-      - name: Check go version
-        run: |
-          go version
+      - name: Use Golang
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Build normal
         run: |
           make build
@@ -211,6 +216,7 @@ jobs:
 
           # rename filepath
           cd .. && mv ./mo-dump-darwin mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-arm64
+          cp LICENSE thirdparties/LICENSE.jemalloc mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-arm64/
 
           zip -r mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-arm64.zip mo-dump-${{ steps.get_release.outputs.tag_name }}-darwin-arm64
       - name: Upload Release normal darwin arm64
