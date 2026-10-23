@@ -48,12 +48,15 @@ const (
 	tablesScopePredicate = " and (account_id = current_account_id() or (account_id = 0 and " +
 		"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 
-	// Hidden helpers are identified by relkind, never by name. A name-based
-	// prefix LIKE also swallowed ordinary tables such as demo_index_data
-	// ('_' is a single-character wildcard), and helper-table names are
-	// legal object names in ordinary databases (mo_increment_columns,
-	// __mo_account_lock and __mo_index_* prefixes alike).
-	metadataHiddenPredicate = " and relkind <> 'i'" +
+	// Hidden helpers are excluded by a compound predicate: the literal
+	// __mo_index_ name prefix (underscores escaped, '_' is a single-character
+	// LIKE wildcard that also swallowed demo_index_data) combined with a
+	// dumpable-relkind gate (r/v/e). A bare kind predicate cannot cover all
+	// hidden kinds: unique/secondary are 'i' since MO v3.0 and empty before,
+	// fulltext/vector helpers carry per-role kinds (fulltext, metadata,
+	// centroids, entries, ...). User objects legally named __mo_index_* with a
+	// dumpable relkind stay dump payloads.
+	hiddenHelpersPredicate = " and not (relname like '\\_\\_mo\\_index\\_%' and relkind not in ('r','v','e'))" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'" +
 		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
@@ -117,8 +120,8 @@ func TestGetTablesScopedQuery(t *testing.T) {
 	// emitted predicates: hidden helpers are filtered away by the query
 	// itself, so user tables named __mo_user_data and %!%plain survive, and
 	// same-named helper objects in ordinary databases survive too.
-	defaultSQL := baseSQL("d") + tablesScopePredicate + metadataHiddenPredicate
-	sysSQL := baseSQL("d") + " and account_id = 0" + metadataHiddenPredicate
+	defaultSQL := baseSQL("d") + tablesScopePredicate + hiddenHelpersPredicate
+	sysSQL := baseSQL("d") + " and account_id = 0" + hiddenHelpersPredicate
 
 	t.Run("default returns user __mo_ tables instead of dropping them (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
@@ -148,7 +151,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 
-	t.Run("sys account keeps account_id = 0 and the hidden-relkind predicates", func(t *testing.T) {
+	t.Run("sys account keeps account_id = 0 and the hidden-helper predicates", func(t *testing.T) {
 		mock := newCatalogMock(t)
 		// Rows as returned by the server after the emitted predicates: no
 		// relkind='i' index-table row survives the query itself.
@@ -188,7 +191,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("mo_catalog dump still excludes its own helper tables", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		catalogSQL := baseSQL("mo_catalog") + tablesScopePredicate + metadataHiddenPredicate + catalogHelpersPredicate
+		catalogSQL := baseSQL("mo_catalog") + tablesScopePredicate + hiddenHelpersPredicate + catalogHelpersPredicate
 		// The pre-filtered result the server returns for mo_catalog itself.
 		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("mo_database", "r").
