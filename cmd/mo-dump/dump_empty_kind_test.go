@@ -44,7 +44,7 @@ func TestDumpDataEmptyRelKind(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	// getTables
 	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'd'" +
-		tablesScopePredicate + hiddenHelpersPredicate + " and relname in ('__mo_index_renamed')").
+		tablesScopePredicate + hiddenHelpersFor("d") + " and relname in ('__mo_index_renamed')").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("__mo_index_renamed", ""))
 	// getCreateTable on the empty-kind object
 	mock.ExpectQuery("show create table `d`.`__mo_index_renamed`").
@@ -82,11 +82,69 @@ func TestDumpDataEmptyRelKindNotSilent(t *testing.T) {
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'd'" + dbScopePredicate).
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'd'" +
-		tablesScopePredicate + hiddenHelpersPredicate + " and relname in ('whatever')").
+		tablesScopePredicate + hiddenHelpersFor("d") + " and relname in ('whatever')").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("whatever", "somefuturekind"))
 
 	err := opt.dumpData(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not supported")
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestGetCreateTableRequiresHead covers the review round-5 guard: server
+// versions whose SHOW CREATE TABLE output lacks the statement head for
+// empty-relkind tables must produce a loud error, not a "successful" dump
+// that cannot be restored. The CREATE EXTERNAL TABLE shape stays valid.
+func TestGetCreateTableRequiresHead(t *testing.T) {
+	cases := []struct {
+		name    string
+		tbl     string
+		sql     string
+		output  string
+		wantErr string
+	}{
+		{
+			name:   "ordinary table keeps passing",
+			tbl:    "t",
+			sql:    "show create table `d`.`t`",
+			output: "CREATE TABLE `t` (\n  `id` int NOT NULL\n)",
+		},
+		{
+			name:   "external table shape keeps passing",
+			tbl:    "e",
+			sql:    "show create table `d`.`e`",
+			output: "CREATE EXTERNAL TABLE `e` (...)",
+		},
+		{
+			name:    "fragment without head fails loudly (review round 5)",
+			tbl:     "__mo_index_renamed",
+			sql:     "show create table `d`.`__mo_index_renamed`",
+			output:  "(`id` int NOT NULL)",
+			wantErr: "missing CREATE statement head",
+		},
+		{
+			name:    "empty output fails loudly",
+			tbl:     "x",
+			sql:     "show create table `d`.`x`",
+			output:  "",
+			wantErr: "missing CREATE statement head",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, mock := exportTestDB(t)
+			mock.ExpectQuery(tc.sql).WillReturnRows(
+				sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("x", tc.output))
+			got, err := getCreateTable("d", tc.tbl)
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				assert.Empty(t, got)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.output, got)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }

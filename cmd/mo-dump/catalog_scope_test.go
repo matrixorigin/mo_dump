@@ -48,19 +48,26 @@ const (
 	tablesScopePredicate = " and (account_id = current_account_id() or (account_id = 0 and " +
 		"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 
-	// Hidden index helpers are identified by their registration in
-	// mo_catalog.mo_indexes.index_table_name (the column exists under this
-	// exact name from MO v1.2 on); name or kind shortcuts silently dropped
-	// user objects, see getTables.
-	hiddenHelpersPredicate = " and relname not in (select index_table_name from mo_catalog.mo_indexes" +
-		" where index_table_name is not null and index_table_name <> '')" +
-		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'" +
-		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
-
 	catalogHelpersPredicate = " and relname != 'mo_increment_columns'" +
 		" and relname != '__mo_account_lock'"
 )
+
+// Hidden index helpers are identified by their per-database registration
+// in mo_catalog.mo_indexes.index_table_name (the column exists under this
+// exact name from MO v1.2 on), joined through mo_database with the same
+// account scoping mo-dump uses for getDatabaseType, so helpers of other
+// databases can never match a same-named user object here.
+var hiddenHelpersFor = func(db string) string {
+	return " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+		" where d.datname = '" + db + "'" +
+		" and (d.account_id = current_account_id()" +
+		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+		" and i.index_table_name is not null and i.index_table_name <> '')" +
+		" and relkind <> 'partition'" +
+		" and relkind <> 'temporary_table'" +
+		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
+}
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 	const (
@@ -117,8 +124,8 @@ func TestGetTablesScopedQuery(t *testing.T) {
 	// emitted predicates: hidden helpers are filtered away by the query
 	// itself, so user tables named __mo_user_data and %!%plain survive, and
 	// same-named helper objects in ordinary databases survive too.
-	defaultSQL := baseSQL("d") + tablesScopePredicate + hiddenHelpersPredicate
-	sysSQL := baseSQL("d") + " and account_id = 0" + hiddenHelpersPredicate
+	defaultSQL := baseSQL("d") + tablesScopePredicate + hiddenHelpersFor("d")
+	sysSQL := baseSQL("d") + " and account_id = 0" + hiddenHelpersFor("d")
 
 	t.Run("default returns user __mo_ tables instead of dropping them (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
@@ -192,7 +199,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("mo_catalog dump still excludes its own helper tables", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		catalogSQL := baseSQL("mo_catalog") + tablesScopePredicate + hiddenHelpersPredicate + catalogHelpersPredicate
+		catalogSQL := baseSQL("mo_catalog") + tablesScopePredicate + hiddenHelpersFor("mo_catalog") + catalogHelpersPredicate
 		// The pre-filtered result the server returns for mo_catalog itself.
 		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("mo_database", "r").

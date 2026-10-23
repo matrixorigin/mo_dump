@@ -352,7 +352,7 @@ func TestDumpExitStatus(t *testing.T) {
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'" + dbScopePredicate).
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db'" +
-			tablesScopePredicate + hiddenHelpersPredicate + " and relname in ('t')").
+			tablesScopePredicate + hiddenHelpersFor("db") + " and relname in ('t')").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", "r"))
 		mock.ExpectQuery("show create table `db`.`t`").
 			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))

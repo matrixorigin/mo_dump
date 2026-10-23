@@ -460,13 +460,15 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 	}
 	// Hidden index helpers are identified by the real index association,
-	// not by name or relkind guesses (review rounds 2-4): every index writes
-	// its helper table name into mo_catalog.mo_indexes.index_table_name (the
-	// column exists under this exact name from MO v1.2 through current
-	// releases), so anything registered there is a helper and is excluded,
-	// regardless of which relkind its row carries ('i', 'fulltext',
-	// 'metadata'/'centroids'/'entries', '' on pre-v3.0 clusters, or a kind a
-	// future index algorithm introduces).
+	// not by name or relkind guesses (review rounds 2-5): every index writes
+	// its helper table name into mo_catalog.mo_indexes.index_table_name for
+	// the database that owns the indexed table (the column exists under
+	// this exact name from MO v1.2 through current releases). The lookup is
+	// scoped to the dumped database through mo_catalog.mo_database with the
+	// same account scoping mo-dump uses for getDatabaseType, so a helper
+	// registered for another database can never match a same-named user
+	// object here — review round 5 found the unscoped subquery silently
+	// dropping user tables of other databases.
 	// Name- and kind-based shortcuts were rejected because they silently
 	// dropped user objects: a plain '_' wildcard pattern swallowed
 	// demo_index_data, and an unrecognizable relkind swallowed user tables
@@ -474,14 +476,20 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	// a __mo_index_* colliding name. Objects that reach the export switch
 	// with an unsupported (non r/v/e) relkind now fail loudly instead; the
 	// empty relkind itself is handled as an ordinary user table in
-	// dumpData, because the server only blanks the kind of colliding
-	// CREATE TABLE names while the object stays a fully usable table
-	// (verified via SHOW CREATE TABLE / SELECT).
+	// dumpData, because on current clusters the object stays a fully
+	// usable table (verified via SHOW CREATE TABLE / SELECT); on clusters
+	// whose SHOW CREATE output lacks the statement head for such objects,
+	// getCreateTable rejects the fragment instead of emitting a dump that
+	// cannot be restored.
 	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
 	// with the name of a catalog helper are regular dump payloads and must
 	// never be skipped silently.
-	sql += " and relname not in (select index_table_name from mo_catalog.mo_indexes" +
-		" where index_table_name is not null and index_table_name <> '')" +
+	sql += " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+		" where d.datname = '" + db + "'" +
+		" and (d.account_id = current_account_id()" +
+		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'" +
 		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
@@ -578,6 +586,17 @@ func getCreateTable(db, tbl string) (string, error) {
 	err := r.Scan(&tbl, &create)
 	if err != nil {
 		return "", err
+	}
+	// Review round 5: on some server versions (verified on MO v1.2.4) SHOW
+	// CREATE TABLE returns a fragment without the statement head for tables
+	// recorded with an empty relkind (e.g. restored under a colliding
+	// __mo_index_* or helper name). Emitting such a fragment would produce a
+	// dump that reports success but cannot be restored, so require the head
+	// and fail loudly. "CREATE " (not "CREATE TABLE") also accepts the
+	// CREATE EXTERNAL TABLE shape used by the external-table branch.
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(create)), "CREATE ") {
+		return "", moerr.NewInternalErrorNoCtxf(
+			"invalid SHOW CREATE TABLE output for table `%s`.`%s`: missing CREATE statement head, got: %.80q", db, tbl, create)
 	}
 	return create, nil
 }
