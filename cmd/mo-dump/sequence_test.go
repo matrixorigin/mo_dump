@@ -350,8 +350,9 @@ func TestFilterUserDatabases(t *testing.T) {
 	require.Empty(t, filterUserDatabases(nil))
 }
 
-// TestDumpDataExternalTableScript pins the unchanged external-table emit
-// now that ordering also handles sequences.
+// TestDumpDataExternalTableScript pins the issue-30559 external-table emit
+// — the section carries the plain DROP/CREATE statements and no comment
+// marker — after object ordering began to handle sequences.
 func TestDumpDataExternalTableScript(t *testing.T) {
 	ctx := context.Background()
 	_, mock := exportTestDB(t)
