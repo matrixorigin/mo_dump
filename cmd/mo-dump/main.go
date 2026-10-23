@@ -296,7 +296,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				// (matrixorigin/matrixone#30577). isSys scopes the catalog
 				// metadata query to the sys account, where mo_catalog is not
 				// tenant-isolated; a state-carrying dump exports the allocation
-				// replay, -no-data the legal definition only.
+				// replay, while -no-data exports the legal definition only.
 				var state string
 				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount, !opt.noData)
 				stateSQL[i] = state
@@ -750,7 +750,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig, out *dumpSink) error {
 	// The csv data file is staged under a name unique to this run and is
 	// renamed to its published name only after the whole dump succeeded, so
-	// a failed run can not replace the files of a previous dump.
+	// a failed run cannot replace the files of a previous dump.
 	f, publishedName, err := out.startCsv(db, tbl)
 	if err != nil {
 		return err

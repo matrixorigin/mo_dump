@@ -40,16 +40,17 @@ type csvArtifact struct {
 
 // dumpSink owns everything a single dump run writes: the SQL script, staged
 // in a temporary file until the run completes, and per-table csv data files,
-// staged beside their published name. The sink records write errors
-// (bufio.Writer hides them until flush) so the run can stop early.
+// staged under a hidden name until their run-unique published name is
+// rename-published. The sink records write errors (bufio.Writer hides them
+// until flush) so the run can stop early.
 type dumpSink struct {
 	w  io.Writer     // SQL text destination
 	bw *bufio.Writer // buffered wrapper over f, nil for direct sinks
 	f  *os.File      // SQL spool file, nil for direct sinks
-	// csv ports the staged per-table csv files; publishedAll is set only
-	// after the complete run was published, so a discard triggered by a
-	// failed run also removes files that were already renamed before the
-	// failure: a partial new backup set never survives.
+	// csv tracks the staged per-table csv data files; publishedAll is set
+	// only after the complete run was published, so a discard triggered
+	// by a failed run also removes files that were already renamed before
+	// the failure: a partial new backup set never survives.
 	csv          []csvArtifact
 	publishedAll bool
 	err          error // first write error, sticky
@@ -180,7 +181,11 @@ func (s *dumpSink) abortCsv(f *os.File) {
 // csv file already published by a partially succeeded publish — a new backup
 // set that was never completed must vanish rather than coexist with the
 // operator's previous files, which the reservation guarantees were never
-// touched. After a complete publish it is a no-op: nothing is owned anymore.
+// touched. Entries already renamed are cleaned at their published name
+// only: after the rename the staged hidden name belongs to the shared
+// namespace again and may even carry a concurrent run's new file
+// (matrixorigin/matrixone#30577). After a complete publish it is a no-op:
+// nothing is owned anymore.
 func (s *dumpSink) discard() {
 	if s.publishedAll {
 		return
