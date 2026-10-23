@@ -31,6 +31,7 @@ import (
 	"unicode/utf8"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -349,19 +350,31 @@ func TestGenOutputClosesRows(t *testing.T) {
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
 		_, mock := exportTestDB(t)
-		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'db'").
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
-		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'db' and relname in ('t')").
-			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", "r"))
-		mock.ExpectQuery("show create table `db`.`t`").
-			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
-		payload := strings.Repeat("x", minNetBufferLength/2)
-		rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("TEXT", "")).
-			AddRow(payload).AddRow(payload).AddRow(payload)
-		if mode == "cancel" {
-			rows.RowError(2, context.Canceled)
+		kind := "r"
+		if mode == "empty_default" {
+			kind = "v"
 		}
-		mock.ExpectQuery("select * from `db`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs("db", "t").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
+		if mode == "empty_default" {
+			// Inject incomplete persisted metadata at the catalog boundary,
+			// then exercise the real CLI's error/exit/success-marker contract.
+			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "t").
+				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`)).RowsWillBeClosed()
+			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
+		} else {
+			mock.ExpectQuery("show create table `db`.`t`").
+				WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (payload TEXT)"))
+			payload := strings.Repeat("x", minNetBufferLength/2)
+			rows := sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("TEXT", "")).
+				AddRow(payload).AddRow(payload).AddRow(payload)
+			if mode == "cancel" {
+				rows.RowError(2, context.Canceled)
+			}
+			mock.ExpectQuery("select * from `db`.`t`").WillReturnRows(rows).RowsWillBeClosed()
+		}
 		mock.ExpectClose()
 		flag.CommandLine = flag.NewFlagSet("mo-dump", flag.ExitOnError)
 		os.Args = []string{"mo-dump", "-db", "db", "-tbl", "t", "-net-buffer-length", "16384"}
@@ -370,7 +383,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel"} {
+	for _, mode := range []string{"success", "cancel", "empty_default"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -380,6 +393,16 @@ func TestDumpExitStatus(t *testing.T) {
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err := cmd.Run()
 			require.NoError(t, ctx.Err(), "child process did not terminate")
+			if mode == "empty_default" {
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr)
+				require.Equal(t, 1, exitErr.ExitCode())
+				require.Contains(t, stderr.String(), "modump error: analyze view db.t: empty default database")
+				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
+				require.NotContains(t, stdout.String(), "CREATE VIEW")
+				require.NotContains(t, stdout.String(), "SET @modump_saved_sql_mode")
+				return
+			}
 			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
 			if mode == "cancel" {
 				var exitErr *exec.ExitError
@@ -571,6 +594,56 @@ func TestShowCreateTable(t *testing.T) {
 	os.Stdout = old
 }
 
+// TestDumpDataExternalTableCommentInjection guards the restore contract: an
+// external-table section must not emit any /* ... */ marker comment. Table names
+// are legal identifiers that may contain */ (e.g. `a*/b`), which would terminate
+// the comment early and inject bare SQL into the restore script, aborting restore
+// just like the original executable-comment marker (issue 30559).
+func TestDumpDataExternalTableCommentInjection(t *testing.T) {
+	dbName := "e2e_db"
+	tblName := "a*/b"
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	if err != nil {
+		t.Fatalf("Failed to create mock database: %v", err)
+	}
+	defer db.Close()
+
+	oldConn, oldStdout := conn, os.Stdout
+	conn = db
+	defer func() { conn = oldConn }()
+
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs(dbName).
+		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "user"))
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs(dbName, tblName).
+		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tblName, catalog.SystemExternalRel))
+	createSQL := "CREATE EXTERNAL TABLE `a*/b` (id INT) INFILE{'filepath'='/tmp/rows.csv'}"
+	mock.ExpectQuery("show create table `" + dbName + "`.`" + tblName + "`").
+		WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow(tblName, createSQL))
+
+	opt := &Options{dbs: []string{dbName}, tables: Tables{{tblName, ""}}}
+
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	err = opt.dumpData(context.Background())
+
+	e := w.Close()
+	require.Nil(t, e)
+	var out bytes.Buffer
+	_, e = out.ReadFrom(r)
+	require.Nil(t, e)
+	os.Stdout = oldStdout
+
+	require.NoError(t, err)
+	// A regular mysql client executes /*! ... */ comment content during restore,
+	// and plain /* ... */ comments are terminated early by legal table names
+	// containing */, so the external-table section must carry no comment at all.
+	require.False(t, strings.Contains(out.String(), "/*"),
+		"external table section must not emit comments, table %q can terminate block comments early", tblName)
+	require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestViewOrder(t *testing.T) {
 	start := 1
 	createTable := []string{
@@ -605,10 +678,16 @@ func TestViewOrder(t *testing.T) {
 		{Name: "t5"},
 		{Name: "t6"},
 	}
-	adjustViewOrder(createTable, tables, start)
-	for i := 0; i < len(createTable); i++ {
-		require.Equal(t, createTable[i], createTarget[i])
-		require.Equal(t, tables[i], tableTarget[i])
+	views := make([]dumpView, 0, len(tables)-start)
+	for i := start; i < len(tables); i++ {
+		views = append(views, dumpView{name: viewName{"db", tables[i].Name}, create: createTable[i]})
+	}
+	ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
+	require.NoError(t, err)
+	require.Len(t, ordered, len(tables)-start)
+	for i, view := range ordered {
+		require.Equal(t, createTarget[i+start], view.create)
+		require.Equal(t, tableTarget[i+start].Name, view.name.name)
 	}
 }
 
@@ -979,32 +1058,16 @@ func TestGetCreateTable(t *testing.T) {
 	}
 }
 
-func TestGetCreateView(t *testing.T) {
-	// create mock database
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("Failed to create mock database: %v", err)
-	}
-	defer db.Close()
-
-	rows := sqlmock.NewRows([]string{"Table", "Create"}).
-		AddRow("table1_view", "CREATE VIEW table1_view as SELECT * FROM table1")
-
-	mock.ExpectQuery("show create table").WillReturnRows(rows)
-	conn = db
-
-	// check the results
-	createTable, err := getCreateTable("db1", "table1_view")
-	if err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
-
-	expectedCreateTable := "CREATE VIEW table1_view as SELECT * FROM table1"
-	if createTable != expectedCreateTable {
-		t.Errorf("Unexpected create table statement. Expected: %s, Got: %s", expectedCreateTable, createTable)
-	}
-
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("Unfulfilled expectations: %s", err)
-	}
+func TestGetDumpView(t *testing.T) {
+	mock, _ := mockDumpOutput(t)
+	create := "CREATE VIEW table1_view as SELECT * FROM table1"
+	mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db1", "table1_view").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("table1_view", viewDefinitionJSON(t, "db1", create, "")))
+	view, err := getDumpView(context.Background(), "db1", "table1_view", false)
+	require.NoError(t, err)
+	require.Equal(t, viewName{"db1", "table1_view"}, view.name)
+	require.Equal(t, create, view.create)
+	require.NotNil(t, view.definition)
+	require.NotNil(t, view.definition.SQLMode)
+	require.Empty(t, *view.definition.SQLMode)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
