@@ -25,7 +25,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-csv**：默认值为 false。当设置为 true 时表示导出的数据为 *CSV* 格式。
 
-- **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。表示支持本地导出 *CSV* 文件。
+- **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。表示生成的恢复 SQL 使用 LOAD DATA LOCAL INFILE，读取客户端文件；false 使用 LOAD DATA INFILE，要求 CSV 可被服务端读取。
 
 - **-tbl [表名]**：可选参数。如果参数为空，则导出整个数据库。如果要备份指定表，则可以在命令中指定多个 `-tbl` 和表名。
 
@@ -81,10 +81,10 @@ __Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</
 ./mo-dump -u root -p 111 -h 127.0.0.1 -P 6001 -db t > t.sql
 ```
 
-如果你想将数据库 *t* 内的表导出为 *CSV* 格式，参考使用下面的命令：
+如果你想将数据库 *t* 内的表导出为 *CSV* 格式，参考使用下面的命令。标准输出是恢复 SQL，数据写入当前目录下的 `${databaseName}_${tableName}.csv`，两者都需保存：
 
 ```
-./mo-dump -u root -p 111  -db t -csv --local-infile=false > ttt.csv
+./mo-dump -u root -p 111  -db t -csv --local-infile=false > t.sql
 ```
 
 如果要在数据库中生成单个表的备份，可以运行以下命令。该命令将生成命名为 *t* 的数据库的 *t1* 表的备份，其中包含 *t.sql* 文件中的结构和数据。
@@ -107,4 +107,8 @@ mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db db1 -tbl tbl1,tbl2,tbl3 > /tm/al
 ```
 
 ## 限制
-* `mo-dump` 暂不支持只导出数据库的结构或数据。如果你想在没有数据库结构的情况下生成数据的备份，或者仅想导出数据库结构，那么，你需要手动拆分 `.sql` 文件。
+* `mo-dump -no-data` 支持仅导出数据库和表结构。暂不支持仅导出数据；需要手动拆分 SQL 时，应保留原始备份并验证恢复结果。
+
+## 验证导出与恢复
+
+在专用测试数据库中创建含 Unicode 和 NULL 的表，导出后先检查退出码，再将 SQL 恢复到隔离实例，逐主键比较全部字段。CSV 模式还需保留生成的 CSV 文件，核对 SQL 中的文件路径和 LOCAL 设置。仅有非空文件或相同行数不能证明备份完整；本工具不保证任意并发写入场景的跨表一致性快照。
