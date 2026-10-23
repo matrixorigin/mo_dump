@@ -67,7 +67,8 @@ const hiddenHelpersPredicate = " and relname not in (select i.index_table_name f
 	" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 	" and i.index_table_name is not null and i.index_table_name <> '')" +
 	" and relkind <> 'partition'" +
-	" and relkind <> 'temporary_table'"
+	" and relkind <> 'temporary_table'" +
+	" and not (lower(coalesce(rel_createsql, '')) like 'create temporary%')"
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 	const (

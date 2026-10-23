@@ -434,14 +434,15 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	// What remains is per-kind metadata:
 	//   - partition members carry relkind 'partition';
 	//   - session temporary tables carry relkind 'temporary_table' since
-	//     the v4.2 catalog rework. On the v4.0/v4.1 interim releases whose
-	//     temporary backing rows still carry relkind 'r' there is no
-	//     metadata to distinguish them from persistent tables, so the dump
-	//     stays complete: a live temporary backing table surfaces as a loud
-	//     error (or visible rows) instead of a silently dropped user table.
-	//     A former '__mo_tmp_<32hex>_' name regexp is gone for that reason
-	//     — it also swallowed persistent user tables legally named with
-	//     that shape (review round 5).
+	//     the v4.2 catalog rework, and on the earlier v4.0/v4.1 releases
+	//     their backing rows are distinguishable by metadata too: the
+	//     backing row keeps relkind 'r' but rel_createsql holds the user's
+	//     original CREATE TEMPORARY TABLE statement (GetRootSql), so the
+	//     dump excludes rows whose root statement is temporary and still
+	//     keeps persistent user tables under any __mo_tmp_ name shape
+	//     (review round 6; identified from the v4.0.x/v4.1.x
+	//     buildTableDefinition source: the Kind property of these rows is
+	//     written through the ordinary-table path).
 	// Anything that still reaches the export switch with an unsupported
 	// relkind fails loudly there; the empty relkind is exported as an
 	// ordinary table, with getCreateTable rejecting fragments that lack
@@ -456,7 +457,8 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'"
+		" and relkind <> 'temporary_table'" +
+		" and not (lower(coalesce(rel_createsql, '')) like 'create temporary%')"
 	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
