@@ -193,6 +193,33 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 		require.Empty(t, readDirSnapshot(t))
 	})
 
+	t.Run("discard never touches a name already handed over by rename", func(t *testing.T) {
+		chdirToTemp(t)
+		sink := sinkOver(discardWriter{})
+		f, published, err := sink.startCsv("db", "t")
+		require.NoError(t, err)
+		staged := filepath.Base(f.Name())
+		require.NoError(t, f.Close())
+
+		// The publish rename hands the staged hidden name back to the
+		// shared namespace; a concurrent run whose random candidate
+		// collides may hold a new file under it immediately after. Stand in
+		// for that run and make sure a failed-run discard cannot remove it.
+		require.NoError(t, os.Rename(staged, published))
+		sink.csv[0].published = true
+		require.NoError(t, os.WriteFile(staged, []byte("concurrent staged"), 0o644))
+
+		sink.discard()
+
+		// Only this run's published file is removed; the concurrent run's
+		// staged file under the handed-over name survives.
+		require.NoFileExists(t, published)
+		concurrent, err := os.ReadFile(staged)
+		require.NoError(t, err)
+		require.Equal(t, "concurrent staged", string(concurrent))
+		require.NoError(t, os.Remove(staged))
+	})
+
 	t.Run("startCsv reserves distinct published names", func(t *testing.T) {
 		chdirToTemp(t)
 		sink := sinkOver(discardWriter{})

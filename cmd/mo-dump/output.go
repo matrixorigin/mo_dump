@@ -194,10 +194,16 @@ func (s *dumpSink) discard() {
 		if s.csv[i].dropped {
 			continue
 		}
-		_ = os.Remove(s.csv[i].tmp)
-		// The published name carries either this run's empty reservation or
-		// its already renamed data; both belong to the failed run and go.
+		// Cleanup ownership follows the rename: the staged hidden name
+		// stopped being this run's with the rename — it went back to the
+		// shared namespace and a concurrent run can already hold a new file
+		// under that name — while the published name was reserved
+		// exclusively from before any data flowed, so only it may be removed
+		// here (matrixorigin/matrixone#30577).
 		_ = os.Remove(s.csv[i].dst)
+		if !s.csv[i].published {
+			_ = os.Remove(s.csv[i].tmp)
+		}
 		s.csv[i].dropped = true
 		s.csv[i].published = false
 	}
