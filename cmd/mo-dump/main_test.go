@@ -23,8 +23,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -1098,4 +1100,58 @@ func runDumpDataOverStdout(t *testing.T, opt *Options, ctx context.Context) erro
 		err = werr
 	}
 	return err
+}
+
+// limitingNoteWriter takes the first write and fails the second (EOF):
+// used to pin that a csv-note failure after a successful marker still
+// surfaces (matrixorigin/matrixone#30577).
+type limitingNoteWriter struct {
+	buf        bytes.Buffer
+	failSecond bool
+}
+
+func (w *limitingNoteWriter) Write(p []byte) (int, error) {
+	if w.failSecond {
+		return 0, io.EOF
+	}
+	w.failSecond = true
+	return w.buf.Write(p)
+}
+
+// TestWriteSuccessFootnotes covers both note shapes and both failure stages:
+// a consumer that closed the pipe right after the published script made the
+// old CLI ignore the failing footnote write and exit 0 with empty stderr.
+func TestWriteSuccessFootnotes(t *testing.T) {
+	cost := 3 * time.Second
+
+	t.Run("marker only", func(t *testing.T) {
+		var out bytes.Buffer
+		require.NoError(t, writeSuccessFootnotes(&out, cost, false))
+		require.Equal(t, "/* MODUMP SUCCESS, COST 3s */\n", out.String())
+	})
+
+	t.Run("marker and csv note", func(t *testing.T) {
+		var out bytes.Buffer
+		require.NoError(t, writeSuccessFootnotes(&out, cost, true))
+		require.Equal(t, "/* MODUMP SUCCESS, COST 3s */\n"+
+			"/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n",
+			out.String())
+	})
+
+	t.Run("marker failure is reported", func(t *testing.T) {
+		signal.Ignore(syscall.SIGPIPE)
+		pipeR, pipeW, err := os.Pipe()
+		require.NoError(t, err)
+		require.NoError(t, pipeR.Close())
+		err = writeSuccessFootnotes(pipeW, cost, false)
+		require.NoError(t, pipeW.Close())
+		require.ErrorIs(t, err, syscall.EPIPE)
+	})
+
+	t.Run("csv note failure is reported", func(t *testing.T) {
+		w := &limitingNoteWriter{}
+		err := writeSuccessFootnotes(w, cost, true)
+		require.ErrorIs(t, err, io.EOF)
+		require.Contains(t, w.buf.String(), "MODUMP SUCCESS")
+	})
 }

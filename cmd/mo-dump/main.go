@@ -112,9 +112,13 @@ func main() {
 			}
 		}
 		if err == nil && flag.NFlag() != 0 {
-			fmt.Fprintf(os.Stdout, "/* MODUMP SUCCESS, COST %v */\n", time.Since(dumpStart))
-			if opt.toCsv {
-				fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
+			// The success notes are the last piece of output their reader can
+			// rely on; ignoring their write failure would report a completed
+			// backup from a dying pipe as a silent exit 0
+			// (matrixorigin/matrixone#30577).
+			if noteErr := writeSuccessFootnotes(os.Stdout, time.Since(dumpStart), opt.toCsv); noteErr != nil {
+				fmt.Fprintf(os.Stderr, "modump error: %v\n", noteErr)
+				os.Exit(1)
 			}
 		}
 	}()
@@ -238,6 +242,23 @@ func main() {
 	if err != nil {
 		return
 	}
+}
+
+// writeSuccessFootnotes writes the completion notes the operator keys on:
+// the cost marker and, for csv runs, the reminder about the data files.
+// It reports write failures instead of letting them vanish — a consumer
+// closing the pipe right after the script must not turn the run into a
+// silent exit 0 (matrixorigin/matrixone#30577).
+func writeSuccessFootnotes(w io.Writer, cost time.Duration, csvNote bool) error {
+	if _, err := fmt.Fprintf(w, "/* MODUMP SUCCESS, COST %v */\n", cost); err != nil {
+		return err
+	}
+	if csvNote {
+		if _, err := fmt.Fprintf(w, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
