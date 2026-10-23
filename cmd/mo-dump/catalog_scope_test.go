@@ -60,14 +60,25 @@ const (
 // tables are excluded by relkind only — a former '__mo_tmp_<32hex>_'
 // name regexp was removed because it silently swallowed persistent user
 // tables legally named with that shape.
-const hiddenHelpersPredicate = " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
-	" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
-	" where d.datname = ?" +
-	" and (d.account_id = current_account_id()" +
-	" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
-	" and i.index_table_name is not null and i.index_table_name <> '')" +
-	" and relkind <> 'partition'" +
-	" and relkind <> 'temporary_table'"
+// hiddenHelpersFor renders the temporary-table classification tail of the
+// getTables predicate for the connected authority: the server-side classifier
+// function (mo_is_legacy_temporary_table) when available, otherwise the
+// __mo_tmp_<32hex>_ shape rule that matches the fallback servers' own SHOW
+// TABLES semantics.
+func hiddenHelpersFor(legacyClassify bool) string {
+	base := " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+		" where d.datname = ?" +
+		" and (d.account_id = current_account_id()" +
+		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+		" and i.index_table_name is not null and i.index_table_name <> '')" +
+		" and relkind <> 'partition'" +
+		" and relkind <> 'temporary_table'"
+	if legacyClassify {
+		return base + " and not mo_is_legacy_temporary_table(relkind, relname, reldatabase, coalesce(rel_createsql, ''), coalesce(extra_info, ''))"
+	}
+	return base + " and not (regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_') and coalesce(relkind, '') in ('r', ''))"
+}
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 	const (
@@ -116,38 +127,38 @@ func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 }
 
 func TestGetTablesScopedQuery(t *testing.T) {
-	baseSQL := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"
+	baseSQL := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
 
 	// The mocked row set models what the server returns after applying the
 	// emitted predicates: hidden helpers are filtered away by the query
 	// itself, so user tables named __mo_user_data and %!%plain survive, and
 	// same-named helper objects in ordinary databases survive too.
-	defaultSQL := baseSQL + tablesScopePredicate + hiddenHelpersPredicate
-	sysSQL := baseSQL + " and account_id = 0" + hiddenHelpersPredicate
+	defaultSQL := baseSQL + tablesScopePredicate + hiddenHelpersFor(false)
+	sysSQL := baseSQL + " and account_id = 0" + hiddenHelpersFor(false)
 
 	t.Run("default returns user __mo_ tables instead of dropping them (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).
-			AddRow("__mo_user_data", "r", "", "").
-			AddRow("plain", "r", "", "").
-			AddRow("v", "v", "", "").
-			AddRow("%!%plain", "r", "", "").
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("__mo_user_data", "r").
+			AddRow("plain", "r").
+			AddRow("v", "v").
+			AddRow("%!%plain", "r").
 			// Review regression #R1: '_' is a LIKE wildcard; demo_index_data is
 			// an ordinary table that a not-like '__mo_index_%' pattern matched.
-			AddRow("demo_index_data", "r", "", "").
+			AddRow("demo_index_data", "r").
 			// Review regression #R5: a user table legally named with the
 			// literal index-table prefix is not registered in mo_indexes, so it
 			// is dumped whatever kind its row carries ('r' on first creation,
 			// '' once the server blanks the kind after rename/restore).
-			AddRow("__mo_index_renamed", "", "", "").
+			AddRow("__mo_index_renamed", "").
 			// Review regression #R9: a persistent user table legally named with
 			// the former temporary-backing name shape '__mo_tmp_<32hex>_' must
 			// no longer be swallowed by a name regexp now that temporary tables
 			// are identified by relkind only.
-			AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_user", "r", "", "")
+			AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_user", "r")
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "d", nil, false)
+		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "__mo_user_data", Kind: "r"},
@@ -165,12 +176,12 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		mock := newCatalogMock(t)
 		// Rows as returned by the server after the emitted predicates: no
 		// relkind='i' index-table row survives the query itself.
-		rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).
-			AddRow("mo_user", "r", "", "").
-			AddRow("__mo_user_data", "r", "", "")
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("mo_user", "r").
+			AddRow("__mo_user_data", "r")
 		mock.ExpectQuery(sysSQL).WithArgs("d", "d").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "d", nil, true)
+		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: true})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_user", Kind: "r"},
@@ -183,13 +194,13 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		mock := newCatalogMock(t)
 		// Same-named user table and view in an ordinary database: the
 		// mo_catalog-only helper exclusion must not apply to them.
-		rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).
-			AddRow("mo_increment_columns", "r", "", "").
-			AddRow("mo_account_lock", "v", "", "").
-			AddRow("__mo_account_lock", "v", "", "")
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("mo_increment_columns", "r").
+			AddRow("mo_account_lock", "v").
+			AddRow("__mo_account_lock", "v")
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows) // db "d": no helper-name predicates
 
-		tables, err := getTables(context.Background(), "d", nil, false)
+		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_increment_columns", Kind: "r"},
@@ -201,15 +212,15 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("mo_catalog dump still excludes its own helper tables", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		catalogSQL := baseSQL + tablesScopePredicate + hiddenHelpersPredicate + catalogHelpersPredicate
+		catalogSQL := baseSQL + tablesScopePredicate + hiddenHelpersFor(false) + catalogHelpersPredicate
 		// The pre-filtered result the server returns for mo_catalog itself.
-		rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).
-			AddRow("mo_database", "r", "", "").
-			AddRow("mo_tables", "r", "", "").
-			AddRow("mo_columns", "r", "", "")
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("mo_database", "r").
+			AddRow("mo_tables", "r").
+			AddRow("mo_columns", "r")
 		mock.ExpectQuery(catalogSQL).WithArgs("mo_catalog", "mo_catalog").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "mo_catalog", nil, false)
+		tables, err := getTables(context.Background(), "mo_catalog", nil, Options{legacyClassifyFn: false, sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_database", Kind: "r"},
@@ -222,12 +233,12 @@ func TestGetTablesScopedQuery(t *testing.T) {
 	t.Run("explicit -tbl accepts a user __mo_ table (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
 		sqlWithTbl := defaultSQL + " and relname in (?,?)"
-		rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).
-			AddRow("__mo_user_data", "r", "", "").
-			AddRow("plain", "r", "", "")
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("__mo_user_data", "r").
+			AddRow("plain", "r")
 		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data", "plain").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}, {Name: "plain"}}, false)
+		tables, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}, {Name: "plain"}}, Options{})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "__mo_user_data", Kind: "r"},
@@ -241,18 +252,31 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		sqlWithTbl := defaultSQL + " and relname in (?)"
 		// The hidden-table predicates filter nothing a user could request
 		// explicitly; an empty result means the object does not exist.
-		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}))
+		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}))
 
-		_, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}}, false)
+		_, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}}, Options{legacyClassifyFn: false, sysAccount: false})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "table __mo_user_data not exists")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("server classifier predicate when the probe is available (round 9)", func(t *testing.T) {
+		mock := newCatalogMock(t)
+		fnSQL := baseSQL + tablesScopePredicate + hiddenHelpersFor(true)
+		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+			AddRow("__mo_user_data", "r")
+		mock.ExpectQuery(fnSQL).WithArgs("d", "d").WillReturnRows(rows)
+
+		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: true, sysAccount: false})
+		require.NoError(t, err)
+		assert.Equal(t, Tables{{Name: "__mo_user_data", Kind: "r"}}, tables)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
 
 	t.Run("query error is propagated", func(t *testing.T) {
 		mock := newCatalogMock(t)
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnError(sql.ErrConnDone)
-		_, err := getTables(context.Background(), "d", nil, false)
+		_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
 		require.ErrorIs(t, err, sql.ErrConnDone)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})

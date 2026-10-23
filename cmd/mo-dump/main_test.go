@@ -355,9 +355,9 @@ func TestDumpExitStatus(t *testing.T) {
 		if mode == "empty_default" {
 			kind = "v"
 		}
-		mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+
-			tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("db", "db", "t").
-			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("t", kind, "", ""))
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+			tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("db", "db", "t").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
 		if mode == "empty_default" {
 			// Inject incomplete persisted metadata at the catalog boundary,
 			// then exercise the real CLI's error/exit/success-marker contract.

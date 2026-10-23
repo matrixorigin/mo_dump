@@ -352,7 +352,7 @@ func TestDumpViewDependencies(t *testing.T) {
 			}
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a_child"}, {Name: parentName}}, noData: true}
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
-			mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?,?)").WithArgs("d", "d", "a_child", parentName).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("a_child", catalog.SystemViewRel, "", "").AddRow(parentName, catalog.SystemViewRel, "", ""))
+			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?,?)").WithArgs("d", "d", "a_child", parentName).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_child", catalog.SystemViewRel).AddRow(parentName, catalog.SystemViewRel))
 			parent := "CREATE VIEW " + quoteIdentifier(parentName) + " AS SELECT 1"
 			if mode == "parse error" {
 				child = "CREATE VIEW a_child AS SELECT * FROM"

@@ -44,13 +44,13 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 			for _, name := range dbs {
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(name, ""))
 				mock.ExpectQuery("show create database `" + name + "`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow(name, "CREATE DATABASE `"+name+"`"))
-				rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})
+				rows := sqlmock.NewRows([]string{"relname", "relkind"})
 				if name == "view_db" {
-					rows.AddRow("v", catalog.SystemViewRel, "", "")
+					rows.AddRow("v", catalog.SystemViewRel)
 				} else {
-					rows.AddRow("t", catalog.SystemOrdinaryRel, "", "")
+					rows.AddRow("t", catalog.SystemOrdinaryRel)
 				}
-				mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersPredicate).WithArgs(name, name).WillReturnRows(rows)
+				mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)).WithArgs(name, name).WillReturnRows(rows)
 				if name == "view_db" {
 					mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("view_db", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", viewDefinitionJSON(t, "view_db", "CREATE VIEW v AS SELECT id, v FROM data_db.t WHERE v > 1", "")))
 				} else {
@@ -124,7 +124,7 @@ func TestDumpViewsFailure(t *testing.T) {
 			steps := []queryStep{
 				{"database", "select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate, sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", "")},
 				{"database_ddl", "show create database `db`", sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db")},
-				{"tables", "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersPredicate, sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("v", catalog.SystemViewRel, "", "").AddRow("t", catalog.SystemOrdinaryRel, "", "")},
+				{"tables", "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?" + tablesScopePredicate + hiddenHelpersFor(false), sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("v", catalog.SystemViewRel).AddRow("t", catalog.SystemOrdinaryRel)},
 				{"view_ddl", "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)", sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", viewDefinitionJSON(t, "db", create, ""))},
 				{"table_ddl", "show create table `db`.`t`", sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)")},
 			}
@@ -175,11 +175,11 @@ func TestDumpWithoutViews(t *testing.T) {
 			mock, output := mockDumpOutput(t)
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 			mock.ExpectQuery("show create database `db`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
-			tables := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})
+			tables := sqlmock.NewRows([]string{"relname", "relkind"})
 			if kind != "" {
-				tables.AddRow("t", kind, "", "")
+				tables.AddRow("t", kind)
 			}
-			mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersPredicate).WithArgs("db", "db").WillReturnRows(tables)
+			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)).WithArgs("db", "db").WillReturnRows(tables)
 			if kind != "" {
 				mock.ExpectQuery("show create table `db`.`t`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)"))
 			}

@@ -204,12 +204,12 @@ func TestDumpDataViewOrder(t *testing.T) {
 			t.Cleanup(func() { os.Stdout = oldStdout })
 			mock.ExpectQuery("select datname, dat_type").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 			mock.ExpectQuery("show create database").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("d", "create database d"))
-			rows := sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"})
+			rows := sqlmock.NewRows([]string{"relname", "relkind"})
 			if tc.ddl != "" {
-				rows.AddRow("va", tc.kind, "", "")
+				rows.AddRow("va", tc.kind)
 			}
 			if tc.second != "" {
-				rows.AddRow("vb", catalog.SystemViewRel, "", "")
+				rows.AddRow("vb", catalog.SystemViewRel)
 			}
 			mock.ExpectQuery("select relname,relkind").WithArgs("d", "d").WillReturnRows(rows)
 			if tc.ddl != "" && tc.kind != catalog.SystemViewRel {

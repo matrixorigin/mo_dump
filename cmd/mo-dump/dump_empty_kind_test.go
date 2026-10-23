@@ -43,9 +43,9 @@ func TestDumpDataEmptyRelKind(t *testing.T) {
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	// getTables
-	mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+
-		tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "__mo_index_renamed").
-		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("__mo_index_renamed", "", "", ""))
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("d", "d", "__mo_index_renamed").
+		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("__mo_index_renamed", ""))
 	// getCreateTable on the empty-kind object
 	mock.ExpectQuery("show create table `d`.`__mo_index_renamed`").
 		WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).
@@ -81,9 +81,9 @@ func TestDumpDataEmptyRelKindNotSilent(t *testing.T) {
 
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
-	mock.ExpectQuery("select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"+
-		tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "whatever").
-		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind", "rel_createsql", "extra_info"}).AddRow("whatever", "somefuturekind", "", ""))
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("d", "d", "whatever").
+		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("whatever", "somefuturekind"))
 
 	err := opt.dumpData(context.Background())
 	require.Error(t, err)

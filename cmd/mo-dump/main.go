@@ -55,6 +55,7 @@ type Options struct {
 	enableEscape         bool
 	where                string
 	sysAccount           bool // used in getDatabaseType, getTables
+	legacyClassifyFn     bool // server-side mo_is_legacy_temporary_table is callable
 }
 
 func (t *Tables) String() string {
@@ -221,6 +222,11 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		defer conn.Close()
 	}
 
+	opt.legacyClassifyFn, err = probeLegacyTemporaryTableFn(ctx)
+	if err != nil {
+		return err
+	}
+
 	// add foreign_key_checks variable to dump file
 	fmt.Printf("SET foreign_key_checks = 0;\n\n")
 
@@ -255,7 +261,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				return err
 			}
 		} else {
-			opt.tables, err = getTables(ctx, db, opt.tables, opt.sysAccount)
+			opt.tables, err = getTables(ctx, db, opt.tables, *opt)
 			if err != nil {
 				return err
 			}
@@ -338,6 +344,26 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	return err
 }
 
+// probeLegacyTemporaryTableFn reports whether the connected server exposes
+// mo_is_legacy_temporary_table, the authoritative classifier for rows
+// written before the v4.2 relkind metadata (review rounds 8-9). Any
+// execution error (unknown function on old clusters, privilege, row or
+// scan error) degrades to the shape fallback instead of failing dumps on
+// those clusters.
+func probeLegacyTemporaryTableFn(ctx context.Context) (bool, error) {
+	r, err := conn.QueryContext(ctx, "select mo_is_legacy_temporary_table('r','x','d','', '')")
+	if err != nil {
+		return false, nil
+	}
+	defer r.Close()
+	for r.Next() {
+	}
+	if err := r.Err(); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", opt.username, opt.password, opt.host, opt.port, database)
 
@@ -410,8 +436,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	return dbs[0], nil
 }
 
-func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
-	sql := "select relname,relkind,rel_createsql,extra_info from mo_catalog.mo_tables where reldatabase = ?"
+func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tables, error) {
+	isSys := opt.sysAccount
+	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
 	args := make([]any, 0, len(tables)+2)
 	args = append(args, db)
 	if isSys {
@@ -431,18 +458,26 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	// identification were removed across review rounds 2-6: each variant
 	// proved able to silently swallow named or renamed user tables behind a
 	// MODUMP SUCCESS — the exact omission class this change forbids.
-	// What remains is per-kind metadata:
-	//   - partition members carry relkind 'partition';
-	//   - session temporary tables carry relkind 'temporary_table' since
-	//     the v4.2 catalog rework. Rows written by v4.0/v4.1 releases keep
-	//     relkind 'r' and are classified row-by-row by isLegacyTemporaryTable
-	//     (see legacy_temporary.go), which associates the backing physical
-	//     name with the CREATE statements of the request the same way the
-	//     server does: a permanent table's physical-looking name is explicit
-	//     in its own CREATE statement and wins over a matching temporary
-	//     alias in the same request, while a temporary table's generated
-	//     physical name never appears in its statement (review round 7);
-	//     rel_createsql prefix matching misfired in both directions.
+	// Temporary-table rows are classified with the strongest authority the
+	// connected server exposes (review rounds 8-9):
+	//   - relkind 'temporary_table' since the v4.2 catalog rework (always
+	//     applied, current clusters);
+	//   - on current clusters the server-side classification function
+	//     mo_is_legacy_temporary_table (probed once per connection) is
+	//     pushed into the query. It owns every classification subtlety the
+	//     client must not reimplement: rename metadata, batched requests,
+	//     comments decoration, qualified identities, executable comments;
+	//   - clusters without the function (v4.0/v4.1 and older, e.g. v1.2.4)
+	//     fall back to the same shape rule those servers themselves used
+	//     in SHOW TABLES ('__mo_tmp_<32hex>_' physical prefixes, ordinary
+	//     or empty relkind). On those releases the server-illegible rows
+	//     follow the server's own visibility semantics; current clusters
+	//     keep precise per-statement classification via the function or
+	//     the relkind metadata.
+	// The two catalog columns the function touches (rel_createsql,
+	// extra_info) are never selected by this client — v1.2.4 has no
+	// extra_info column at all — they are only referenced inside the
+	// server-executed predicate on clusters that provide the function.
 	// Anything that still reaches the export switch with an unsupported
 	// relkind fails loudly there; the empty relkind is exported as an
 	// ordinary table, with getCreateTable rejecting fragments that lack
@@ -458,6 +493,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'"
+	if opt.legacyClassifyFn {
+		sql += " and not mo_is_legacy_temporary_table(relkind, relname, reldatabase," +
+			" coalesce(rel_createsql, ''), coalesce(extra_info, ''))"
+	} else {
+		sql += " and not (regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')" +
+			" and coalesce(relkind, '') in ('r', ''))"
+	}
 	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
@@ -493,16 +535,9 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	for r.Next() {
 		var table string
 		var kind string
-		var createSQL, extraInfo nullStr
-		err = r.Scan(&table, &kind, &createSQL, &extraInfo)
+		err = r.Scan(&table, &kind)
 		if err != nil {
 			return nil, err
-		}
-		// Row classification for v4.0/v4.1 temporary backing rows — see
-		// legacy_temporary.go; on current clusters these rows already carry
-		// relkind 'temporary_table' and are rejected by the query itself.
-		if isLegacyTemporaryTable(kind, table, db, createSQL.String, extraInfo.String) {
-			continue
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true
