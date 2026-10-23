@@ -310,10 +310,9 @@ func TestDumpSinkSpoolFallback(t *testing.T) {
 }
 
 // TestProbeFileMode pins the umask policy: the flipped umask probe derives
-// 0666 &^ umask, and nothing else. umask math is hidden behind the probe so
-// the published csv still carries os.Create-compatible permissions
-// (0644 under umask 022, 0664 under umask 002, not the private 0600
-// mode of the staged CreateTemp file).
+// 0666 &^ umask, exactly like os.Create, so published csv files carry
+// permissions for their readers (0644 under umask 022, 0664 under umask 002)
+// instead of the private 0600 mode CreateTemp stages with.
 func TestProbeFileMode(t *testing.T) {
 	old := syscall.Umask(0)
 	syscall.Umask(old)
@@ -335,9 +334,9 @@ func TestProbeFileMode(t *testing.T) {
 // though the staged CreateTemp file was 0600.
 func TestDumpSinkPublishesUmaskMode(t *testing.T) {
 	chdirToTemp(t)
-	// The umask belongs to the process: restore whatever it was when the
-	// test ends (077 must not leak as 022, review finding) and re-derive the
-	// global probe so later tests see a consistent pair.
+	// The umask belongs to the process: restore whatever it was on exit (not
+	// a hardcoded 022) and re-derive the probe so later tests observe a
+	// consistent pair.
 	oldUmask := syscall.Umask(0)
 	syscall.Umask(oldUmask)
 	saved := publishedFileMode

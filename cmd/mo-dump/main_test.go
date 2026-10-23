@@ -1084,7 +1084,7 @@ func TestGetDumpView(t *testing.T) {
 // itself stages the script and only publishes complete dumps; this helper
 // keeps the merged view tests' "capture stdout" fixtures meaningful by
 // reproducing the old streaming observation points for assertions, including
-// the sub-prefix a failed dump produced before its error.
+// the partial prefix a failed dump produced before its error.
 func runDumpDataOverStdout(t *testing.T, opt *Options, ctx context.Context) error {
 	t.Helper()
 	var buf bytes.Buffer

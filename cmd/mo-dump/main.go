@@ -364,8 +364,11 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				// issue-30559: the legacy /*!EXTERNAL TABLE*/ marker is not
-				// executable SQL and is omitted from the dump.
+				// issue-30559: a regular mysql client executes /*! ... */ content on
+				// restore, and a table name containing */ would terminate the
+				// block early — the external-table section emits no marker
+				// comment at all, and the CREATE TABLE text is the same SQL the
+				// server accepted.
 				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(out, create, true)
 			case catalog.SystemViewRel:
@@ -425,8 +428,8 @@ func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) 
 		counts[r]++
 	}
 	starts := [2]int{}
-	// starts[1] is the number of sequence entries and doubles as the length of
-	// the non-view prefix the emit loop walks in registry order.
+	// starts[r] is the write cursor for partition r: sequences write from 0,
+	// every other entry from counts[0]. next walks them in one stable pass.
 	for r := 1; r < 2; r++ {
 		starts[r] = starts[r-1] + counts[r-1]
 	}
