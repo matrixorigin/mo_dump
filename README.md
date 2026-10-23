@@ -37,7 +37,11 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 ### 构建 mo-dump 二进制文件
 __Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</a>（支持自动工具链选择的 Go 1.21 或更新版本）、C/C++ 编译器、`make`、`tar` 和 `shasum`。构建会选用 `go.mod` 指定的 Go 1.26.4，从固定版本 MatrixOne 模块的已校验源码归档构建静态 jemalloc，不需要安装整个 MatrixOne 内核或在运行时携带 jemalloc 动态库。
 
-视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集。保留原始视图 DDL，对真实循环返回错误而不是无限重排。依赖分析使用每个视图在 `mo_catalog.mo_tables.viewdef` 中持久化的创建语句、默认库及解析模式，不使用导出连接的 SQL mode 猜测视图语法；历史记录缺少模式字段时遵循服务端 legacy 规则。元数据缺失或损坏会明确报错，不猜测回退。恢复文件仍保留服务端提供的 DDL，恢复会话须使用适合这些 DDL 的模式；不会自动为各视图插入 `SET sql_mode`。跨库或未选中的外部依赖仍需在恢复环境中可用。
+视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集，对真实循环返回错误而不是无限重排。分析和恢复使用每个视图在 `mo_catalog.mo_tables.viewdef` 中持久化的源语句、默认库及解析模式，不使用导出连接的 SQL mode 猜测视图语法。保留源语句内容；持久化语句为 `ALTER VIEW` 时，仅将首个语句动词改为 `CREATE`，用于在空目标上重建视图。历史记录缺少模式字段时遵循服务端 legacy 规则。元数据缺失或损坏会明确报错；若 `DefaultDatabase` 缺失、为 null 或空字符串，且视图需要解析未限定数据库的物理关系，也会明确拒绝导出，不猜测其所属库就是创建默认库。无需默认库的常量、CTE-only 和全限定引用仍可导出。
+
+恢复脚本会为每个视图保存当前 `@@SESSION.sql_mode`，通过 `SET SESSION sql_mode` 临时应用其持久化解析标志，并保留目标会话的非解析策略；成功执行该视图段落后恢复原 SQL mode。不修改全局 SQL mode 或目标的 `lower_case_table_names`，目标仍需兼容的名称解析规则。导入客户端必须正确切分语句并支持这些会话设置，尤其是 `NO_BACKSLASH_ESCAPES` 字面量；不能仅凭导入退出码判断恢复完整。恢复不是原子操作，出错时可能留下部分对象或尚未恢复的会话设置。
+
+导出时先输出所有选中数据库的普通表及数据，再对选中的跨库视图统一依赖排序。未选中的外部对象和历史快照仍需在恢复环境中可用。
 
 1. 执行下面的代码即可从 MatrixOrigin/mo_dump 源代码构建 `mo-dump` 二进制文件：
 

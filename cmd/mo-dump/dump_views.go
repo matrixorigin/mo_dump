@@ -140,9 +140,15 @@ func analyzeDumpView(ctx context.Context, view dumpView, mode viewSQLMode) (view
 			return viewAnalysis{}, err
 		}
 	}
-	analysis, err := analyzeView(ctx, view.defaultDatabase(), view.create, mode)
+	database := view.defaultDatabase()
+	analysis, err := analyzeView(ctx, database, view.create, mode)
 	if err != nil {
 		return viewAnalysis{}, fmt.Errorf("analyze view %s.%s: %w", view.name.database, view.name.name, err)
+	}
+	// The owner need not be the creation database. Do not guess a binding
+	// context, lose ordering edges, or let replay depend on the previous USE.
+	if database == "" && analysis.usesDefaultDatabase {
+		return viewAnalysis{}, fmt.Errorf("analyze view %s.%s: empty default database for unqualified relation", view.name.database, view.name.name)
 	}
 	return analysis, nil
 }

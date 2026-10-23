@@ -43,6 +43,23 @@ func TestViewDefaultDatabase(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			if tt.want == "" {
+				_, err := analyzeDumpView(context.Background(), view, viewSQLMode{lowerCaseTableNames: 1})
+				require.ErrorContains(t, err, "analyze view owned.v: empty default database")
+				parent := dumpView{name: viewName{"owned", "target"}, create: "CREATE VIEW target AS SELECT 7 AS x"}
+				views := []dumpView{view, parent}
+				before := append([]dumpView(nil), views...)
+				ordered, err := orderDumpViews(context.Background(), views, viewSQLMode{lowerCaseTableNames: 1})
+				require.ErrorContains(t, err, "empty default database")
+				require.Nil(t, ordered)
+				require.Equal(t, before, views)
+				require.ErrorContains(t, showDumpView(view, viewSQLMode{lowerCaseTableNames: 1}), "empty default database")
+				data, err := os.ReadFile(output.Name())
+				require.NoError(t, err)
+				require.Empty(t, data, "reject before emitting session changes or view DDL")
+				require.NoError(t, mock.ExpectationsWereMet())
+				return
+			}
 			refs, err := viewReferences(context.Background(), view, viewSQLMode{lowerCaseTableNames: 1})
 			require.NoError(t, err)
 			require.Equal(t, map[viewName]struct{}{{tt.want, "target"}: {}}, refs)
@@ -59,12 +76,42 @@ func TestViewDefaultDatabase(t *testing.T) {
 			text := string(data)
 			require.Contains(t, text, "DROP VIEW IF EXISTS `owned`.`v`;")
 			require.Contains(t, text, "CREATE VIEW owned.v AS SELECT x FROM target;")
-			if tt.want == "" {
-				require.NotContains(t, text, "USE ")
-			} else {
-				require.Contains(t, text, "USE `source`;")
-			}
+			require.Contains(t, text, "USE `source`;")
 			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestViewEmptyDefaultLookupBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name, query string
+		needsLookup bool
+	}{
+		{"derived", "SELECT x FROM (SELECT x FROM target) s", true},
+		{"scalar", "SELECT (SELECT x FROM target) AS x", true},
+		{"used CTE", "WITH c AS (SELECT x FROM target) SELECT * FROM c", true},
+		{"historical", "SELECT x FROM target {snapshot='saved'}", true},
+		{"constant", "SELECT 7 AS x", false},
+		{"virtual DUAL", "SELECT 7 AS x FROM dual", false},
+		{"CTE only", "WITH c AS (SELECT 7 AS x) SELECT x FROM c", false},
+		{"qualified", "SELECT x FROM source.target", false},
+		{"unused CTE", "WITH c AS (SELECT x FROM target) SELECT 7 AS x", false},
+		{"discarded CTE wrapper", "WITH c AS ((SELECT 7 AS x) ORDER BY (SELECT x FROM target)) SELECT x FROM c", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, output := mockDumpOutput(t)
+			view := dumpView{name: viewName{"owned", "v"}, create: "CREATE VIEW owned.v AS " + tc.query, definition: &viewDefinition{}}
+			err := showDumpView(view, viewSQLMode{lowerCaseTableNames: 1})
+			text, readErr := os.ReadFile(output.Name())
+			require.NoError(t, readErr)
+			if tc.needsLookup {
+				require.ErrorContains(t, err, "analyze view owned.v: empty default database")
+				require.Empty(t, text)
+			} else {
+				require.NoError(t, err)
+				require.Contains(t, string(text), "USE `owned`;\n\nDROP VIEW IF EXISTS `owned`.`v`;")
+				require.Contains(t, string(text), view.create+";")
+			}
 		})
 	}
 }
