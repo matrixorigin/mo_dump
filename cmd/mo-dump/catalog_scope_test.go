@@ -56,7 +56,10 @@ const (
 // in mo_catalog.mo_indexes.index_table_name (the column exists under this
 // exact name from MO v1.2 on), joined through mo_database with the same
 // account scoping mo-dump uses for getDatabaseType, so helpers of other
-// databases can never match a same-named user object here.
+// databases can never match a same-named user object here. Temporary
+// tables are excluded by relkind only — a former '__mo_tmp_<32hex>_'
+// name regexp was removed because it silently swallowed persistent user
+// tables legally named with that shape.
 var hiddenHelpersFor = func(db string) string {
 	return " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
 		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
@@ -65,8 +68,7 @@ var hiddenHelpersFor = func(db string) string {
 		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'" +
-		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
+		" and relkind <> 'temporary_table'"
 }
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
@@ -141,8 +143,12 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			// literal index-table prefix is not registered in mo_indexes, so it
 			// is dumped whatever kind its row carries ('r' on first creation,
 			// '' once the server blanks the kind after rename/restore).
-			AddRow("__mo_index_data", "r").
-			AddRow("__mo_index_renamed", "")
+			AddRow("__mo_index_renamed", "").
+			// Review regression #R9: a persistent user table legally named with
+			// the former temporary-backing name shape '__mo_tmp_<32hex>_' must
+			// no longer be swallowed by a name regexp now that temporary tables
+			// are identified by relkind only.
+			AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_user", "r")
 		mock.ExpectQuery(defaultSQL).WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", nil, false)
@@ -153,8 +159,8 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			{Name: "v", Kind: "v"},
 			{Name: "%!%plain", Kind: "r"},
 			{Name: "demo_index_data", Kind: "r"},
-			{Name: "__mo_index_data", Kind: "r"},
 			{Name: "__mo_index_renamed", Kind: ""},
+			{Name: "__mo_tmp_0123456789abcdef0123456789abcdef_user", Kind: "r"},
 		}, tables)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})

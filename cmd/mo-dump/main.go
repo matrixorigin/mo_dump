@@ -459,28 +459,29 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
 			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
 	}
-	// Hidden index helpers are identified by the real index association,
-	// not by name or relkind guesses (review rounds 2-5): every index writes
-	// its helper table name into mo_catalog.mo_indexes.index_table_name for
-	// the database that owns the indexed table (the column exists under
-	// this exact name from MO v1.2 through current releases). The lookup is
-	// scoped to the dumped database through mo_catalog.mo_database with the
-	// same account scoping mo-dump uses for getDatabaseType, so a helper
-	// registered for another database can never match a same-named user
-	// object here — review round 5 found the unscoped subquery silently
-	// dropping user tables of other databases.
-	// Name- and kind-based shortcuts were rejected because they silently
-	// dropped user objects: a plain '_' wildcard pattern swallowed
-	// demo_index_data, and an unrecognizable relkind swallowed user tables
-	// the server records with an empty kind after e.g. a rename/restore to
-	// a __mo_index_* colliding name. Objects that reach the export switch
-	// with an unsupported (non r/v/e) relkind now fail loudly instead; the
-	// empty relkind itself is handled as an ordinary user table in
-	// dumpData, because on current clusters the object stays a fully
-	// usable table (verified via SHOW CREATE TABLE / SELECT); on clusters
-	// whose SHOW CREATE output lacks the statement head for such objects,
-	// getCreateTable rejects the fragment instead of emitting a dump that
-	// cannot be restored.
+	// Hidden index helpers are identified by their per-database registration
+	// in mo_catalog.mo_indexes.index_table_name (the column exists under
+	// this exact name from MO v1.2 on), joined through mo_database with the
+	// same account scoping as getDatabaseType so helpers of other databases
+	// can never match a same-named user object here. Name- and kind-based
+	// identification were removed across review rounds 2-5: each variant
+	// proved able to silently swallow named or renamed user tables behind a
+	// MODUMP SUCCESS — the exact omission class this change forbids.
+	// What remains is per-kind metadata:
+	//   - partition members carry relkind 'partition';
+	//   - session temporary tables carry relkind 'temporary_table' since
+	//     the v4.2 catalog rework. On the v4.0/v4.1 interim releases whose
+	//     temporary backing rows still carry relkind 'r' there is no
+	//     metadata to distinguish them from persistent tables, so the dump
+	//     stays complete: a live temporary backing table surfaces as a loud
+	//     error (or visible rows) instead of a silently dropped user table.
+	//     A former '__mo_tmp_<32hex>_' name regexp is gone for that reason
+	//     — it also swallowed persistent user tables legally named with
+	//     that shape (review round 5).
+	// Anything that still reaches the export switch with an unsupported
+	// relkind fails loudly there; the empty relkind is exported as an
+	// ordinary table, with getCreateTable rejecting fragments that lack
+	// the CREATE statement head.
 	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
 	// with the name of a catalog helper are regular dump payloads and must
 	// never be skipped silently.
@@ -491,8 +492,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'" +
-		" and not regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')"
+		" and relkind <> 'temporary_table'"
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
 	// mo_catalog, and ordinary databases may legally contain same-named
