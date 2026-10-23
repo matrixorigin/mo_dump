@@ -17,6 +17,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,23 +48,43 @@ func readDirSnapshot(t *testing.T) map[string]bool {
 	return files
 }
 
+// hasNoStagingLeftover fails when any hidden staging file remains. Published
+// csv names legitimately carry the ".mo-dump-<id>" run suffix; only a
+// leading dot marks staged or spool files as leftovers.
+func hasNoStagingLeftover(t *testing.T) {
+	t.Helper()
+	for name := range readDirSnapshot(t) {
+		require.False(t, strings.HasPrefix(name, "."), "staging/partial files must be cleaned: %s", name)
+	}
+}
+
+// stageCsvOne stages one table csv, writes the given data and closes it.
+func stageCsvOne(t *testing.T, sink *dumpSink, db, tbl string, data string) (string, string) {
+	t.Helper()
+	f, published, err := sink.startCsv(db, tbl)
+	require.NoError(t, err)
+	_, err = f.WriteString(data)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	return f.Name(), published
+}
+
 // TestDumpSinkPublishAndDiscard proves the two release paths: publish exposes
 // the staged csv data and streams the SQL spool, and discard leaves no
 // staging file behind.
 func TestDumpSinkPublishAndDiscard(t *testing.T) {
 	t.Run("publish", func(t *testing.T) {
 		chdirToTemp(t)
+		// A previous run's csv file under the legacy fixed name must never
+		// be touched by a later dump: published names are unique per run.
+		require.NoError(t, os.WriteFile(csvFileName("db", "t"), []byte("old backup\n"), 0o644))
+
 		sink, err := newDumpSink()
 		require.NoError(t, err)
 		sink.printf("SET foreign_key_checks = 0;\n\n")
 		require.NoError(t, sink.Err())
 
-		csvFile, err := sink.startCsv("db", "t")
-		require.NoError(t, err)
-		_, err = csvFile.WriteString("1,2\n")
-		require.NoError(t, err)
-		require.NoError(t, csvFile.Close())
-		csvTemp := csvFile.Name()
+		staged, published := stageCsvOne(t, sink, "db", "t", "1,2\n")
 
 		// publish streams the spool to real stdout; capture it with a pipe.
 		pipeR, pipeW, err := os.Pipe()
@@ -81,37 +102,54 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 		require.NoError(t, pipeR.Close())
 		require.Equal(t, "SET foreign_key_checks = 0;\n\n", string(restored[:n]))
 
-		// The staged csv was published; nothing else remains.
-		data, err := os.ReadFile(csvFileName("db", "t"))
+		// The staged csv was published under its unique name; both the staged
+		// hidden file and the legacy previous backup are untouched.
+		data, err := os.ReadFile(published)
 		require.NoError(t, err)
 		require.Equal(t, "1,2\n", string(data))
-		require.NoFileExists(t, csvTemp)
-		files := readDirSnapshot(t)
-		require.Len(t, files, 1)
-		require.True(t, files[csvFileName("db", "t")])
+		require.NoFileExists(t, staged)
+		legacy, err := os.ReadFile(csvFileName("db", "t"))
+		require.NoError(t, err)
+		require.Equal(t, "old backup\n", string(legacy), "a previous dump file must never be replaced")
+		hasNoStagingLeftover(t)
 
-		// discard after publish is a no-op; the published file survives.
+		// discard after a complete publish is a no-op; the published files
+		// survive.
 		sink.discard()
+		require.FileExists(t, published)
 		require.FileExists(t, csvFileName("db", "t"))
-		require.Len(t, readDirSnapshot(t), 1)
+		require.Len(t, readDirSnapshot(t), 2)
 	})
 
-	t.Run("spool falls back to system temp when cwd is read-only", func(t *testing.T) {
-		stageDir := t.TempDir()
-		require.NoError(t, os.Chmod(stageDir, 0o555))
-		oldWd, err := os.Getwd()
-		require.NoError(t, err)
-		require.NoError(t, os.Chdir(stageDir))
-		t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	t.Run("publish rename failure removes the partial set", func(t *testing.T) {
+		chdirToTemp(t)
+		// A previous backup set (legacy name) that must survive a failed run.
+		legacyFile := csvFileName("db", "t")
+		require.NoError(t, os.WriteFile(legacyFile, []byte("old backup\n"), 0o644))
 
-		sink, err := newDumpSink()
-		require.NoError(t, err)
-		require.NotEqual(t, stageDir, filepath.Dir(sink.f.Name()), "spool moved to the system temp dir")
-		sink.printf("SET foreign_key_checks = 0;\n")
-		require.NoError(t, sink.Err())
-		spoolName := sink.f.Name()
+		sink := sinkOver(discardWriter{})
+		_, firstPublished := stageCsvOne(t, sink, "db", "t", "new t\n")
+		_, secondPublished := stageCsvOne(t, sink, "db", "v", "new v\n")
+		// Make the second rename fail deterministically: its published name
+		// is occupied by a directory.
+		require.NoError(t, os.Mkdir(secondPublished, 0o755))
+
+		err := sink.publish()
+		var linkErr *os.LinkError
+		require.ErrorAs(t, err, &linkErr)
+		require.True(t, sink.csv[0].published, "first rename happened before the failure")
+
 		sink.discard()
-		require.NoFileExists(t, spoolName)
+
+		// The partially published files of the failed run are gone, the
+		// old backup is intact, and only the blocking directory remains.
+		require.NoFileExists(t, firstPublished)
+		require.NoFileExists(t, sink.csv[1].tmp)
+		legacy, err := os.ReadFile(legacyFile)
+		require.NoError(t, err)
+		require.Equal(t, "old backup\n", string(legacy))
+		require.DirExists(t, secondPublished)
+		hasNoStagingLeftover(t)
 	})
 
 	t.Run("discard", func(t *testing.T) {
@@ -120,20 +158,18 @@ func TestDumpSinkPublishAndDiscard(t *testing.T) {
 		require.NoError(t, err)
 		sink.printf("DROP DATABASE IF EXISTS `victim`;")
 
-		csvFile, err := sink.startCsv("db", "t")
+		f, _, err := sink.startCsv("db", "t")
 		require.NoError(t, err)
-		abortedTemp := csvFile.Name()
-		sink.abortCsv(csvFile)
+		abortedTemp := f.Name()
+		sink.abortCsv(f)
 
-		keptCsv, err := sink.startCsv("db", "v")
-		require.NoError(t, err)
-		keptTemp := keptCsv.Name()
-		require.NoError(t, keptCsv.Close())
+		keptTemp, keptPublished := stageCsvOne(t, sink, "db", "v", "1\n")
 
 		sink.discard()
 
 		require.NoFileExists(t, abortedTemp)
 		require.NoFileExists(t, keptTemp)
+		require.NoFileExists(t, keptPublished)
 		require.NoFileExists(t, csvFileName("db", "t"))
 		require.NoFileExists(t, csvFileName("db", "v"))
 		require.Empty(t, readDirSnapshot(t))
@@ -171,7 +207,7 @@ func TestDumpSinkAbortedCsvKeepsPreviousFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(csvFileName("db", "t"), []byte("old data\n"), 0o644))
 
 	sink := sinkOver(discardWriter{})
-	f, err := sink.startCsv("db", "t")
+	f, published, err := sink.startCsv("db", "t")
 	require.NoError(t, err)
 	sink.abortCsv(f)
 	sink.discard()
@@ -179,7 +215,28 @@ func TestDumpSinkAbortedCsvKeepsPreviousFile(t *testing.T) {
 	data, err := os.ReadFile(csvFileName("db", "t"))
 	require.NoError(t, err)
 	require.Equal(t, "old data\n", string(data))
+	require.NoFileExists(t, published)
 	files := readDirSnapshot(t)
 	require.Len(t, files, 1)
 	require.True(t, files[csvFileName("db", "t")])
+}
+
+// TestDumpSinkSpoolFallback keeps the whole-script spool working when the
+// current directory is read-only: the spool moves to the system temp dir.
+func TestDumpSinkSpoolFallback(t *testing.T) {
+	stageDir := t.TempDir()
+	require.NoError(t, os.Chmod(stageDir, 0o555))
+	oldWd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(stageDir))
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	sink, err := newDumpSink()
+	require.NoError(t, err)
+	require.NotEqual(t, stageDir, filepath.Dir(sink.f.Name()), "spool moved to the system temp dir")
+	sink.printf("SET foreign_key_checks = 0;\n")
+	require.NoError(t, sink.Err())
+	spoolName := sink.f.Name()
+	sink.discard()
+	require.NoFileExists(t, spoolName)
 }

@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 // spoolPrefix names the hidden staging file that holds the complete SQL
@@ -26,11 +28,6 @@ import (
 // half script, so a restore can not drop a database it then fails to
 // recreate (matrixorigin/matrixone#30577).
 const spoolPrefix = ".mo-dump-script-"
-
-// csvTempPattern formats a staged csv name next to its published file:
-// publishing is then one rename in the same directory, and a failed run can
-// never truncate the operator's previous data files.
-const csvTempPattern = ".%s.mo-dump-*"
 
 // csvArtifact tracks one staged csv file on its way to publish or discard.
 type csvArtifact struct {
@@ -45,11 +42,16 @@ type csvArtifact struct {
 // staged beside their published name. The sink records write errors
 // (bufio.Writer hides them until flush) so the run can stop early.
 type dumpSink struct {
-	w   io.Writer     // SQL text destination
-	bw  *bufio.Writer // buffered wrapper over f, nil for direct sinks
-	f   *os.File      // SQL spool file, nil for direct sinks
-	csv []csvArtifact
-	err error // first write error, sticky
+	w  io.Writer     // SQL text destination
+	bw *bufio.Writer // buffered wrapper over f, nil for direct sinks
+	f  *os.File      // SQL spool file, nil for direct sinks
+	// csv ports the staged per-table csv files; publishedAll is set only
+	// after the complete run was published, so a discard triggered by a
+	// failed run also removes files that were already renamed before the
+	// failure: a partial new backup set never survives.
+	csv          []csvArtifact
+	publishedAll bool
+	err          error // first write error, sticky
 }
 
 // newDumpSink creates the staging owner for one dump run. The spool goes to
@@ -114,22 +116,29 @@ func csvFileName(db, tbl string) string {
 	return fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
 }
 
-// startCsv stages the csv data file of one table in a hidden temporary file
-// beside its published path next to the dump script.
-func (s *dumpSink) startCsv(db, tbl string) (*os.File, error) {
-	dst := csvFileName(db, tbl)
-	f, err := os.CreateTemp(".", fmt.Sprintf(csvTempPattern, dst))
+// startCsv stages the csv data file of one table in a hidden temporary file.
+// It returns the staged file and the name it will be published under after
+// the whole run succeeds; the LOAD DATA statement references that name.
+// Both names are resolved against the current directory, which is also
+// where the final file has to live.
+func (s *dumpSink) startCsv(db, tbl string) (*os.File, string, error) {
+	f, err := os.CreateTemp(".", "."+csvFileName(db, tbl)+".mo-dump-")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	s.csv = append(s.csv, csvArtifact{tmp: f.Name(), dst: dst})
-	return f, nil
+	// CreateTemp returns the directory-qualified name ("./.<file>"); work
+	// on the base name alone and strip exactly the one leading dot that hides
+	// the staged file.
+	staged := filepath.Base(f.Name())
+	dst := strings.TrimPrefix(staged, ".")
+	s.csv = append(s.csv, csvArtifact{tmp: staged, dst: dst})
+	return f, dst, nil
 }
 
 // abortCsv removes a staged csv file after the table failed; a later
 // failed-run discard must not remove it again.
 func (s *dumpSink) abortCsv(f *os.File) {
-	name := f.Name()
+	name := filepath.Base(f.Name())
 	_ = f.Close()
 	_ = os.Remove(name)
 	for i := range s.csv {
@@ -140,15 +149,25 @@ func (s *dumpSink) abortCsv(f *os.File) {
 }
 
 // discard drops every artifact a failed run leaves behind: the staged SQL
-// script and all not-yet-published csv files. It is a no-op after publish.
+// script, all staged csv files, and any csv file already published by a
+// partially succeeded publish — a new backup set that was never completed
+// must vanish rather than coexist with the operator's previous files. After
+// a complete publish it is a no-op: nothing is owned anymore.
 func (s *dumpSink) discard() {
+	if s.publishedAll {
+		return
+	}
 	if s.f != nil {
 		_ = s.f.Close()
 		_ = os.Remove(s.f.Name())
 		s.f = nil
 	}
 	for i := range s.csv {
-		if s.csv[i].published || s.csv[i].dropped {
+		if s.csv[i].dst != "" && s.csv[i].published {
+			_ = os.Remove(s.csv[i].dst)
+			s.csv[i].published = false
+		}
+		if s.csv[i].dropped {
 			continue
 		}
 		_ = os.Remove(s.csv[i].tmp)
@@ -157,9 +176,9 @@ func (s *dumpSink) discard() {
 }
 
 // publish makes the completed dump visible: csv data files are renamed to
-// their published name first — a complete data file without the script is
-// inert, while a script without its data files is a broken restore — then
-// the SQL script is streamed to stdout.
+// their published name first — every name is unique to this run, so previous
+// dump files can never be overwritten — then the SQL script is streamed to
+// stdout. Any failure before the end leaves the removal to discard.
 func (s *dumpSink) publish() error {
 	if s.err != nil {
 		return s.err
@@ -192,5 +211,6 @@ func (s *dumpSink) publish() error {
 		_ = os.Remove(s.f.Name())
 		s.f = nil
 	}
+	s.publishedAll = true
 	return nil
 }

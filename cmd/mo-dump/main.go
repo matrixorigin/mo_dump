@@ -294,8 +294,10 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				// A sequence's current definition and allocation state live in
 				// its backing row, not in SHOW CREATE TABLE
 				// (matrixorigin/matrixone#30577).
+				// isSys scopes the catalog metadata query to the sys account,
+				// where mo_catalog is not tenant-isolated.
 				var state string
-				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name)
+				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount)
 				stateSQL[i] = state
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
@@ -745,10 +747,10 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 }
 
 func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig, out *dumpSink) error {
-	// The csv data file is staged beside its published name and is renamed
-	// only by sink.publish after the whole dump succeeded, so a failed run
-	// can not truncate the operator's previous dump files.
-	f, err := out.startCsv(db, tbl)
+	// The csv data file is staged under a name unique to this run and is
+	// renamed to its published name only after the whole dump succeeded, so
+	// a failed run can not replace the files of a previous dump.
+	f, publishedName, err := out.startCsv(db, tbl)
 	if err != nil {
 		return err
 	}
@@ -765,12 +767,11 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		out.abortCsv(f)
 		return err
 	}
-	fName := csvFileName(db, tbl)
 	pwd := os.Getenv("PWD")
 	if localInfile {
-		out.printf("LOAD DATA LOCAL INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, fName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA LOCAL INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, publishedName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
 	} else {
-		out.printf("LOAD DATA INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, fName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
+		out.printf("LOAD DATA INFILE '%s/%s' INTO TABLE %s FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", pwd, publishedName, quoteIdentifier(tbl), string(csvConf.fieldDelimiter))
 	}
 	return out.Err()
 }

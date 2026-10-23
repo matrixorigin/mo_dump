@@ -16,9 +16,8 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 
@@ -36,16 +35,23 @@ const sequenceStateQuery = "select last_seq_num, min_value, max_value, start_val
 //
 // createSQL recreates the sequence with its current definition; stateSQL
 // repeats last_seq_num/is_called so a restored sequence does not hand out
-// values the source already consumed. -no-data callers may drop stateSQL,
-// which makes the restored sequence continue from its START value.
-func getCreateSequence(ctx context.Context, db, seq string) (createSQL string, stateSQL string, err error) {
-	columnType, err := sequenceColumnType(ctx, db, seq)
+// values the source already consumed. A state that cannot be replayed
+// exactly — for example a last_seq_num outside [min_value, max_value], which
+// ALTER SEQUENCE can produce — fails the dump instead of writing a script
+// whose restore breaks after dropping the old objects
+// (matrixorigin/matrixone#30577). -no-data callers may drop stateSQL, which
+// makes the restored sequence continue from its START value.
+func getCreateSequence(ctx context.Context, db, seq string, isSys bool) (createSQL string, stateSQL string, err error) {
+	columnType, err := sequenceColumnType(ctx, db, seq, isSys)
 	if err != nil {
 		return "", "", err
 	}
 
 	state, err := readSequenceState(ctx, db, seq)
 	if err != nil {
+		return "", "", err
+	}
+	if err := checkSequenceRange(ctx, db, seq, state); err != nil {
 		return "", "", err
 	}
 
@@ -89,15 +95,38 @@ func getCreateSequence(ctx context.Context, db, seq string) (createSQL string, s
 
 // sequenceColumnType returns the numeric type of the sequence, as written by
 // SHOW SEQUENCES, by decoding the backing column type of last_seq_num from
-// mo_catalog.mo_columns.
-func sequenceColumnType(ctx context.Context, db, seq string) (string, error) {
+// mo_catalog.mo_columns. Even a filtered query must find exactly one row;
+// anything else is an ambiguous sequence and fails the dump.
+func sequenceColumnType(ctx context.Context, db, seq string, isSys bool) (string, error) {
 	query := "select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = " +
 		quoteSQLLiteral(db) + " and att_relname = " + quoteSQLLiteral(seq) + " and attname = 'last_seq_num'"
+	if isSys {
+		// A sys account's mo_catalog view is not tenant-isolated: without this
+		// filter the same-name sequence of another tenant can answer the query
+		// and poison the dump with a wrong type (matrixorigin/matrixone#30577).
+		query += " and account_id = 0"
+	}
+	rows, err := conn.Query(query)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
 	var columnType string
-	if err := conn.QueryRow(query).Scan(&columnType); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", moerr.NewNoSuchTable(ctx, db, seq)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return "", err
 		}
+		return "", moerr.NewNoSuchTable(ctx, db, seq)
+	}
+	if err := rows.Scan(&columnType); err != nil {
+		return "", err
+	}
+	if rows.Next() {
+		return "", moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s has ambiguous column metadata in mo_catalog.mo_columns", db, seq)
+	}
+	if err := rows.Err(); err != nil {
 		return "", err
 	}
 	columnType = strings.TrimSpace(columnType)
@@ -161,6 +190,43 @@ func readSequenceState(ctx context.Context, db, seq string) (sequenceState, erro
 		}
 	}
 	return state, nil
+}
+
+// checkSequenceRange verifies the allocation state against the sequence's own
+// bounds. SETVAL — the only user-reachable state writer on restore — rejects a
+// value outside [min_value, max_value], and ALTER SEQUENCE can leave a
+// sequence in exactly such a state (it pre-advances last_seq_num in the
+// session that called NEXTVAL). A dump that would later fail on restore
+// because of this must fail now, at export time, before any old objects are
+// dropped by the script (matrixorigin/matrixone#30577).
+func checkSequenceRange(ctx context.Context, db, seq string, state sequenceState) error {
+	minimum, ok := new(big.Int).SetString(state.minimum, 10)
+	maximum, okMax := new(big.Int).SetString(state.maximum, 10)
+	if !ok || !okMax {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s has non-numeric min/max bounds %q, %q", db, seq, state.minimum, state.maximum)
+	}
+	lastValue, ok := new(big.Int).SetString(state.lastValue, 10)
+	if !ok {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s has non-numeric last_seq_num %q", db, seq, state.lastValue)
+	}
+	if lastValue.Cmp(minimum) < 0 || lastValue.Cmp(maximum) > 0 {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s allocation state last_seq_num %s is outside its bounds [%s, %s]: sequence bounds are not enforced on ALTER SEQUENCE, and SETVAL cannot restore such a state",
+			db, seq, state.lastValue, state.minimum, state.maximum)
+	}
+	startValue, ok := new(big.Int).SetString(state.start, 10)
+	if !ok {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s has non-numeric start_value %q", db, seq, state.start)
+	}
+	if startValue.Cmp(minimum) < 0 || startValue.Cmp(maximum) > 0 {
+		return moerr.NewInternalErrorf(
+			ctx, "sequence %s.%s start_value %s is outside its bounds [%s, %s]",
+			db, seq, state.start, state.minimum, state.maximum)
+	}
+	return nil
 }
 
 // checkSequenceNumber accepts the textual form the server sends for an

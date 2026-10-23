@@ -32,9 +32,13 @@ import (
 func TestGetCreateSequence(t *testing.T) {
 	ctx := context.Background()
 
-	typeQuery := func(db, seq string) string {
-		return "select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = " +
+	typeQuery := func(db, seq string, isSys bool) string {
+		query := "select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = " +
 			quoteSQLLiteral(db) + " and att_relname = " + quoteSQLLiteral(seq) + " and attname = 'last_seq_num'"
+		if isSys {
+			query += " and account_id = 0"
+		}
+		return query
 	}
 	stateCols := []string{
 		"last_seq_num", "min_value", "max_value",
@@ -97,11 +101,11 @@ func TestGetCreateSequence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, mock := exportTestDB(t)
-			mock.ExpectQuery(typeQuery("db", tc.seq)).
+			mock.ExpectQuery(typeQuery("db", tc.seq, false)).
 				WillReturnRows(sqlmock.NewRows([]string{"atttyp"}).AddRow(tc.columnType))
 			mock.ExpectQuery(stateQuery("db", tc.seq)).WillReturnRows(oneState(tc.state...))
 
-			createSQL, stateSQL, err := getCreateSequence(ctx, "db", tc.seq)
+			createSQL, stateSQL, err := getCreateSequence(ctx, "db", tc.seq, false)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantCreate, createSQL)
 			require.Equal(t, tc.wantState, stateSQL)
@@ -113,6 +117,7 @@ func TestGetCreateSequence(t *testing.T) {
 		name       string
 		columnType string
 		hasTypeRow bool
+		typeRows   *sqlmock.Rows
 		hasState   bool
 		state      *sqlmock.Rows
 		wantErr    string
@@ -127,6 +132,18 @@ func TestGetCreateSequence(t *testing.T) {
 			hasTypeRow: true,
 			columnType: "",
 			hasState:   false,
+		},
+		{
+			// A non-isolated mo_catalog view can answer the type query with the
+			// same-name sequence of another tenant; that must fail the dump with
+			// an explicit ambiguity error instead of exporting whichever row the
+			// driver happened to return first (matrixorigin/matrixone#30577).
+			name:       "ambiguous type rows",
+			hasTypeRow: true,
+			typeRows: sqlmock.NewRows([]string{"atttyp"}).
+				AddRow("bigint").AddRow("smallint"),
+			hasState: false,
+			wantErr:  "ambiguous column metadata",
 		},
 		{
 			name:       "no state row",
@@ -145,6 +162,34 @@ func TestGetCreateSequence(t *testing.T) {
 				AddRow("1", "1", "100", "1", "1", "0", "0").
 				AddRow("2", "1", "100", "1", "1", "0", "0"),
 			wantErr: "more than one state row",
+		},
+		{
+			// ALTER SEQUENCE pre-advances last_seq_num in the session that
+			// called NEXTVAL, which can leave last outside [min, max]. SETVAL
+			// rejects the replay on restore, so a dump of that state must
+			// fail at export time (matrixorigin/matrixone#30577).
+			name:       "last allocation exceeds max_value",
+			hasTypeRow: true,
+			columnType: "bigint",
+			hasState:   true,
+			state:      oneState("11", "1", "10", "10", "1", "0", "0"),
+			wantErr:    "outside its bounds",
+		},
+		{
+			name:       "last allocation below min_value",
+			hasTypeRow: true,
+			columnType: "bigint",
+			hasState:   true,
+			state:      oneState("0", "1", "10", "1", "1", "0", "0"),
+			wantErr:    "outside its bounds",
+		},
+		{
+			name:       "start value out of bounds",
+			hasTypeRow: true,
+			columnType: "bigint",
+			hasState:   true,
+			state:      oneState("5", "1", "10", "99", "1", "0", "1"),
+			wantErr:    "start_value 99 is outside",
 		},
 		{
 			name:       "non-numeric last value",
@@ -173,15 +218,18 @@ func TestGetCreateSequence(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, mock := exportTestDB(t)
-			typeRows := sqlmock.NewRows([]string{"atttyp"})
-			if tc.hasTypeRow {
-				typeRows.AddRow(tc.columnType)
+			typeRows := tc.typeRows
+			if typeRows == nil {
+				typeRows = sqlmock.NewRows([]string{"atttyp"})
+				if tc.hasTypeRow {
+					typeRows.AddRow(tc.columnType)
+				}
 			}
-			mock.ExpectQuery(typeQuery("db", "sq")).WillReturnRows(typeRows)
+			mock.ExpectQuery(typeQuery("db", "sq", false)).WillReturnRows(typeRows)
 			if tc.hasState {
 				mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(tc.state)
 			}
-			_, _, err := getCreateSequence(ctx, "db", "sq")
+			_, _, err := getCreateSequence(ctx, "db", "sq", false)
 			require.Error(t, err)
 			switch tc.name {
 			case "missing type row", "empty type text":
@@ -192,6 +240,23 @@ func TestGetCreateSequence(t *testing.T) {
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+
+	// The -sys mode scopes metadata to account 0, where mo_catalog is not
+	// tenant-isolated: only the sys-owned row may answer the type query
+	// (matrixorigin/matrixone#30577).
+	t.Run("sys account scopes the metadata query", func(t *testing.T) {
+		_, mock := exportTestDB(t)
+		mock.ExpectQuery(typeQuery("db", "sq", true)).
+			WillReturnRows(sqlmock.NewRows([]string{"atttyp"}).AddRow("smallint"))
+		mock.ExpectQuery(stateQuery("db", "sq")).WillReturnRows(
+			emptyState().AddRow("5", "1", "3000", "5", "3", "0", "1"))
+
+		createSQL, stateSQL, err := getCreateSequence(ctx, "db", "sq", true)
+		require.NoError(t, err)
+		require.Equal(t, "CREATE SEQUENCE `sq` AS smallint INCREMENT BY 3 MINVALUE 1 MAXVALUE 3000 START WITH 5 NO CYCLE", createSQL)
+		require.Equal(t, "SELECT setval('sq', 5, false)", stateSQL)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 }
 
 // TestReorderDumpObjects checks the stable three-way partition that puts
