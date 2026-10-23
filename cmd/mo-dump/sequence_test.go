@@ -374,7 +374,6 @@ func TestDumpDataExternalTableScript(t *testing.T) {
 		"DROP DATABASE IF EXISTS `db`;\n" +
 		"CREATE DATABASE db ;\n" +
 		"USE `db`;\n\n\n" +
-		"/*!EXTERNAL TABLE `ext`*/\n" +
 		"DROP TABLE IF EXISTS `ext`;\n" +
 		"CREATE EXTERNAL TABLE ext (id int);\n\n\n" +
 		"SET foreign_key_checks = 1;\n"

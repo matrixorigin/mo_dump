@@ -355,7 +355,8 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				out.printf("/*!EXTERNAL TABLE %s*/\n", quoteIdentifier(tbl.Name))
+				// issue-30559: the legacy /*!EXTERNAL TABLE*/ marker is not
+				// executable SQL and is omitted from the dump.
 				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(out, create, true)
 			case catalog.SystemViewRel:
