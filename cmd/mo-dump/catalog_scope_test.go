@@ -60,26 +60,24 @@ const (
 // tables are excluded by relkind only — a former '__mo_tmp_<32hex>_'
 // name regexp was removed because it silently swallowed persistent user
 // tables legally named with that shape.
-var hiddenHelpersFor = func(db string) string {
-	return " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
-		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
-		" where d.datname = '" + db + "'" +
-		" and (d.account_id = current_account_id()" +
-		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
-		" and i.index_table_name is not null and i.index_table_name <> '')" +
-		" and relkind <> 'partition'" +
-		" and relkind <> 'temporary_table'"
-}
+const hiddenHelpersPredicate = " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+	" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+	" where d.datname = ?" +
+	" and (d.account_id = current_account_id()" +
+	" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+	" and i.index_table_name is not null and i.index_table_name <> '')" +
+	" and relkind <> 'partition'" +
+	" and relkind <> 'temporary_table'"
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 	const (
-		defaultSQL = "select datname, dat_type from mo_catalog.mo_database where datname = 'd'" + dbScopePredicate
-		sysSQL     = "select datname, dat_type from mo_catalog.mo_database where datname = 'd' and account_id = 0"
+		defaultSQL = "select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate
+		sysSQL     = "select datname, dat_type from mo_catalog.mo_database where datname = ? and account_id = 0"
 	)
 
 	t.Run("default scopes the query to the connected account", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		mock.ExpectQuery(defaultSQL).
+		mock.ExpectQuery(defaultSQL).WithArgs("d").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 		got, err := getDatabaseType(context.Background(), "d", false)
 		require.NoError(t, err)
@@ -89,7 +87,7 @@ func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 
 	t.Run("default keeps mo_catalog visible for every account", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'mo_catalog'" + dbScopePredicate).
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("mo_catalog").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("mo_catalog", ""))
 		got, err := getDatabaseType(context.Background(), "mo_catalog", false)
 		require.NoError(t, err)
@@ -99,7 +97,7 @@ func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 
 	t.Run("no row reports database not exists", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		mock.ExpectQuery(defaultSQL).WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}))
+		mock.ExpectQuery(defaultSQL).WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}))
 		_, err := getDatabaseType(context.Background(), "d", false)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "database d not exists")
@@ -108,7 +106,7 @@ func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 
 	t.Run("sys account dumps only the sys account", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		mock.ExpectQuery(sysSQL).
+		mock.ExpectQuery(sysSQL).WithArgs("d").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 		got, err := getDatabaseType(context.Background(), "d", true)
 		require.NoError(t, err)
@@ -118,16 +116,14 @@ func TestGetDatabaseTypeScopedQuery(t *testing.T) {
 }
 
 func TestGetTablesScopedQuery(t *testing.T) {
-	baseSQL := func(db string) string {
-		return "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
-	}
+	baseSQL := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
 
 	// The mocked row set models what the server returns after applying the
 	// emitted predicates: hidden helpers are filtered away by the query
 	// itself, so user tables named __mo_user_data and %!%plain survive, and
 	// same-named helper objects in ordinary databases survive too.
-	defaultSQL := baseSQL("d") + tablesScopePredicate + hiddenHelpersFor("d")
-	sysSQL := baseSQL("d") + " and account_id = 0" + hiddenHelpersFor("d")
+	defaultSQL := baseSQL + tablesScopePredicate + hiddenHelpersPredicate
+	sysSQL := baseSQL + " and account_id = 0" + hiddenHelpersPredicate
 
 	t.Run("default returns user __mo_ tables instead of dropping them (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
@@ -149,7 +145,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			// no longer be swallowed by a name regexp now that temporary tables
 			// are identified by relkind only.
 			AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_user", "r")
-		mock.ExpectQuery(defaultSQL).WillReturnRows(rows)
+		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", nil, false)
 		require.NoError(t, err)
@@ -172,7 +168,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("mo_user", "r").
 			AddRow("__mo_user_data", "r")
-		mock.ExpectQuery(sysSQL).WillReturnRows(rows)
+		mock.ExpectQuery(sysSQL).WithArgs("d", "d").WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", nil, true)
 		require.NoError(t, err)
@@ -191,7 +187,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			AddRow("mo_increment_columns", "r").
 			AddRow("mo_account_lock", "v").
 			AddRow("__mo_account_lock", "v")
-		mock.ExpectQuery(defaultSQL).WillReturnRows(rows) // db "d": no helper-name predicates
+		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows) // db "d": no helper-name predicates
 
 		tables, err := getTables(context.Background(), "d", nil, false)
 		require.NoError(t, err)
@@ -205,13 +201,13 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("mo_catalog dump still excludes its own helper tables", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		catalogSQL := baseSQL("mo_catalog") + tablesScopePredicate + hiddenHelpersFor("mo_catalog") + catalogHelpersPredicate
+		catalogSQL := baseSQL + tablesScopePredicate + hiddenHelpersPredicate + catalogHelpersPredicate
 		// The pre-filtered result the server returns for mo_catalog itself.
 		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("mo_database", "r").
 			AddRow("mo_tables", "r").
 			AddRow("mo_columns", "r")
-		mock.ExpectQuery(catalogSQL).WillReturnRows(rows)
+		mock.ExpectQuery(catalogSQL).WithArgs("mo_catalog", "mo_catalog").WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "mo_catalog", nil, false)
 		require.NoError(t, err)
@@ -225,11 +221,11 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("explicit -tbl accepts a user __mo_ table (#30562)", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		sqlWithTbl := defaultSQL + " and relname in ('__mo_user_data','plain')"
+		sqlWithTbl := defaultSQL + " and relname in (?,?)"
 		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("__mo_user_data", "r").
 			AddRow("plain", "r")
-		mock.ExpectQuery(sqlWithTbl).WillReturnRows(rows)
+		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data", "plain").WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}, {Name: "plain"}}, false)
 		require.NoError(t, err)
@@ -242,10 +238,10 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("explicit -tbl missing table reports not exists", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		sqlWithTbl := defaultSQL + " and relname in ('__mo_user_data')"
+		sqlWithTbl := defaultSQL + " and relname in (?)"
 		// The hidden-table predicates filter nothing a user could request
 		// explicitly; an empty result means the object does not exist.
-		mock.ExpectQuery(sqlWithTbl).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}))
+		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}))
 
 		_, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}}, false)
 		require.Error(t, err)
@@ -255,7 +251,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 
 	t.Run("query error is propagated", func(t *testing.T) {
 		mock := newCatalogMock(t)
-		mock.ExpectQuery(defaultSQL).WillReturnError(sql.ErrConnDone)
+		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnError(sql.ErrConnDone)
 		_, err := getTables(context.Background(), "d", nil, false)
 		require.ErrorIs(t, err, sql.ErrConnDone)
 		require.NoError(t, mock.ExpectationsWereMet())

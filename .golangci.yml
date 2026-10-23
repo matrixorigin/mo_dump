@@ -35,6 +35,14 @@ linters:
     - unused
 
 linters-settings:
+  depguard:
+    # Preserve the legacy empty denylist; do not ban existing dependencies.
+    rules:
+      main:
+        files: ["$all"]
+        list-mode: lax
+        allow: ["$gostd"]
+        deny: []
   stylecheck:
     checks:
       - ST1001

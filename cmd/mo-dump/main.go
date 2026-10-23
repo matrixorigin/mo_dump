@@ -32,8 +32,8 @@ import (
 	"unicode/utf8"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/mo_dump/internal/catalog"
 )
 
 type Options struct {
@@ -209,6 +209,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	var (
 		createDb    string
 		createTable []string
+		views       []dumpView
 		err         error
 	)
 
@@ -230,21 +231,22 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			return err
 		}
 
+		db = dbStruct.Name // Catalog identity, not the requested spelling.
 		if opt.emptyTables {
 			opt.tables = nil
 		}
 		if len(opt.tables) == 0 { //dump all tables
 			if dbStruct.DBType == catalog.SystemDBTypeSubscription {
-				createDb = fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", db)
+				createDb = "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier(db)
 			} else {
 				createDb, err = getCreateDB(db)
 				if err != nil {
 					return err
 				}
 			}
-			fmt.Printf("DROP DATABASE IF EXISTS `%s`;\n", db)
+			fmt.Printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
 			fmt.Println(createDb, ";")
-			fmt.Printf("USE `%s`;\n\n\n", db)
+			fmt.Printf("USE %s;\n\n\n", quoteIdentifier(db))
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -273,10 +275,12 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 			case catalog.SystemViewRel:
-				createTableSql, err = getCreateView(db, tbl.Name)
+				view, err := getDumpView(ctx, db, tbl.Name, opt.sysAccount)
 				if err != nil {
 					return err
 				}
+				views = append(views, view)
+				createTableSql = view.create
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
@@ -288,26 +292,11 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				return &bytes.Buffer{}
 			},
 		}
-		left, right := 0, len(createTable)-1
-		for left < right {
-			for left < len(createTable) && opt.tables[left].Kind != catalog.SystemViewRel {
-				left++
-			}
-			for right >= 0 && opt.tables[right].Kind == catalog.SystemViewRel {
-				right--
-			}
-			if left >= right {
-				break
-			}
-			createTable[left], createTable[right] = createTable[right], createTable[left]
-			opt.tables[left], opt.tables[right] = opt.tables[right], opt.tables[left]
-		}
-		adjustViewOrder(createTable, opt.tables, left)
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
 			case catalog.SystemOrdinaryRel, emptyRelKind:
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
+				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, false)
 				if !opt.noData {
 					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
@@ -316,16 +305,32 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("/*!EXTERNAL TABLE `%s`*/\n", tbl.Name)
-				fmt.Printf("DROP TABLE IF EXISTS `%s`;\n", tbl.Name)
+				fmt.Printf("/*!EXTERNAL TABLE %s*/\n", quoteIdentifier(tbl.Name))
+				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, true)
 			case catalog.SystemViewRel:
-				fmt.Printf("DROP VIEW IF EXISTS `%s`;\n", tbl.Name)
-				showCreateTable(create, true)
+				// The definition and its creation mode were captured together above.
+				continue
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
+		}
+	}
+	var mode viewSQLMode
+	if len(views) > 0 {
+		mode, err = getViewCatalogMode(ctx)
+		if err != nil {
+			return fmt.Errorf("cannot read view catalog mode: %w", err)
+		}
+	}
+	orderedViews, err := orderDumpViews(ctx, views, mode)
+	if err != nil {
+		return err
+	}
+	for _, view := range orderedViews {
+		if err := showDumpView(view, mode); err != nil {
+			return err
 		}
 	}
 	// reset foreign_key_checks variable to dump file
@@ -359,52 +364,6 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	return conn, nil
 }
 
-func adjustViewOrder(createTable []string, tables Tables, start int) {
-	viewName := make([]string, 0)
-	viewPos := make(map[string]int)
-	cnt := len(tables)
-	for i := start; i < cnt; i++ {
-		viewPos[tables[i].Name] = i - start
-		viewName = append(viewName, tables[i].Name)
-	}
-	viewCount := make([]int, len(viewName))
-	viewRef := make([][]int, len(viewName))
-	for i := start; i < cnt; i++ {
-		for j := start; j < cnt; j++ {
-			if i == j {
-				continue
-			}
-			if strings.Count(createTable[i], tables[j].Name) > 0 {
-				viewCount[viewPos[tables[i].Name]]++
-				viewRef[viewPos[tables[j].Name]] = append(viewRef[viewPos[tables[j].Name]], viewPos[tables[i].Name])
-			}
-		}
-	}
-	order := 0
-	orderArr := make([]int, 0)
-	visit := make([]bool, len(viewName))
-	for order < len(viewName) {
-		for i := 0; i < len(viewName); i++ {
-			if viewCount[i] == 0 && !visit[i] {
-				visit[i] = true
-				order++
-				orderArr = append(orderArr, i)
-				for j := 0; j < len(viewRef[i]); j++ {
-					viewCount[viewRef[i][j]]--
-				}
-			}
-		}
-	}
-	newCreate := make([]string, cnt)
-	newTables := make([]Table, cnt)
-	for i := 0; i < len(orderArr); i++ {
-		newCreate[i] = createTable[orderArr[i]+start]
-		newTables[i] = tables[orderArr[i]+start]
-	}
-	_ = copy(createTable[start:], newCreate)
-	_ = copy(tables[start:], newTables)
-}
-
 func showCreateTable(createSql string, withNextLine bool) {
 	var suffix string
 	if !strings.HasSuffix(createSql, ";") {
@@ -416,7 +375,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 	fmt.Printf("%s%s\n", createSql, suffix)
 }
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
-	sql := "select datname, dat_type from mo_catalog.mo_database where datname = '" + db + "'"
+	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {
 		sql += " and account_id = 0"
 	} else {
@@ -427,7 +386,7 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 		// matching the server's SHOW DATABASES visibility.
 		sql += " and (account_id = current_account_id() or (account_id = 0 and datname = 'mo_catalog'))"
 	}
-	r, err := conn.Query(sql)
+	r, err := conn.QueryContext(ctx, sql, db)
 	if err != nil {
 		return Db{}, err
 	}
@@ -442,6 +401,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 		}
 		dbs = append(dbs, Db{dbName, dbType})
 	}
+	if err := r.Err(); err != nil {
+		return Db{}, err
+	}
 	if len(dbs) != 1 {
 		return Db{}, moerr.NewInvalidInput(ctx, fmt.Sprintf("database %s not exists", db))
 	}
@@ -449,7 +411,9 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 }
 
 func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
-	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = '" + db + "'"
+	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
+	args := make([]any, 0, len(tables)+2)
+	args = append(args, db)
 	if isSys {
 		sql += " and account_id = 0"
 	} else {
@@ -487,12 +451,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 	// never be skipped silently.
 	sql += " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
 		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
-		" where d.datname = '" + db + "'" +
+		" where d.datname = ?" +
 		" and (d.account_id = current_account_id()" +
 		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
 		" and i.index_table_name is not null and i.index_table_name <> '')" +
 		" and relkind <> 'partition'" +
 		" and relkind <> 'temporary_table'"
+	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
 	// mo_catalog, and ordinary databases may legally contain same-named
@@ -508,12 +473,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 			if i != 0 {
 				sql += ","
 			}
-			sql += "'" + tbl.Name + "'"
+			sql += "?"
+			args = append(args, tbl.Name)
 			tableNames[tbl.Name] = false
 		}
 		sql += ")"
 	}
-	r, err := conn.Query(sql)
+	r, err := conn.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +513,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 }
 
 func getCreateDB(db string) (string, error) {
-	r := conn.QueryRow("show create database `" + db + "`")
+	r := conn.QueryRow("show create database " + quoteIdentifier(db))
 	var create string
 	err := r.Scan(&db, &create)
 	if err != nil {
@@ -581,7 +547,7 @@ func getDatabases(ctx context.Context) ([]string, error) {
 }
 
 func getCreateTable(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
+	r := conn.QueryRow("show create table " + quoteIdentifier(db) + "." + quoteIdentifier(tbl))
 	var create string
 	err := r.Scan(&tbl, &create)
 	if err != nil {
@@ -601,18 +567,6 @@ func getCreateTable(db, tbl string) (string, error) {
 	return create, nil
 }
 
-func getCreateView(db, tbl string) (string, error) {
-	r := conn.QueryRow("show create table `" + db + "`.`" + tbl + "`")
-	var create string
-	var character_set_client string
-	var collation_connection string
-	err := r.Scan(&tbl, &create, &character_set_client, &collation_connection)
-	if err != nil {
-		return "", err
-	}
-	return create, nil
-}
-
 func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
@@ -626,7 +580,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		bufPool.Put(curBuf)
 	}()
 	buf.Grow(netBufferLength)
-	initInert := "INSERT INTO `" + tbl + "` VALUES "
+	initInert := "INSERT INTO " + quoteIdentifier(tbl) + " VALUES "
 	for {
 		buf.WriteString(initInert)
 		preLen := buf.Len()
@@ -717,9 +671,9 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		return err
 	}
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quoteString(fmt.Sprintf("%s/%s", pwd, fname)), quoteIdentifier(tbl), quoteString(string(csvConf.fieldDelimiter)))
 	} else {
-		fmt.Printf("LOAD DATA INFILE '%s' INTO TABLE `%s` FIELDS TERMINATED BY '%s' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", fmt.Sprintf("%s/%s", pwd, fname), tbl, string(csvConf.fieldDelimiter))
+		fmt.Printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quoteString(fmt.Sprintf("%s/%s", pwd, fname)), quoteIdentifier(tbl), quoteString(string(csvConf.fieldDelimiter)))
 	}
 	return nil
 }
@@ -836,7 +790,7 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 }
 
 func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
-	querySql := "select * from `" + db + "`.`" + tbl + "`"
+	querySql := "select * from " + quoteIdentifier(db) + "." + quoteIdentifier(tbl)
 	if condition != "" {
 		querySql += " where " + condition
 	}

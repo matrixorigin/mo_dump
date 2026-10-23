@@ -41,14 +41,15 @@
 # where am I
 ROOT_DIR = $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 MO_DUMP := mo-dump
+GO := env GOTOOLCHAIN=go$(shell awk '$$1 == "go" {print $$2}' $(ROOT_DIR)/go.mod) GOWORK=off go
 UNAME_S := $(shell uname -s)
-GOPATH := $(shell go env GOPATH)
-GO_VERSION=$(shell go version)
+GOPATH := $(shell $(GO) env GOPATH)
+GO_VERSION=$(shell $(GO) version)
 BRANCH_NAME=$(shell git rev-parse --abbrev-ref HEAD)
 LAST_COMMIT_ID=$(shell git rev-parse --short HEAD)
 BUILD_TIME=$(shell date +%s)
 MO_VERSION=$(shell git describe --always --tags $(shell git rev-list --tags --max-count=1))
-GO_MODULE=$(shell go list -m)
+GO_MODULE=$(shell $(GO) list -m)
 
 # cross compilation has been disabled for now
 ifneq ($(GOARCH)$(TARGET_ARCH)$(GOOS)$(TARGET_OS),)
@@ -68,7 +69,7 @@ all: build
 .PHONY: vendor-build
 vendor-build:
 	$(info [go mod vendor])
-	@go mod vendor
+	@$(GO) mod vendor
 
 
 ###############################################################################
@@ -79,7 +80,7 @@ vendor-build:
 clean:
 	$(info [Clean up])
 	$(info Clean go test cache)
-	@go clean -testcache
+	@$(GO) clean -testcache
 	rm -f $(MO_DUMP)
 
 
@@ -90,19 +91,27 @@ clean:
 RACE_OPT :=
 DEBUG_OPT :=
 CGO_DEBUG_OPT :=
-CGO_OPTS=CGO_CFLAGS="-I$(ROOT_DIR)/cgo " CGO_LDFLAGS="-L$(ROOT_DIR)/cgo -lmo -lm"
+CGO_OPTS=CGO_CFLAGS="-I$(ROOT_DIR)/thirdparties/install/include" CGO_LDFLAGS="-L$(ROOT_DIR)/thirdparties/install/lib"
 GOLDFLAGS=-ldflags="-X '$(GO_MODULE)/pkg/version.GoVersion=$(GO_VERSION)' -X '$(GO_MODULE)/pkg/version.BranchName=$(BRANCH_NAME)' -X '$(GO_MODULE)/pkg/version.CommitID=$(LAST_COMMIT_ID)' -X '$(GO_MODULE)/pkg/version.BuildTime=$(BUILD_TIME)' -X '$(GO_MODULE)/pkg/version.Version=$(MO_VERSION)'"
 
 .PHONY: cgo
 cgo:
 	@(cd cgo; ${MAKE} ${CGO_DEBUG_OPT})
 
+.PHONY: jemalloc
+jemalloc:
+	$(MAKE) -C thirdparties GO="$(GO)"
+
 .PHONY: modump
-modump:
-	$(CGO_OPTS) go build $(RACE_OPT) $(GOLDFLAGS) -o $(MO_DUMP) ./cmd/mo-dump
+modump: jemalloc
+	$(CGO_OPTS) $(GO) build $(RACE_OPT) $(GOLDFLAGS) -o $(MO_DUMP) ./cmd/mo-dump
 
 .PHONY: build
-build:  cgo modump
+build: modump
+
+.PHONY: test
+test: jemalloc
+	$(CGO_OPTS) $(GO) test -mod=readonly -count=1 ./...
 
 ###############################################################################
 # static checks

@@ -40,11 +40,11 @@ func TestDumpDataEmptyRelKind(t *testing.T) {
 	}
 
 	// getDatabaseType
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'd'" + dbScopePredicate).
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	// getTables
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'd'" +
-		tablesScopePredicate + hiddenHelpersFor("d") + " and relname in ('__mo_index_renamed')").
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "__mo_index_renamed").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("__mo_index_renamed", ""))
 	// getCreateTable on the empty-kind object
 	mock.ExpectQuery("show create table `d`.`__mo_index_renamed`").
@@ -79,10 +79,10 @@ func TestDumpDataEmptyRelKindNotSilent(t *testing.T) {
 		netBufferLength: 1024 * 1024,
 	}
 
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = 'd'" + dbScopePredicate).
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = 'd'" +
-		tablesScopePredicate + hiddenHelpersFor("d") + " and relname in ('whatever')").
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersPredicate+" and relname in (?)").WithArgs("d", "d", "whatever").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("whatever", "somefuturekind"))
 
 	err := opt.dumpData(context.Background())
