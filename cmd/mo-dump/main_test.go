@@ -640,7 +640,7 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 	// containing */, so the external-table section must carry no comment at all.
 	require.False(t, strings.Contains(out.String(), "/*"),
 		"external table section must not emit comments, table %q can terminate block comments early", tblName)
-	require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
+	require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

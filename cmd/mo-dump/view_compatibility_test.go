@@ -388,7 +388,10 @@ func TestDumpViewDependencies(t *testing.T) {
 				if mode == "mode error" {
 					require.ErrorIs(t, err, injected)
 				}
-				require.Equal(t, "SET foreign_key_checks = 0;\n\n", output, "failure must not emit relation DDL")
+				// The dump preamble (fk preset + sql_mode pin for
+				// matrixorigin/matrixone#30587) is emitted before any
+				// relation DDL even when the dump later fails.
+				require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n", output, "failure must not emit relation DDL")
 			}
 		})
 	}
