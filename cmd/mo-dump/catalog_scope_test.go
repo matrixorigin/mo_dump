@@ -77,7 +77,10 @@ func hiddenHelpersFor(legacyClassify bool) string {
 	if legacyClassify {
 		return base + " and not mo_is_legacy_temporary_table(relkind, relname, reldatabase, coalesce(rel_createsql, ''), coalesce(extra_info, ''))"
 	}
-	return base + " and not (regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_') and coalesce(relkind, '') in ('r', ''))"
+	// No classifier on v4.1.x and older clusters: the __mo_tmp_<32hex>_ rows
+	// are not filtered by the query — getTables inspects them and aborts the
+	// dump unless the user selected them explicitly with -tbl.
+	return base
 }
 
 func TestGetDatabaseTypeScopedQuery(t *testing.T) {
@@ -150,12 +153,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			// literal index-table prefix is not registered in mo_indexes, so it
 			// is dumped whatever kind its row carries ('r' on first creation,
 			// '' once the server blanks the kind after rename/restore).
-			AddRow("__mo_index_renamed", "").
-			// Review regression #R9: a persistent user table legally named with
-			// the former temporary-backing name shape '__mo_tmp_<32hex>_' must
-			// no longer be swallowed by a name regexp now that temporary tables
-			// are identified by relkind only.
-			AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_user", "r")
+			AddRow("__mo_index_renamed", "")
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
 
 		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
@@ -167,7 +165,6 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			{Name: "%!%plain", Kind: "r"},
 			{Name: "demo_index_data", Kind: "r"},
 			{Name: "__mo_index_renamed", Kind: ""},
-			{Name: "__mo_tmp_0123456789abcdef0123456789abcdef_user", Kind: "r"},
 		}, tables)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -258,6 +255,41 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "table __mo_user_data not exists")
 		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("fallback aborts on ambiguous tmp-shaped rows; explicit -tbl exports them (round 10)", func(t *testing.T) {
+		const shaped = "__mo_tmp_0123456789abcdef0123456789abcdef_user"
+		t.Run("default dump aborts", func(t *testing.T) {
+			mock := newCatalogMock(t)
+			rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+				AddRow("plain", "r").
+				AddRow(shaped, "r")
+			mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
+			_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "has the legacy temporary name shape")
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+		t.Run("explicit -tbl selection exports the row", func(t *testing.T) {
+			mock := newCatalogMock(t)
+			rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+				AddRow(shaped, "r")
+			mock.ExpectQuery(defaultSQL+" and relname in (?)").WithArgs("d", "d", shaped).WillReturnRows(rows)
+			got, err := getTables(context.Background(), "d", Tables{{Name: shaped}}, Options{legacyClassifyFn: false})
+			require.NoError(t, err)
+			assert.Equal(t, Tables{{Name: shaped, Kind: "r"}}, got)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+		t.Run("empty-kind shape row without explicit selection aborts too", func(t *testing.T) {
+			mock := newCatalogMock(t)
+			rows := sqlmock.NewRows([]string{"relname", "relkind"}).
+				AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_d_idx", "")
+			mock.ExpectQuery(sysSQL).WithArgs("d", "d").WillReturnRows(rows)
+			_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: true})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "has the legacy temporary name shape")
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
 	})
 
 	t.Run("server classifier predicate when the probe is available (round 9)", func(t *testing.T) {

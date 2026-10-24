@@ -40,6 +40,7 @@ func TestDumpDataEmptyRelKind(t *testing.T) {
 	}
 
 	// getDatabaseType
+	expectLegacyProbeAbsent(mock)
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	// getTables
@@ -79,6 +80,7 @@ func TestDumpDataEmptyRelKindNotSilent(t *testing.T) {
 		netBufferLength: 1024 * 1024,
 	}
 
+	expectLegacyProbeAbsent(mock)
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+

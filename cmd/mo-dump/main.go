@@ -31,7 +31,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/mo_dump/internal/catalog"
 )
@@ -353,15 +353,52 @@ func (opt *Options) dumpData(ctx context.Context) error {
 func probeLegacyTemporaryTableFn(ctx context.Context) (bool, error) {
 	r, err := conn.QueryContext(ctx, "select mo_is_legacy_temporary_table('r','x','d','', '')")
 	if err != nil {
-		return false, nil
+		if isUnknownFunctionErr(err) {
+			// Only the server's own "function does not exist" answer means the
+			// cluster predates the classifier (v4.1.x and older, e.g. v1.2.4).
+			// Any injected/failing error must not blast the dump into the
+			// degraded fallback: review round 10 had one bad probe trip the
+			// fallback on functioning clusters and produce a "successful"
+			// backup the classifier would have completed correctly.
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot probe mo_is_legacy_temporary_table: %w", err)
 	}
 	defer r.Close()
+	// Drive the rows: driver-level row errors (RowError paths, stream
+	// resets) only surface on Err() after iteration has touched them.
 	for r.Next() {
 	}
 	if err := r.Err(); err != nil {
-		return false, nil
+		if isUnknownFunctionErr(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot probe mo_is_legacy_temporary_table: %w", err)
 	}
 	return true, nil
+}
+
+// isUnknownFunctionErr reports whether the error is the server's own
+// unknown-function answer. Across every supported release (v1.2 through
+// current) the resolved form is moerr.NotSupported, surfaced by the MySQL
+// driver as error 20105 with the message "not supported: function or
+// operator '<name>'"; stock MySQL versions may answer 1305 ("FUNCTION
+// ... does not exist") instead. Anything else — transient faults,
+// privilege errors, connection resets — is not proof of absence and must
+// abort the dump instead of downgrading it (review round 10).
+func isUnknownFunctionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) && (myErr.Number == 20105 || myErr.Number == 1305) {
+		msg := strings.ToLower(myErr.Message)
+		return strings.Contains(msg, "function") ||
+			strings.Contains(msg, "operator")
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not supported: function or operator") ||
+		(strings.Contains(msg, "function") && strings.Contains(msg, "does not exist"))
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
@@ -496,10 +533,14 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 	if opt.legacyClassifyFn {
 		sql += " and not mo_is_legacy_temporary_table(relkind, relname, reldatabase," +
 			" coalesce(rel_createsql, ''), coalesce(extra_info, ''))"
-	} else {
-		sql += " and not (regexp_like(relname, '^__mo_tmp_[0-9a-f]{32}_')" +
-			" and coalesce(relkind, '') in ('r', ''))"
 	}
+	// Without the classifier (clusters that predate it) the __mo_tmp_<32hex>_
+	// rows are ambiguous: they can be session temporary backing rows of
+	// v4.0/v4.1 or legally named persistent tables. No metadata on those
+	// clusters can tell the two apart (review rounds 9-10), so the dump
+	// refuses instead of silently guessing: rows that reach the client are
+	// inspected below, and ambiguous ones abort the dump unless the user
+	// selected them explicitly with -tbl (review round 10 / #30562).
 	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
@@ -538,6 +579,14 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 		err = r.Scan(&table, &kind)
 		if err != nil {
 			return nil, err
+		}
+		if !opt.legacyClassifyFn && isLegacyTemporaryShape(table, kind) {
+			if _, explicit := tableNames[table]; !explicit {
+				return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf(
+					"table %s has the legacy temporary name shape but this cluster has no authoritative classifier; "+
+						"dump it explicitly with -tbl, rename it, clean up expired session temporary tables, or run mo-dump against a v4.2+ cluster",
+					table))
+			}
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true
@@ -1049,4 +1098,29 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 func isStringType(typ string) bool {
 	typ = strings.ToLower(typ)
 	return typ == "text" || typ == "char" || typ == "varchar" || typ == "json"
+}
+
+// isLegacyTemporaryShape reports whether a catalog row carries the
+// v4.0/v4.1 temporary backing-table shape: the physical name encodes a
+// session id (__mo_tmp_<32 lowercase hex>_...) and the row's kind is one
+// those releases wrote through the ordinary path ('r' or empty).
+func isLegacyTemporaryShape(relName, relKind string) bool {
+	if relKind != catalog.SystemOrdinaryRel && relKind != "" {
+		return false
+	}
+	rest, ok := strings.CutPrefix(relName, "__mo_tmp_")
+	if !ok {
+		return false
+	}
+	session, _, found := strings.Cut(rest, "_")
+	if !found || len(session) != 32 {
+		return false
+	}
+	for i := 0; i < len(session); i++ {
+		c := session[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

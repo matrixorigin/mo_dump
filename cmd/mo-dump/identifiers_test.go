@@ -238,6 +238,7 @@ func TestDumpIdentifiers(t *testing.T) {
 				const dbName = "d'`b"
 				const quotedDB = "`d'``b`"
 				opt := Options{dbs: []string{dbName}, emptyTables: mode != "table", noData: mode == "schema", netBufferLength: 1024}
+				expectLegacyProbeAbsent(mock)
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 					WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "")).RowsWillBeClosed()
 				want := "SET foreign_key_checks = 0;\n\n"
@@ -282,6 +283,7 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			mock := newIdentifierMock(t)
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a`b"}}, noData: true}
+			expectLegacyProbeAbsent(mock)
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 				WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", "")).RowsWillBeClosed()
 			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("d", "d", "a`b").

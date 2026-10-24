@@ -349,6 +349,7 @@ func TestGenOutputClosesRows(t *testing.T) {
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
 		_, mock := exportTestDB(t)
+		expectLegacyProbeAbsent(mock)
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 		kind := "r"
