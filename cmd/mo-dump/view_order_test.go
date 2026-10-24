@@ -240,7 +240,7 @@ func TestDumpDataViewOrder(t *testing.T) {
 				}
 			}
 			opt := Options{dbs: []string{"d"}, emptyTables: true, noData: true}
-			err = opt.dumpData(context.Background())
+			err = runDumpDataOverStdout(t, &opt, context.Background())
 			if tc.err != "" {
 				require.ErrorContains(t, err, tc.err)
 			} else {

@@ -44,7 +44,7 @@ func TestMergedEmptyDefaultTargetsOwner(t *testing.T) {
 	_, output := mockDumpOutput(t)
 	mode := ""
 	view := dumpView{name: viewName{"owner", "v"}, create: "CREATE VIEW v AS SELECT 7 AS x", definition: &viewDefinition{SQLMode: &mode}}
-	require.NoError(t, showDumpView(view, viewSQLMode{}))
+	require.NoError(t, showDumpView(sinkOver(os.Stdout), view, viewSQLMode{}))
 	text, err := os.ReadFile(output.Name())
 	require.NoError(t, err)
 	require.Contains(t, string(text), "USE `owner`;\n\nDROP VIEW IF EXISTS `owner`.`v`;\nCREATE VIEW v AS SELECT 7 AS x;")

@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
@@ -215,7 +216,9 @@ func TestIdentifierQueryErrors(t *testing.T) {
 		{"database", "show create database `d'``b`", func() error { _, err := getCreateDB("d'`b"); return err }},
 		{"table", "show create table `d'``b`.`a'``b`", func() error { _, err := getCreateTable("d'`b", "a'`b"); return err }},
 		{"view", "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)", func() error { _, err := getDumpView(context.Background(), "d'`b", "a'`b", false); return err }},
-		{"select", "select * from `d'``b`.`a'``b`", func() error { return genOutput("d'`b", "a'`b", nil, 1024, false, &csvConfig{}, "") }},
+		{"select", "select * from `d'``b`.`a'``b`", func() error {
+			return genOutput("d'`b", "a'`b", sinkOver(os.Stdout), nil, 1024, false, &csvConfig{}, "")
+		}},
 	} {
 		t.Run(query.name, func(t *testing.T) {
 			mock := newIdentifierMock(t)
@@ -269,7 +272,7 @@ func TestDumpIdentifiers(t *testing.T) {
 					want += "INSERT INTO " + tc.quoted + " VALUES (1,'row');\n\n\n\n"
 				}
 				want += "SET foreign_key_checks = 1;\n"
-				got := captureIdentifierOutput(t, func() { require.NoError(t, opt.dumpData(context.Background())) })
+				got := captureIdentifierOutput(t, func() { require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background())) })
 				require.Equal(t, want, got)
 			})
 		}
@@ -302,7 +305,7 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 			} else {
 				mock.ExpectQuery("show create table `d`.`a``b`").WillReturnRows(rows).RowsWillBeClosed()
 			}
-			got := captureIdentifierOutput(t, func() { require.NoError(t, opt.dumpData(context.Background())) })
+			got := captureIdentifierOutput(t, func() { require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background())) })
 			if kind == catalog.SystemViewRel {
 				require.Contains(t, got, "USE `d`;\n\n"+drop+ddl+";\n\n\nSET SESSION sql_mode = @modump_saved_sql_mode;\nSET foreign_key_checks = 1;\n")
 			} else {
@@ -328,16 +331,38 @@ func TestLoadIdentifiers(t *testing.T) {
 				sqlmock.NewColumn("id").OfType("INT", int64(1)),
 			).AddRow(1)).RowsWillBeClosed()
 			got := captureIdentifierOutput(t, func() {
-				require.NoError(t, genOutput("d", "a'`\\b", nil, 1024, local, &csvConfig{enable: true, fieldDelimiter: ','}, ""))
+				require.NoError(t, genOutput("d", "a'`\\b", sinkOver(os.Stdout), nil, 1024, local, &csvConfig{enable: true, fieldDelimiter: ','}, ""))
 			})
 			prefix := "LOAD DATA"
 			if local {
 				prefix += " LOCAL"
 			}
-			require.Equal(t, prefix+" INFILE '"+root+"/work''`\\\\dir/d_a''`\\\\b.csv' INTO TABLE `a'``\\b` FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", got)
-			data, err := os.ReadFile(filepath.Join(dir, "d_a'`\\b.csv"))
+			// Published csv names carry the per-run ".mo-dump-<id>" suffix, so
+			// match the statement up to the run-unique part of the file name.
+			wantSuffix := "' INTO TABLE `a'``\\b` FIELDS TERMINATED BY ',' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n"
+			require.True(t, strings.HasPrefix(got, prefix+" INFILE '"+root+"/work''`\\\\dir/d_a''`\\\\b.csv"), "got %q", got)
+			require.True(t, strings.HasSuffix(got, wantSuffix), "got %q", got)
+			// At the genOutput layer the csv data file is only staged: a hidden
+			// staged file holding the rows plus the empty exclusively reserved
+			// published placeholder; publish renames the pair.
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			require.Len(t, entries, 2)
+			var staged, reserved string
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".") {
+					staged = entry.Name()
+				} else {
+					reserved = entry.Name()
+				}
+			}
+			require.Contains(t, reserved, ".mo-dump-")
+			data, err := os.ReadFile(filepath.Join(dir, staged))
 			require.NoError(t, err)
 			require.Equal(t, "1\n", string(data))
+			placeholder, err := os.ReadFile(filepath.Join(dir, reserved))
+			require.NoError(t, err)
+			require.Empty(t, placeholder)
 		})
 	}
 }

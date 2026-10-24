@@ -62,7 +62,7 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 			}
 			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 			opt := Options{dbs: dbs, emptyTables: true, noData: tt.noData, netBufferLength: defaultNetBufferLength}
-			require.NoError(t, opt.dumpData(context.Background()))
+			require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background()))
 			require.NoError(t, mock.ExpectationsWereMet())
 			content, err := os.ReadFile(output.Name())
 			require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestDumpViewsFailure(t *testing.T) {
 				expect.WillReturnRows(step.rows)
 			}
 			opt := Options{dbs: []string{"db"}, emptyTables: true, noData: failure != "data", netBufferLength: defaultNetBufferLength}
-			err := opt.dumpData(context.Background())
+			err := runDumpDataOverStdout(t, &opt, context.Background())
 			switch failure {
 			case "invalid_view":
 				require.ErrorContains(t, err, "analyze view db.v")
@@ -181,7 +181,7 @@ func TestDumpWithoutViews(t *testing.T) {
 				mock.ExpectQuery("show create table `db`.`t`").WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).AddRow("t", "CREATE TABLE t (x INT)"))
 			}
 			opt := Options{dbs: []string{"db"}, emptyTables: true, noData: true}
-			require.NoError(t, opt.dumpData(context.Background()))
+			require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background()))
 			require.NoError(t, mock.ExpectationsWereMet())
 			content, err := os.ReadFile(output.Name())
 			require.NoError(t, err)

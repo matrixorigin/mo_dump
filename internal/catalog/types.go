@@ -21,5 +21,6 @@ const (
 	SystemOrdinaryRel        = "r"
 	SystemExternalRel        = "e"
 	SystemViewRel            = "v"
+	SystemSequenceRel        = "S"
 	SystemDBTypeSubscription = "subscription"
 )
