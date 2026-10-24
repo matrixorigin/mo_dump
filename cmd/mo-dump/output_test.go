@@ -385,8 +385,10 @@ func TestDumpSinkPublishesUmaskMode(t *testing.T) {
 // discard still removes the spool and the already-renamed csv file.
 func TestDumpSinkPublishAgainstClosedStdout(t *testing.T) {
 	// The test process does not run main(); ignore SIGPIPE here the same way
-	// the CLI does, or a regression would kill the whole test binary.
+	// the CLI does, or a regression would kill the whole test binary, and
+	// restore the Go default disposition afterwards for other tests.
 	signal.Ignore(syscall.SIGPIPE)
+	t.Cleanup(func() { signal.Reset(syscall.SIGPIPE) })
 
 	chdirToTemp(t)
 	sink, err := newDumpSink()
@@ -414,4 +416,40 @@ func TestDumpSinkPublishAgainstClosedStdout(t *testing.T) {
 	hasNoStagingLeftover(t)
 	files := readDirSnapshot(t)
 	require.Empty(t, files)
+}
+
+// TestDumpSinkRevokeRemovesPublishedFiles pins the tail-note failure
+// contract from main: publication already flagged the sink complete, so
+// discard alone would be a no-op and the exit path skips defers anyway.
+// revoke takes already renamed csv files back: a run whose consumer never
+// saw the success notes must not leave any of its own files behind
+// (matrixorigin/matrixone#30577).
+func TestDumpSinkRevokeRemovesPublishedFiles(t *testing.T) {
+	chdirToTemp(t)
+	sink, err := newDumpSink()
+	require.NoError(t, err)
+	sink.printf("SET foreign_key_checks = 0;\n\n")
+	_, published := stageCsvOne(t, sink, "db", "t", "1,2\n")
+
+	out, outErr := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	require.NoError(t, outErr)
+	oldStdout := os.Stdout
+	os.Stdout = out
+	pubErr := sink.publish()
+	os.Stdout = oldStdout
+	require.NoError(t, outErr)
+	require.NoError(t, out.Close())
+	require.NoError(t, pubErr)
+	require.True(t, sink.publishedAll)
+	require.FileExists(t, published)
+	require.Len(t, readDirSnapshot(t), 1)
+
+	sink.revoke()
+	require.NoFileExists(t, published)
+	require.Empty(t, readDirSnapshot(t))
+	require.False(t, sink.publishedAll)
+
+	// revoke owns the same cleanup as discard: a second call stays a no-op.
+	sink.discard()
+	require.Empty(t, readDirSnapshot(t))
 }

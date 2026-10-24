@@ -1140,6 +1140,7 @@ func TestWriteSuccessFootnotes(t *testing.T) {
 
 	t.Run("marker failure is reported", func(t *testing.T) {
 		signal.Ignore(syscall.SIGPIPE)
+		t.Cleanup(func() { signal.Reset(syscall.SIGPIPE) })
 		pipeR, pipeW, err := os.Pipe()
 		require.NoError(t, err)
 		require.NoError(t, pipeR.Close())

@@ -194,6 +194,18 @@ func (s *dumpSink) abortCsv(f *os.File) {
 	}
 }
 
+// revoke withdraws a run that completed publication but whose final
+// success footnotes failed: the consumer never received a valid complete
+// backup, so unlike discard after a successful publish — which owns nothing
+// anymore — already renamed csv files are taken back as well. It exists
+// because the failing path exits through os.Exit, which skips deferred
+// calls, so the tail-note failure branch must clean up explicitly
+// (matrixorigin/matrixone#30577).
+func (s *dumpSink) revoke() {
+	s.publishedAll = false
+	s.discard()
+}
+
 // discard drops every artifact a failed run leaves behind: the staged SQL
 // script, all staged csv files, their published-name reservations, and any
 // csv file already published by a partially succeeded publish — a new backup
@@ -203,7 +215,8 @@ func (s *dumpSink) abortCsv(f *os.File) {
 // only: after the rename the staged hidden name belongs to the shared
 // namespace again and may even carry a concurrent run's new file
 // (matrixorigin/matrixone#30577). After a complete publish it is a no-op:
-// nothing is owned anymore.
+// nothing is owned anymore; revoke covers the complete-but-unreported
+// case.
 func (s *dumpSink) discard() {
 	if s.publishedAll {
 		return

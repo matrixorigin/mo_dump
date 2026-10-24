@@ -95,8 +95,10 @@ func parseDatabases(ctx context.Context, raw string) ([]string, error) {
 
 func main() {
 	var (
-		err error
-		opt Options
+		err     error
+		opt     Options
+		sink    *dumpSink
+		sinkErr error
 	)
 	dumpStart := time.Now()
 	defer func() {
@@ -117,6 +119,13 @@ func main() {
 			// backup from a dying pipe as a silent exit 0
 			// (matrixorigin/matrixone#30577).
 			if noteErr := writeSuccessFootnotes(os.Stdout, time.Since(dumpStart), opt.toCsv); noteErr != nil {
+				// os.Exit below skips the remaining defers, and publish already
+				// flagged the sink fully published — revoke takes the csv files
+				// back explicitly so a tail-note failure still leaves nothing
+				// of this run behind (matrixorigin/matrixone#30577).
+				if sink != nil {
+					sink.revoke()
+				}
 				fmt.Fprintf(os.Stderr, "modump error: %v\n", noteErr)
 				os.Exit(1)
 			}
@@ -227,7 +236,7 @@ func main() {
 	// The whole dump is staged before anything reaches stdout: a failed run
 	// must not publish a truncated script whose DROP statements then destroy
 	// a target database (matrixorigin/matrixone#30577).
-	sink, sinkErr := newDumpSink()
+	sink, sinkErr = newDumpSink()
 	if sinkErr != nil {
 		err = sinkErr
 		return
