@@ -31,7 +31,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/mo_dump/internal/catalog"
 )
@@ -55,6 +55,7 @@ type Options struct {
 	enableEscape         bool
 	where                string
 	sysAccount           bool // used in getDatabaseType, getTables
+	legacyClassifyFn     bool // server-side mo_is_legacy_temporary_table is callable
 }
 
 func (t *Tables) String() string {
@@ -221,6 +222,11 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		defer conn.Close()
 	}
 
+	opt.legacyClassifyFn, err = probeLegacyTemporaryTableFn(ctx)
+	if err != nil {
+		return err
+	}
+
 	// add foreign_key_checks variable to dump file
 	fmt.Printf("SET foreign_key_checks = 0;\n\n")
 
@@ -255,7 +261,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 				return err
 			}
 		} else {
-			opt.tables, err = getTables(ctx, db, opt.tables, opt.sysAccount)
+			opt.tables, err = getTables(ctx, db, opt.tables, *opt)
 			if err != nil {
 				return err
 			}
@@ -264,7 +270,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for i, tbl := range opt.tables {
 			var createTableSql string
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
+			case catalog.SystemOrdinaryRel, emptyRelKind:
 				createTableSql, err = getCreateTable(db, tbl.Name)
 				if err != nil {
 					return err
@@ -295,7 +301,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel:
+			case catalog.SystemOrdinaryRel, emptyRelKind:
 				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(create, false)
 				if !opt.noData {
@@ -335,6 +341,63 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	// reset foreign_key_checks variable to dump file
 	fmt.Println("SET foreign_key_checks = 1;")
 	return err
+}
+
+// probeLegacyTemporaryTableFn reports whether the connected server exposes
+// mo_is_legacy_temporary_table, the authoritative classifier for rows
+// written before the v4.2 relkind metadata (review rounds 8-9). Any
+// execution error (unknown function on old clusters, privilege, row or
+// scan error) degrades to the shape fallback instead of failing dumps on
+// those clusters.
+func probeLegacyTemporaryTableFn(ctx context.Context) (bool, error) {
+	r, err := conn.QueryContext(ctx, "select mo_is_legacy_temporary_table('r','x','d','', '')")
+	if err != nil {
+		if isUnknownFunctionErr(err) {
+			// Only the server's own "function does not exist" answer means the
+			// cluster predates the classifier (v4.1.x and older, e.g. v1.2.4).
+			// Any injected/failing error must not blast the dump into the
+			// degraded fallback: review round 10 had one bad probe trip the
+			// fallback on functioning clusters and produce a "successful"
+			// backup the classifier would have completed correctly.
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot probe mo_is_legacy_temporary_table: %w", err)
+	}
+	defer r.Close()
+	// Drive the rows: driver-level row errors (RowError paths, stream
+	// resets) only surface on Err() after iteration has touched them.
+	for r.Next() {
+	}
+	if err := r.Err(); err != nil {
+		if isUnknownFunctionErr(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot probe mo_is_legacy_temporary_table: %w", err)
+	}
+	return true, nil
+}
+
+// isUnknownFunctionErr reports whether the error is the server's own
+// unknown-function answer. Across every supported release (v1.2 through
+// current) the resolved form is moerr.NotSupported, surfaced by the MySQL
+// driver as error 20105 with the message "not supported: function or
+// operator '<name>'"; stock MySQL versions may answer 1305 ("FUNCTION
+// ... does not exist") instead. Anything else — transient faults,
+// privilege errors, connection resets — is not proof of absence and must
+// abort the dump instead of downgrading it (review round 10).
+func isUnknownFunctionErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) && (myErr.Number == 20105 || myErr.Number == 1305) {
+		msg := strings.ToLower(myErr.Message)
+		return strings.Contains(msg, "function") ||
+			strings.Contains(msg, "operator")
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not supported: function or operator") ||
+		(strings.Contains(msg, "function") && strings.Contains(msg, "does not exist"))
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
@@ -378,6 +441,13 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: rows are owned by the connected account. The sys
+		// account sees catalog rows of every tenant, so without this scope a
+		// same-named tenant database either fails as "not exists" or leaks that
+		// tenant's data. The mo_catalog row stays reachable for every account,
+		// matching the server's SHOW DATABASES visibility.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and datname = 'mo_catalog'))"
 	}
 	r, err := conn.QueryContext(ctx, sql, db)
 	if err != nil {
@@ -403,12 +473,82 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	return dbs[0], nil
 }
 
-func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
+func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tables, error) {
+	isSys := opt.sysAccount
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
-	args := make([]any, 0, len(tables)+1)
+	args := make([]any, 0, len(tables)+2)
 	args = append(args, db)
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: same account scoping as the server's SHOW TABLES
+		// plan: the connected account's own rows plus the always-visible catalog
+		// metadata tables and cluster tables owned by the sys account.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
+			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
+	}
+	// Hidden index helpers are identified by their per-database registration
+	// in mo_catalog.mo_indexes.index_table_name (the column exists under
+	// this exact name from MO v1.2 on), joined through mo_database with the
+	// same account scoping as getDatabaseType so helpers of other databases
+	// can never match a same-named user object here. Name- and kind-based
+	// identification were removed across review rounds 2-6: each variant
+	// proved able to silently swallow named or renamed user tables behind a
+	// MODUMP SUCCESS — the exact omission class this change forbids.
+	// Temporary-table rows are classified with the strongest authority the
+	// connected server exposes (review rounds 8-9):
+	//   - relkind 'temporary_table' since the v4.2 catalog rework (always
+	//     applied, current clusters);
+	//   - on current clusters the server-side classification function
+	//     mo_is_legacy_temporary_table (probed once per connection) is
+	//     pushed into the query. It owns every classification subtlety the
+	//     client must not reimplement: rename metadata, batched requests,
+	//     comments decoration, qualified identities, executable comments;
+	//   - clusters without the function (v4.0/v4.1 and older, e.g. v1.2.4)
+	//     fall back to the same shape rule those servers themselves used
+	//     in SHOW TABLES ('__mo_tmp_<32hex>_' physical prefixes, ordinary
+	//     or empty relkind). On those releases the server-illegible rows
+	//     follow the server's own visibility semantics; current clusters
+	//     keep precise per-statement classification via the function or
+	//     the relkind metadata.
+	// The two catalog columns the function touches (rel_createsql,
+	// extra_info) are never selected by this client — v1.2.4 has no
+	// extra_info column at all — they are only referenced inside the
+	// server-executed predicate on clusters that provide the function.
+	// Anything that still reaches the export switch with an unsupported
+	// relkind fails loudly there; the empty relkind is exported as an
+	// ordinary table, with getCreateTable rejecting fragments that lack
+	// the CREATE statement head.
+	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
+	// with the name of a catalog helper are regular dump payloads and must
+	// never be skipped silently.
+	sql += " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+		" where d.datname = ?" +
+		" and (d.account_id = current_account_id()" +
+		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+		" and i.index_table_name is not null and i.index_table_name <> '')" +
+		" and relkind <> 'partition'" +
+		" and relkind <> 'temporary_table'"
+	if opt.legacyClassifyFn {
+		sql += " and not mo_is_legacy_temporary_table(relkind, relname, reldatabase," +
+			" coalesce(rel_createsql, ''), coalesce(extra_info, ''))"
+	}
+	// Without the classifier (clusters that predate it) the __mo_tmp_<32hex>_
+	// rows are ambiguous: they can be session temporary backing rows of
+	// v4.0/v4.1 or legally named persistent tables. No metadata on those
+	// clusters can tell the two apart (review rounds 9-10), so the dump
+	// refuses instead of silently guessing: rows that reach the client are
+	// inspected below, and ambiguous ones abort the dump unless the user
+	// selected them explicitly with -tbl (review round 10 / #30562).
+	args = append(args, db)
+	// mo_increment_columns and __mo_account_lock (the latter has no
+	// matching constant in the pinned matrixone dependency) only exist in
+	// mo_catalog, and ordinary databases may legally contain same-named
+	// tables or views: apply the exclusion only when dumping that catalog.
+	if db == catalog.MO_CATALOG {
+		sql += " and relname != '" + catalog.MOAutoIncrTable + "'" +
+			" and relname != '__mo_account_lock'"
 	}
 	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
@@ -423,7 +563,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		}
 		sql += ")"
 	}
-	r, err := conn.QueryContext(ctx, sql, args...) //TODO: after unified sys table prefix, add condition in where clause
+	r, err := conn.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -440,8 +580,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(table, "__mo_") || strings.HasPrefix(table, "%!%") { //TODO: after adding condition in where clause, remove this
-			continue
+		if !opt.legacyClassifyFn && isLegacyTemporaryShape(table, kind) {
+			if _, explicit := tableNames[table]; !explicit {
+				return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf(
+					"table %s has the legacy temporary name shape but this cluster has no authoritative classifier; "+
+						"dump it explicitly with -tbl, rename it, clean up expired session temporary tables, or run mo-dump against a v4.2+ cluster",
+					table))
+			}
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true
@@ -499,6 +644,17 @@ func getCreateTable(db, tbl string) (string, error) {
 	err := r.Scan(&tbl, &create)
 	if err != nil {
 		return "", err
+	}
+	// Review round 5: on some server versions (verified on MO v1.2.4) SHOW
+	// CREATE TABLE returns a fragment without the statement head for tables
+	// recorded with an empty relkind (e.g. restored under a colliding
+	// __mo_index_* or helper name). Emitting such a fragment would produce a
+	// dump that reports success but cannot be restored, so require the head
+	// and fail loudly. "CREATE " (not "CREATE TABLE") also accepts the
+	// CREATE EXTERNAL TABLE shape used by the external-table branch.
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(create)), "CREATE ") {
+		return "", moerr.NewInternalErrorNoCtxf(
+			"invalid SHOW CREATE TABLE output for table `%s`.`%s`: missing CREATE statement head, got: %.80q", db, tbl, create)
 	}
 	return create, nil
 }
@@ -942,4 +1098,29 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 func isStringType(typ string) bool {
 	typ = strings.ToLower(typ)
 	return typ == "text" || typ == "char" || typ == "varchar" || typ == "json"
+}
+
+// isLegacyTemporaryShape reports whether a catalog row carries the
+// v4.0/v4.1 temporary backing-table shape: the physical name encodes a
+// session id (__mo_tmp_<32 lowercase hex>_...) and the row's kind is one
+// those releases wrote through the ordinary path ('r' or empty).
+func isLegacyTemporaryShape(relName, relKind string) bool {
+	if relKind != catalog.SystemOrdinaryRel && relKind != "" {
+		return false
+	}
+	rest, ok := strings.CutPrefix(relName, "__mo_tmp_")
+	if !ok {
+		return false
+	}
+	session, _, found := strings.Cut(rest, "_")
+	if !found || len(session) != 32 {
+		return false
+	}
+	for i := 0; i < len(session); i++ {
+		c := session[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

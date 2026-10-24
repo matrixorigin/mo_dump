@@ -71,11 +71,12 @@ func TestViewODBCOuterJoins(t *testing.T) {
 
 func TestDumpStoredViewSQLMode(t *testing.T) {
 	mock, output := mockDumpOutput(t)
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
+	expectLegacyProbeAbsent(mock)
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 	mock.ExpectQuery("show create database `db`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_consumer", catalog.SystemViewRel).AddRow("z_source", catalog.SystemViewRel))
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)).WithArgs("db", "db").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_consumer", catalog.SystemViewRel).AddRow("z_source", catalog.SystemViewRel))
 	createConsumer := `CREATE VIEW a_consumer AS SELECT x FROM "z_source"`
-	query := "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)"
+	query := "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)"
 	mock.ExpectQuery(query).WithArgs("db", "a_consumer").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("a_consumer", viewDefinitionJSON(t, "db", createConsumer, "ANSI_QUOTES")))
 	mock.ExpectQuery(query).WithArgs("db", "z_source").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("z_source", viewDefinitionJSON(t, "db", "CREATE VIEW z_source AS SELECT 7 AS x", "")))
 	mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))

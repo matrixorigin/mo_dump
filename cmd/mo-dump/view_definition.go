@@ -69,6 +69,14 @@ func readViewDefinitionBatch(ctx context.Context, database string, tables Tables
 	query := "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v'"
 	if systemAccount {
 		query += " and account_id = 0"
+	} else {
+		// issue #30579 (review round 7): scope to the connected account. The
+		// sys account sees the rows of every tenant, so without this filter a
+		// view that exists with the same name in the sys account and another
+		// tenant reads duplicate persisted rows and the dump aborts with
+		// "duplicate persisted definition". The view list itself is already
+		// account-scoped by getTables, so matching that scope here is exact.
+		query += " and account_id = current_account_id()"
 	}
 	query += " and relname in (" + strings.TrimSuffix(strings.Repeat("?,", len(tables)), ",") + ")"
 	args := make([]any, 0, len(tables)+1)
