@@ -139,7 +139,7 @@ func TestCatalogIdentifiers(t *testing.T) {
 					tables = append(Tables(nil), want...)
 				}
 				mock.ExpectQuery(tblQuery).WithArgs(args...).WillReturnRows(rows).RowsWillBeClosed()
-				got, err := getTables(context.Background(), dbName, tables, Options{legacyClassifyFn: false, sysAccount: sys})
+				got, err := getTables(context.Background(), dbName, tables, Options{sysAccount: sys})
 				require.NoError(t, err)
 				require.Equal(t, want, got)
 			})
@@ -164,7 +164,7 @@ func TestCatalogIdentifierErrors(t *testing.T) {
 			case "iteration":
 				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a'b", "r").RowError(0, injected)).RowsWillBeClosed()
 			}
-			_, err := getTables(context.Background(), "d'b", Tables{{Name: "a'b"}}, Options{legacyClassifyFn: false, sysAccount: false})
+			_, err := getTables(context.Background(), "d'b", Tables{{Name: "a'b"}}, Options{sysAccount: false})
 			switch scenario {
 			case "query", "iteration":
 				require.ErrorIs(t, err, injected)
@@ -238,7 +238,6 @@ func TestDumpIdentifiers(t *testing.T) {
 				const dbName = "d'`b"
 				const quotedDB = "`d'``b`"
 				opt := Options{dbs: []string{dbName}, emptyTables: mode != "table", noData: mode == "schema", netBufferLength: 1024}
-				expectLegacyProbeAbsent(mock)
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 					WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "")).RowsWillBeClosed()
 				want := "SET foreign_key_checks = 0;\n\n"
@@ -283,7 +282,6 @@ func TestDumpOtherRelationIdentifiers(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			mock := newIdentifierMock(t)
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a`b"}}, noData: true}
-			expectLegacyProbeAbsent(mock)
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").
 				WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", "")).RowsWillBeClosed()
 			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("d", "d", "a`b").

@@ -43,7 +43,6 @@ func TestDumpCrossDatabaseViews(t *testing.T) {
 			dbs := tt.dbs
 			for i, name := range dbs {
 				if i == 0 {
-					expectLegacyProbeAbsent(mock)
 				}
 				mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(name).WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(name, ""))
 				mock.ExpectQuery("show create database `" + name + "`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow(name, "CREATE DATABASE `"+name+"`"))
@@ -138,7 +137,6 @@ func TestDumpViewsFailure(t *testing.T) {
 			}
 			for i, step := range steps {
 				if i == 0 {
-					expectLegacyProbeAbsent(mock)
 				}
 				expect := mock.ExpectQuery(step.query)
 				if step.name == "database" {
@@ -179,7 +177,6 @@ func TestDumpWithoutViews(t *testing.T) {
 	for _, kind := range []string{"", catalog.SystemOrdinaryRel, catalog.SystemExternalRel} {
 		t.Run("kind="+kind, func(t *testing.T) {
 			mock, output := mockDumpOutput(t)
-			expectLegacyProbeAbsent(mock)
 			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 			mock.ExpectQuery("show create database `db`").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
 			tables := sqlmock.NewRows([]string{"relname", "relkind"})

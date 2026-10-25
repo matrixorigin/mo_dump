@@ -156,7 +156,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			AddRow("__mo_index_renamed", "")
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
+		tables, err := getTables(context.Background(), "d", nil, Options{sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "__mo_user_data", Kind: "r"},
@@ -178,7 +178,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			AddRow("__mo_user_data", "r")
 		mock.ExpectQuery(sysSQL).WithArgs("d", "d").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: true})
+		tables, err := getTables(context.Background(), "d", nil, Options{sysAccount: true})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_user", Kind: "r"},
@@ -197,7 +197,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			AddRow("__mo_account_lock", "v")
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows) // db "d": no helper-name predicates
 
-		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
+		tables, err := getTables(context.Background(), "d", nil, Options{sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_increment_columns", Kind: "r"},
@@ -217,7 +217,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			AddRow("mo_columns", "r")
 		mock.ExpectQuery(catalogSQL).WithArgs("mo_catalog", "mo_catalog").WillReturnRows(rows)
 
-		tables, err := getTables(context.Background(), "mo_catalog", nil, Options{legacyClassifyFn: false, sysAccount: false})
+		tables, err := getTables(context.Background(), "mo_catalog", nil, Options{sysAccount: false})
 		require.NoError(t, err)
 		assert.Equal(t, Tables{
 			{Name: "mo_database", Kind: "r"},
@@ -251,7 +251,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		// explicitly; an empty result means the object does not exist.
 		mock.ExpectQuery(sqlWithTbl).WithArgs("d", "d", "__mo_user_data").WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}))
 
-		_, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}}, Options{legacyClassifyFn: false, sysAccount: false})
+		_, err := getTables(context.Background(), "d", Tables{{Name: "__mo_user_data"}}, Options{sysAccount: false})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "table __mo_user_data not exists")
 		require.NoError(t, mock.ExpectationsWereMet())
@@ -265,7 +265,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 				AddRow("plain", "r").
 				AddRow(shaped, "r")
 			mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnRows(rows)
-			_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false})
+			_, err := getTables(context.Background(), "d", nil, Options{})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "has the legacy temporary name shape")
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -275,7 +275,7 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 				AddRow(shaped, "r")
 			mock.ExpectQuery(defaultSQL+" and relname in (?)").WithArgs("d", "d", shaped).WillReturnRows(rows)
-			got, err := getTables(context.Background(), "d", Tables{{Name: shaped}}, Options{legacyClassifyFn: false})
+			got, err := getTables(context.Background(), "d", Tables{{Name: shaped}}, Options{})
 			require.NoError(t, err)
 			assert.Equal(t, Tables{{Name: shaped, Kind: "r"}}, got)
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -285,30 +285,17 @@ func TestGetTablesScopedQuery(t *testing.T) {
 			rows := sqlmock.NewRows([]string{"relname", "relkind"}).
 				AddRow("__mo_tmp_0123456789abcdef0123456789abcdef_d_idx", "")
 			mock.ExpectQuery(sysSQL).WithArgs("d", "d").WillReturnRows(rows)
-			_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: true})
+			_, err := getTables(context.Background(), "d", nil, Options{sysAccount: true})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "has the legacy temporary name shape")
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
 	})
 
-	t.Run("server classifier predicate when the probe is available (round 9)", func(t *testing.T) {
-		mock := newCatalogMock(t)
-		fnSQL := baseSQL + tablesScopePredicate + hiddenHelpersFor(true)
-		rows := sqlmock.NewRows([]string{"relname", "relkind"}).
-			AddRow("__mo_user_data", "r")
-		mock.ExpectQuery(fnSQL).WithArgs("d", "d").WillReturnRows(rows)
-
-		tables, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: true, sysAccount: false})
-		require.NoError(t, err)
-		assert.Equal(t, Tables{{Name: "__mo_user_data", Kind: "r"}}, tables)
-		require.NoError(t, mock.ExpectationsWereMet())
-	})
-
 	t.Run("query error is propagated", func(t *testing.T) {
 		mock := newCatalogMock(t)
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnError(sql.ErrConnDone)
-		_, err := getTables(context.Background(), "d", nil, Options{legacyClassifyFn: false, sysAccount: false})
+		_, err := getTables(context.Background(), "d", nil, Options{sysAccount: false})
 		require.ErrorIs(t, err, sql.ErrConnDone)
 		require.NoError(t, mock.ExpectationsWereMet())
 	})

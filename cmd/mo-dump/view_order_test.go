@@ -15,8 +15,6 @@
 package main
 
 import (
-	"regexp"
-
 	"context"
 	"encoding/json"
 	"errors"
@@ -204,7 +202,6 @@ func TestDumpDataViewOrder(t *testing.T) {
 			oldStdout := os.Stdout
 			os.Stdout = file
 			t.Cleanup(func() { os.Stdout = oldStdout })
-			mock.ExpectQuery(regexp.QuoteMeta(legacyProbeSQL)).WillReturnError(errLegacyProbe{})
 			mock.ExpectQuery("select datname, dat_type").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
 			mock.ExpectQuery("show create database").WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("d", "create database d"))
 			rows := sqlmock.NewRows([]string{"relname", "relkind"})
