@@ -253,21 +253,20 @@ func main() {
 	}
 }
 
-// writeSuccessFootnotes writes the completion notes the operator keys on:
-// the cost marker and, for csv runs, the reminder about the data files.
-// It reports write failures instead of letting them vanish — a consumer
-// closing the pipe right after the script must not turn the run into a
-// silent exit 0 (matrixorigin/matrixone#30577).
+// writeSuccessFootnotes writes the closing notes. The csv reminder goes
+// first and the success marker is the very last output a reader sees: a
+// visible MODUMP SUCCESS must guarantee that everything — script, csv
+// files and their reminder — was already delivered, so a failing note
+// never leaves a script whose final complete marker costs the operator a
+// restore that cannot find its files (matrixorigin/matrixone#30577).
 func writeSuccessFootnotes(w io.Writer, cost time.Duration, csvNote bool) error {
-	if _, err := fmt.Fprintf(w, "/* MODUMP SUCCESS, COST %v */\n", cost); err != nil {
-		return err
-	}
 	if csvNote {
 		if _, err := fmt.Fprintf(w, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err := fmt.Fprintf(w, "/* MODUMP SUCCESS, COST %v */\n", cost)
+	return err
 }
 
 func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {

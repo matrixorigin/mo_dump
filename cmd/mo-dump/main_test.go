@@ -23,7 +23,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
@@ -1102,9 +1101,16 @@ func runDumpDataOverStdout(t *testing.T, opt *Options, ctx context.Context) erro
 	return err
 }
 
-// limitingNoteWriter takes the first write and fails the second (EOF):
-// used to pin that a csv-note failure after a successful marker still
-// surfaces (matrixorigin/matrixone#30577).
+// epipeWriter fails every write with EPIPE without any process-level
+// signal machinery: SIGPIPE disposition belongs to the real CLI, tests
+// only need the error path itself.
+type epipeWriter struct{}
+
+func (epipeWriter) Write([]byte) (int, error) { return 0, syscall.EPIPE }
+
+// limitingNoteWriter takes the first note write and fails the second
+// (EOF): used to pin that the failing closing note still surfaces while
+// the already delivered prefix stays visible (matrixorigin/matrixone#30577).
 type limitingNoteWriter struct {
 	buf        bytes.Buffer
 	failSecond bool
@@ -1118,11 +1124,14 @@ func (w *limitingNoteWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-// TestWriteSuccessFootnotes covers both note shapes and both failure stages:
-// a consumer that closed the pipe right after the published script made the
-// old CLI ignore the failing footnote write and exit 0 with empty stderr.
+// TestWriteSuccessFootnotes covers both note shapes and both failure stages.
+// The success marker is always the last byte a reader sees: a failing csv
+// note must not leave a complete MODUMP SUCCESS behind (a consumer would
+// restore a script whose data files were revoked), and a failing marker
+// write must surface instead of a silent exit 0.
 func TestWriteSuccessFootnotes(t *testing.T) {
 	cost := 3 * time.Second
+	csvNote := "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"
 
 	t.Run("marker only", func(t *testing.T) {
 		var out bytes.Buffer
@@ -1130,29 +1139,26 @@ func TestWriteSuccessFootnotes(t *testing.T) {
 		require.Equal(t, "/* MODUMP SUCCESS, COST 3s */\n", out.String())
 	})
 
-	t.Run("marker and csv note", func(t *testing.T) {
+	t.Run("csv note precedes the marker", func(t *testing.T) {
 		var out bytes.Buffer
 		require.NoError(t, writeSuccessFootnotes(&out, cost, true))
-		require.Equal(t, "/* MODUMP SUCCESS, COST 3s */\n"+
-			"/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n",
-			out.String())
+		require.Equal(t, csvNote+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
 	})
 
 	t.Run("marker failure is reported", func(t *testing.T) {
-		signal.Ignore(syscall.SIGPIPE)
-		t.Cleanup(func() { signal.Reset(syscall.SIGPIPE) })
-		pipeR, pipeW, err := os.Pipe()
-		require.NoError(t, err)
-		require.NoError(t, pipeR.Close())
-		err = writeSuccessFootnotes(pipeW, cost, false)
-		require.NoError(t, pipeW.Close())
+		// A writer that fails without touching process signal state: the
+		// footnote write only has to surface the error, SIGPIPE handling
+		// is the main package's concern, not this unit's.
+		err := writeSuccessFootnotes(epipeWriter{}, cost, false)
 		require.ErrorIs(t, err, syscall.EPIPE)
 	})
 
-	t.Run("csv note failure is reported", func(t *testing.T) {
+	t.Run("csv note failure leaves no marker", func(t *testing.T) {
+		// The csv note is the first write now; failing it must deliver no
+		// complete success marker at all.
 		w := &limitingNoteWriter{}
 		err := writeSuccessFootnotes(w, cost, true)
 		require.ErrorIs(t, err, io.EOF)
-		require.Contains(t, w.buf.String(), "MODUMP SUCCESS")
+		require.NotContains(t, w.buf.String(), "MODUMP SUCCESS")
 	})
 }

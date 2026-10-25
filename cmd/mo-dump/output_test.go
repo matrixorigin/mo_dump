@@ -15,7 +15,9 @@
 package main
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -379,16 +381,35 @@ func TestDumpSinkPublishesUmaskMode(t *testing.T) {
 }
 
 // TestDumpSinkPublishAgainstClosedStdout covers the review finding that a
-// reader closing stdout early used to kill the process with SIGPIPE before
+// reader closing stdout early used to kill the CLI with SIGPIPE before
 // the deferred cleanup could run: main ignores SIGPIPE, so the same write
 // surfaces as an error, the emitted prefix byte count is reported, and
 // discard still removes the spool and the already-renamed csv file.
+//
+// The child body runs in its own process because the real EPIPE path
+// needs SIGPIPE ignored; ignoring it here would change signal handling
+// for every other test in this binary and signal.Reset cannot undo an
+// Ignore. The child's assertions report through the test framework;
+// the parent requires a clean exit.
 func TestDumpSinkPublishAgainstClosedStdout(t *testing.T) {
-	// The test process does not run main(); ignore SIGPIPE here the same way
-	// the CLI does, or a regression would kill the whole test binary, and
-	// restore the Go default disposition afterwards for other tests.
+	if os.Getenv("MO_DUMP_TEST_CLOSED_STDOUT") == "1" {
+		closedStdoutChild(t)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDumpSinkPublishAgainstClosedStdout$")
+	cmd.Env = append(os.Environ(), "MO_DUMP_TEST_CLOSED_STDOUT=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	require.NoError(t, err, stderr.String())
+	require.Empty(t, stderr.String())
+}
+
+func closedStdoutChild(t *testing.T) {
+	// Confined to this short-lived process: the real EPIPE path needs the
+	// signal ignored exactly like the CLI does.
 	signal.Ignore(syscall.SIGPIPE)
-	t.Cleanup(func() { signal.Reset(syscall.SIGPIPE) })
 
 	chdirToTemp(t)
 	sink, err := newDumpSink()
