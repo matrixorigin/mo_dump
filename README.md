@@ -13,6 +13,14 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-u [user]**：连接 MatrixOne 服务器的用户名。只有具有数据库和表读取权限的用户才能使用 `mo-dump` 实用程序，默认值 dump。
 
+- **权限要求**：除目标数据库/表的读取权限外，账号还需要系统表 `mo_catalog.mo_database`、`mo_catalog.mo_tables` 与 `mo_catalog.mo_indexes` 的 SELECT 权限（`mo_indexes` 用于识别索引隐藏表，避免其被误导出或误删用户表）。受限账号可执行：
+
+  ```sql
+  GRANT SELECT ON TABLE mo_catalog.mo_database TO <role>;
+  GRANT SELECT ON TABLE mo_catalog.mo_tables TO <role>;
+  GRANT SELECT ON TABLE mo_catalog.mo_indexes TO <role>;
+  ```
+
 - **-p [password]**：MatrixOne 用户的有效密码。默认值：111。
 
 - **-h [host]**：MatrixOne 服务器的主机 IP 地址。默认值：127.0.0.1
