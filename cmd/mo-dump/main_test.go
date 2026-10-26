@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -89,6 +90,11 @@ func TestMoDumpDbOptionValidation(t *testing.T) {
 		{name: "single comma", args: []string{"-db", ","}, wantErr: "contains no valid database name"},
 		{name: "commas and spaces", args: []string{"-db", " , , "}, wantErr: "contains no valid database name"},
 		{name: "empty option", args: []string{"-db", ""}, wantErr: "database must be specified"},
+		{
+			name:    "backslash csv delimiter",
+			args:    []string{"-db", "testdb", "-csv", "-csv-field-delimiter", "\\", "-P", "0"},
+			wantErr: "csv field delimiter cannot be backslash",
+		},
 		{
 			// A list with at least one valid name must pass argument validation.
 			// The host check runs after -db parsing and before any connection,
@@ -353,17 +359,21 @@ func TestDumpExitStatus(t *testing.T) {
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 		kind := "r"
-		if mode == "empty_default" {
+		if mode == "empty_default" || mode == "view" {
 			kind = "v"
 		}
 		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
 			tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("db", "db", "t").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
-		if mode == "empty_default" {
-			// Inject incomplete persisted metadata at the catalog boundary,
-			// then exercise the real CLI's error/exit/success-marker contract.
+		if mode == "empty_default" || mode == "view" {
+			// Exercise view output and incomplete persisted metadata through
+			// the real CLI's exit and success-marker contract.
+			definition := `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`
+			if mode == "view" {
+				definition = viewDefinitionJSON(t, "db", "CREATE VIEW t AS SELECT 1", "")
+			}
 			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "t").
-				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`)).RowsWillBeClosed()
+				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", definition)).RowsWillBeClosed()
 			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 		} else {
 			mock.ExpectQuery("show create table `db`.`t`").
@@ -384,7 +394,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel", "empty_default"} {
+	for _, mode := range []string{"success", "cancel", "empty_default", "view"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -402,6 +412,22 @@ func TestDumpExitStatus(t *testing.T) {
 				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
 				require.NotContains(t, stdout.String(), "CREATE VIEW")
 				require.NotContains(t, stdout.String(), "SET @modump_saved_sql_mode")
+				return
+			}
+			if mode == "view" {
+				require.NoError(t, err, stderr.String())
+				require.Empty(t, stderr.String())
+				text := stdout.String()
+				require.Contains(t, text, "CREATE VIEW t AS SELECT 1;")
+				require.Contains(t, text, "MODUMP SUCCESS")
+				saves := regexp.MustCompile(`(?im)^SET\s+(@\w+)\s*=\s*@@SESSION\.sql_mode;`).FindAllStringSubmatch(text, -1)
+				restores := regexp.MustCompile(`(?im)^SET\s+SESSION\s+sql_mode\s*=\s*(@\w+);`).FindAllStringSubmatch(text, -1)
+				require.Len(t, saves, 2, "script and view must each save their mode")
+				require.Len(t, restores, 2, "view and script must each restore their mode")
+				require.NotEqual(t, strings.ToLower(saves[0][1]), strings.ToLower(saves[1][1]),
+					"SQL user-variable names are case-insensitive; the view must not overwrite the script's saved mode")
+				require.Equal(t, strings.ToLower(saves[1][1]), strings.ToLower(restores[0][1]))
+				require.Equal(t, strings.ToLower(saves[0][1]), strings.ToLower(restores[1][1]))
 				return
 			}
 			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
@@ -614,9 +640,10 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 	conn = db
 	defer func() { conn = oldConn }()
 
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs(dbName).
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "user"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs(dbName, tblName).
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs(dbName, dbName, tblName).
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tblName, catalog.SystemExternalRel))
 	createSQL := "CREATE EXTERNAL TABLE `a*/b` (id INT) INFILE{'filepath'='/tmp/rows.csv'}"
 	mock.ExpectQuery("show create table `" + dbName + "`.`" + tblName + "`").
@@ -641,7 +668,7 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 	// containing */, so the external-table section must carry no comment at all.
 	require.False(t, strings.Contains(out.String(), "/*"),
 		"external table section must not emit comments, table %q can terminate block comments early", tblName)
-	require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
+	require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -833,127 +860,35 @@ func Test_showInsertOversizedRow(t *testing.T) {
 }
 
 func Test_checkFieldDelimiter(t *testing.T) {
-	type args struct {
-		ctx context.Context
-		s   string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    rune
-		wantErr assert.ErrorAssertionFunc
+	for _, tt := range []struct {
+		name, value string
+		want        rune
+		wantErr     string
 	}{
-		{
-			name: "t1",
-			args: args{
-				ctx: nil,
-				s:   "",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "csv field delimiter is invalid utf8 character"))
-				return false
-			},
-		},
-		{
-			name: "t2",
-			args: args{
-				ctx: nil,
-				s:   "fdaf",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "there are multiple utf8 characters for csv field delimiter."))
-				return false
-			},
-		},
-		{
-			name: "t3",
-			args: args{
-				ctx: nil,
-				s:   string([]rune{utf8.RuneError}),
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "csv field delimiter is invalid utf8 character"))
-				return false
-			},
-		},
-		{
-			name: "t4",
-			args: args{
-				ctx: nil,
-				s:   " ",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.NoError(t, err)
-				return false
-			},
-		},
-		{
-			name: "double quote",
-			args: args{ctx: nil, s: "\""},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "line feed",
-			args: args{ctx: nil, s: "\n"},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "carriage return",
-			args: args{ctx: nil, s: "\r"},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "t5",
-			args: args{
-				ctx: nil,
-				s:   "中文",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "there are multiple utf8 characters for csv field delimiter."))
-				return false
-			},
-		},
-		{
-			name: "t6",
-			args: args{
-				ctx: nil,
-				s:   "中",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.NoError(t, err)
-				return false
-			},
-		},
-	}
-	for _, tt := range tests {
+		{name: "empty", wantErr: "invalid utf8 character"},
+		{name: "multiple ascii", value: "fdaf", wantErr: "multiple utf8 characters"},
+		{name: "replacement rune", value: string(utf8.RuneError), wantErr: "invalid utf8 character"},
+		{name: "invalid utf8", value: string([]byte{0xff}), wantErr: "invalid utf8 character"},
+		{name: "space", value: " ", want: ' '},
+		{name: "comma", value: ",", want: ','},
+		{name: "single quote", value: "'", want: '\''},
+		{name: "double quote", value: "\"", wantErr: "invalid utf8 character"},
+		{name: "line feed", value: "\n", wantErr: "invalid utf8 character"},
+		{name: "carriage return", value: "\r", wantErr: "invalid utf8 character"},
+		{name: "nul", value: "\x00", wantErr: "invalid utf8 character"},
+		{name: "backslash", value: "\\", wantErr: "csv field delimiter cannot be backslash"},
+		{name: "multiple multibyte", value: "中文", wantErr: "multiple utf8 characters"},
+		{name: "multibyte", value: "中", want: '中'},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := checkFieldDelimiter(tt.args.ctx, tt.args.s)
-			if !tt.wantErr(t, err, fmt.Sprintf("checkFieldDelimiter(%v, %v)", tt.args.ctx, tt.args.s)) {
+			got, err := checkFieldDelimiter(context.Background(), tt.value)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Zero(t, got)
 				return
 			}
-			assert.Equalf(t, tt.want, got, "checkFieldDelimiter(%v, %v)", tt.args.ctx, tt.args.s)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
