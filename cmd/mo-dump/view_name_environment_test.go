@@ -80,7 +80,7 @@ func TestDumpViewNameModeMetadataErrors(t *testing.T) {
 	for _, encoded := range []string{`{"Stmt":"CREATE VIEW v AS SELECT 1","lower_case_table_names":"0"}`, `{"Stmt":"CREATE VIEW v AS SELECT 1","lower_case_table_names":-1}`, `{"Stmt":"CREATE VIEW v AS SELECT 1","lower_case_table_names":3}`} {
 		t.Run(encoded, func(t *testing.T) {
 			mock, _ := mockDumpOutput(t)
-			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", encoded)).RowsWillBeClosed()
+			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", encoded)).RowsWillBeClosed()
 			_, err := getDumpView(context.Background(), "db", "v", false)
 			require.ErrorContains(t, err, "lower_case_table_names")
 			require.NoError(t, mock.ExpectationsWereMet())
