@@ -33,7 +33,9 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 
 - **-csv**：默认值为 false。当设置为 true 时表示导出的数据为 *CSV* 格式。
 
-- **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。表示支持本地导出 *CSV* 文件。
+- **-csv-field-delimiter**：默认值为逗号，指定一个 UTF-8 字符作为 CSV 字段分隔符。不能使用反斜杠、双引号、回车、换行或 NUL；反斜杠与 `LOAD DATA` 的转义及 NULL 标记冲突，会在连接数据库前拒绝导出。
+
+- **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。为 true 时，恢复脚本按 CSV 文件名从导入客户端的当前目录读取；搬迁备份时将 SQL 和 CSV 一起拷贝，并从 CSV 所在目录执行导入。为 false 时，脚本保留导出 CSV 的绝对路径，恢复服务器必须能访问该路径。
 
 - **-tbl [表名]**：可选参数。如果参数为空，则导出整个数据库。如果要备份指定表，则可以在命令中指定多个 `-tbl` 和表名。
 
@@ -47,7 +49,7 @@ __Tips:__ 需要安装 <a href="https://go.dev/doc/install" target="_blank">Go</
 
 视图依赖使用 MatrixOne `9dfe5c1be92e` 的完整 SQL parser；支持语法随该依赖版本演进，不再使用字符串匹配或手写 SQL 子集，对真实循环返回错误而不是无限重排。分析和恢复使用每个视图在 `mo_catalog.mo_tables.viewdef` 中持久化的源语句、默认库及解析模式，不使用导出连接的 SQL mode 猜测视图语法。保留源语句内容；持久化语句为 `ALTER VIEW` 时，仅将首个语句动词改为 `CREATE`，用于在空目标上重建视图。历史记录缺少模式字段时遵循服务端 legacy 规则。元数据缺失或损坏会明确报错；若 `DefaultDatabase` 缺失、为 null 或空字符串，且视图需要解析未限定数据库的物理关系，也会明确拒绝导出，不猜测其所属库就是创建默认库。无需默认库的常量、CTE-only 和全限定引用仍可导出。
 
-恢复脚本会为每个视图保存当前 `@@SESSION.sql_mode`，通过 `SET SESSION sql_mode` 临时应用其持久化解析标志，并保留目标会话的非解析策略；成功执行该视图段落后恢复原 SQL mode。不修改全局 SQL mode 或目标的 `lower_case_table_names`，目标仍需兼容的名称解析规则。导入客户端必须正确切分语句并支持这些会话设置，尤其是 `NO_BACKSLASH_ESCAPES` 字面量；不能仅凭导入退出码判断恢复完整。恢复不是原子操作，出错时可能留下部分对象或尚未恢复的会话设置。
+恢复脚本先保存原 `@@SESSION.sql_mode`，在恢复期间临时移除 `NO_BACKSLASH_ESCAPES`，保证数据字符串和 CSV 路径的转义有效，成功结束后恢复原 mode。每个视图使用独立于脚本级变量的临时变量保存当前 mode，通过 `SET SESSION sql_mode` 应用其持久化解析标志，并保留目标会话的非解析策略；成功执行该视图段落后恢复进入该段落时的 mode。不修改全局 SQL mode 或目标的 `lower_case_table_names`，目标仍需兼容的名称解析规则。导入客户端必须正确切分语句并支持这些会话设置，尤其是 `NO_BACKSLASH_ESCAPES` 字面量；不能仅凭导入退出码判断恢复完整。恢复不是原子操作，出错时可能留下部分对象或尚未恢复的会话设置。
 
 导出时先输出所有选中数据库的普通表及数据，再对选中的跨库视图统一依赖排序。未选中的外部对象和历史快照仍需在恢复环境中可用。
 
