@@ -34,13 +34,13 @@ func TestDumpDataWholeDatabaseScript(t *testing.T) {
 	ctx := context.Background()
 
 	expectCommonQueries := func(mock sqlmock.Sqlmock) {
-		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").
+		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 		mock.ExpectQuery("show create database `db`").
 			WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
 		// The catalog returns the sequence last and the view in the middle;
 		// the script must still emit sequence, table, view.
-		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs("db").
+		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)).WithArgs("db", "db").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).
 				AddRow("t", catalog.SystemOrdinaryRel).
 				AddRow("v", catalog.SystemViewRel).
@@ -48,7 +48,7 @@ func TestDumpDataWholeDatabaseScript(t *testing.T) {
 		mock.ExpectQuery("show create table `db`.`t`").
 			WillReturnRows(sqlmock.NewRows([]string{"Table", "Create Table"}).
 				AddRow("t", "CREATE TABLE t (id bigint)"))
-		mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "v").
+		mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "v").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).
 				AddRow("v", viewDefinitionJSON(t, "db", "CREATE VIEW v AS SELECT * FROM t", "")))
 		mock.ExpectQuery("select mo_show_visible_bin(atttyp, 2) from mo_catalog.mo_columns where att_database = 'db' and att_relname = 's' and attname = 'last_seq_num'").

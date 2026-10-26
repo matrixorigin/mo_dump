@@ -320,7 +320,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 				return err
 			}
 		} else {
-			opt.tables, err = getTables(ctx, db, opt.tables, opt.sysAccount)
+			opt.tables, err = getTables(ctx, db, opt.tables, *opt)
 			if err != nil {
 				return err
 			}
@@ -329,7 +329,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 		stateSQL = make([]string, len(opt.tables))
 		for i, tbl := range opt.tables {
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel, catalog.SystemExternalRel:
+			case catalog.SystemOrdinaryRel, catalog.SystemExternalRel, emptyRelKind:
 				createTable[i], err = getCreateTable(db, tbl.Name)
 				if err != nil {
 					return err
@@ -383,7 +383,7 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 					// starts handing out values from its START value.
 					out.printf("\n\n")
 				}
-			case catalog.SystemOrdinaryRel:
+			case catalog.SystemOrdinaryRel, emptyRelKind:
 				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
 				showCreateTable(out, create, false)
 				if !opt.noData {
@@ -519,6 +519,13 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	sql := "select datname, dat_type from mo_catalog.mo_database where datname = ?"
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: rows are owned by the connected account. The sys
+		// account sees catalog rows of every tenant, so without this scope a
+		// same-named tenant database either fails as "not exists" or leaks that
+		// tenant's data. The mo_catalog row stays reachable for every account,
+		// matching the server's SHOW DATABASES visibility.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and datname = 'mo_catalog'))"
 	}
 	r, err := conn.QueryContext(ctx, sql, db)
 	if err != nil {
@@ -544,12 +551,84 @@ func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
 	return dbs[0], nil
 }
 
-func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Tables, error) {
+func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tables, error) {
+	isSys := opt.sysAccount
 	sql := "select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"
-	args := make([]any, 0, len(tables)+1)
+	args := make([]any, 0, len(tables)+2)
 	args = append(args, db)
 	if isSys {
 		sql += " and account_id = 0"
+	} else {
+		// issue #30579: same account scoping as the server's SHOW TABLES
+		// plan: the connected account's own rows plus the always-visible catalog
+		// metadata tables and cluster tables owned by the sys account.
+		sql += " and (account_id = current_account_id() or (account_id = 0 and " +
+			"(relname in ('mo_database','mo_tables','mo_columns') or relkind = 'cluster')))"
+	}
+	// Hidden index helpers are identified by their per-database registration
+	// in mo_catalog.mo_indexes.index_table_name (the column exists under
+	// this exact name from MO v1.2 on), joined through mo_database with the
+	// same account scoping as getDatabaseType so helpers of other databases
+	// can never match a same-named user object here. Name- and kind-based
+	// identification were removed across review rounds 2-6: each variant
+	// proved able to silently swallow named or renamed user tables behind a
+	// MODUMP SUCCESS — the exact omission class this change forbids.
+	// Temporary-table rows are classified with the strongest authority the
+	// connected server exposes (review rounds 8-9):
+	//   - relkind 'temporary_table' since the v4.2 catalog rework (always
+	//     applied, current clusters);
+	//   - on current clusters the server-side classification function
+	//     mo_is_legacy_temporary_table (probed once per connection) is
+	//     pushed into the query. It owns every classification subtlety the
+	//     client must not reimplement: rename metadata, batched requests,
+	//     comments decoration, qualified identities, executable comments;
+	//   - clusters without the function (v4.0/v4.1 and older, e.g. v1.2.4)
+	//     fall back to the same shape rule those servers themselves used
+	//     in SHOW TABLES ('__mo_tmp_<32hex>_' physical prefixes, ordinary
+	//     or empty relkind). On those releases the server-illegible rows
+	//     follow the server's own visibility semantics; current clusters
+	//     keep precise per-statement classification via the function or
+	//     the relkind metadata.
+	// The two catalog columns the function touches (rel_createsql,
+	// extra_info) are never selected by this client — v1.2.4 has no
+	// extra_info column at all — they are only referenced inside the
+	// server-executed predicate on clusters that provide the function.
+	// Anything that still reaches the export switch with an unsupported
+	// relkind fails loudly there; the empty relkind is exported as an
+	// ordinary table, with getCreateTable rejecting fragments that lack
+	// the CREATE statement head.
+	// #30562: user tables legally named with any `__mo_`/`%!%` prefix or
+	// with the name of a catalog helper are regular dump payloads and must
+	// never be skipped silently.
+	sql += " and relname not in (select i.index_table_name from mo_catalog.mo_indexes i" +
+		" join mo_catalog.mo_database d on i.database_id = d.dat_id" +
+		" where d.datname = ?" +
+		" and (d.account_id = current_account_id()" +
+		" or (d.account_id = 0 and d.datname = 'mo_catalog'))" +
+		" and i.index_table_name is not null and i.index_table_name <> '')" +
+		" and relkind <> 'partition'" +
+		" and relkind <> 'temporary_table'"
+	// Rows named with the __mo_tmp_<32hex>_ shape and carrying relkind 'r'
+	// or '' are the ambiguous class (review rounds 9-11): they can be
+	// v4.0/v4.1 session temporary backing rows surviving an upgrade —
+	// including empty-kind index rows — renamed permanent tables whose
+	// requests the classifiers cannot reconstruct, or persistent tables
+	// named that way legally. No metadata on any supported release, and no
+	// classifier output, separates these cases reliably (the server-side
+	// mo_is_legacy_temporary_table misclassifies renamed-permanent rows and
+	// USE-qualified statements, and its relkind gate never inspects the
+	// empty-kind index rows — review round 11). The query therefore flags
+	// nothing here: the rows reach the client, and the dump aborts unless
+	// the user explicitly selected each such row with -tbl, giving the
+	// object's owner the final say instead of a guessed classification.
+	args = append(args, db)
+	// mo_increment_columns and __mo_account_lock (the latter has no
+	// matching constant in the pinned matrixone dependency) only exist in
+	// mo_catalog, and ordinary databases may legally contain same-named
+	// tables or views: apply the exclusion only when dumping that catalog.
+	if db == catalog.MO_CATALOG {
+		sql += " and relname != '" + catalog.MOAutoIncrTable + "'" +
+			" and relname != '__mo_account_lock'"
 	}
 	tableNames := make(map[string]bool, len(tables))
 	if len(tables) > 0 {
@@ -564,7 +643,7 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		}
 		sql += ")"
 	}
-	r, err := conn.QueryContext(ctx, sql, args...) //TODO: after unified sys table prefix, add condition in where clause
+	r, err := conn.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -581,8 +660,13 @@ func getTables(ctx context.Context, db string, tables Tables, isSys bool) (Table
 		if err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(table, "__mo_") || strings.HasPrefix(table, "%!%") { //TODO: after adding condition in where clause, remove this
-			continue
+		if isLegacyTemporaryShape(table, kind) {
+			if _, explicit := tableNames[table]; !explicit {
+				return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf(
+					"table %s has the legacy temporary name shape; its permanent or session-temporary identity is not decidable from catalog metadata or the server classifier, "+
+						"so the dump refuses to guess: export it explicitly with -tbl if it is a permanent table, or clean up expired session temporary backing rows and dump again",
+					table))
+			}
 		}
 		tables = append(tables, Table{table, kind})
 		tableNames[table] = true
@@ -670,6 +754,17 @@ func getCreateTable(db, tbl string) (string, error) {
 	err := r.Scan(&tbl, &create)
 	if err != nil {
 		return "", err
+	}
+	// Review round 5: on some server versions (verified on MO v1.2.4) SHOW
+	// CREATE TABLE returns a fragment without the statement head for tables
+	// recorded with an empty relkind (e.g. restored under a colliding
+	// __mo_index_* or helper name). Emitting such a fragment would produce a
+	// dump that reports success but cannot be restored, so require the head
+	// and fail loudly. "CREATE " (not "CREATE TABLE") also accepts the
+	// CREATE EXTERNAL TABLE shape used by the external-table branch.
+	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(create)), "CREATE ") {
+		return "", moerr.NewInternalErrorNoCtxf(
+			"invalid SHOW CREATE TABLE output for table `%s`.`%s`: missing CREATE statement head, got: %.80q", db, tbl, create)
 	}
 	return create, nil
 }
@@ -1124,4 +1219,29 @@ func (opt *Options) getSubScriptionTables(ctx context.Context, db string, tables
 func isStringType(typ string) bool {
 	typ = strings.ToLower(typ)
 	return typ == "text" || typ == "char" || typ == "varchar" || typ == "json"
+}
+
+// isLegacyTemporaryShape reports whether a catalog row carries the
+// v4.0/v4.1 temporary backing-table shape: the physical name encodes a
+// session id (__mo_tmp_<32 lowercase hex>_...) and the row's kind is one
+// those releases wrote through the ordinary path ('r' or empty).
+func isLegacyTemporaryShape(relName, relKind string) bool {
+	if relKind != catalog.SystemOrdinaryRel && relKind != "" {
+		return false
+	}
+	rest, ok := strings.CutPrefix(relName, "__mo_tmp_")
+	if !ok {
+		return false
+	}
+	session, _, found := strings.Cut(rest, "_")
+	if !found || len(session) != 32 {
+		return false
+	}
+	for i := 0; i < len(session); i++ {
+		c := session[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

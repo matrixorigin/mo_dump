@@ -23,4 +23,9 @@ const (
 	SystemViewRel            = "v"
 	SystemSequenceRel        = "S"
 	SystemDBTypeSubscription = "subscription"
+
+	// MO_CATALOG is the durable name of the system catalog database.
+	MO_CATALOG = "mo_catalog"
+	// MOAutoIncrTable is the auto-increment helper table of mo_catalog.
+	MOAutoIncrTable = "mo_increment_columns"
 )

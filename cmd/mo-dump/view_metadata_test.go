@@ -49,6 +49,8 @@ func TestDumpViewMetadata(t *testing.T) {
 			query := "select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v'"
 			if tt.sys {
 				query += " and account_id = 0"
+			} else {
+				query += " and account_id = current_account_id()"
 			}
 			query += " and relname in (?)"
 			mock.ExpectQuery(query).WithArgs("db'雪", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", tt.encoded)).RowsWillBeClosed()
@@ -82,7 +84,7 @@ func TestDumpViewMetadataErrors(t *testing.T) {
 			if failure == "cancel" {
 				cancel()
 			} else {
-				expect := mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("db", "v")
+				expect := mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "v")
 				switch failure {
 				case "query":
 					expect.WillReturnError(injected)

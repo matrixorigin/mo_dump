@@ -35,7 +35,7 @@ func TestViewDefaultDatabase(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mock, output := mockDumpOutput(t)
 			encoded := `{"Stmt":"CREATE VIEW owned.v AS SELECT x FROM target","lower_case_table_names":0` + tt.field + `}`
-			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("owned", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", encoded)).RowsWillBeClosed()
+			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("owned", "v").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("v", encoded)).RowsWillBeClosed()
 			view, err := getDumpView(context.Background(), "owned", "v", false)
 			if tt.name == "invalid_type" {
 				require.ErrorContains(t, err, "DefaultDatabase")

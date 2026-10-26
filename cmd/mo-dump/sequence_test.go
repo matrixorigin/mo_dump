@@ -356,11 +356,11 @@ func TestFilterUserDatabases(t *testing.T) {
 func TestDumpDataExternalTableScript(t *testing.T) {
 	ctx := context.Background()
 	_, mock := exportTestDB(t)
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("db").
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 	mock.ExpectQuery("show create database `db`").
 		WillReturnRows(sqlmock.NewRows([]string{"Database", "Create Database"}).AddRow("db", "CREATE DATABASE db"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?").WithArgs("db").
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)).WithArgs("db", "db").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).
 			AddRow("ext", catalog.SystemExternalRel))
 	mock.ExpectQuery("show create table `db`.`ext`").

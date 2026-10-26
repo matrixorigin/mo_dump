@@ -351,8 +351,8 @@ func TestDumpViewDependencies(t *testing.T) {
 				parentName = "parent"
 			}
 			opt := Options{dbs: []string{"d"}, tables: Tables{{Name: "a_child"}, {Name: parentName}}, noData: true}
-			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
-			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?,?)").WithArgs("d", "a_child", parentName).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_child", catalog.SystemViewRel).AddRow(parentName, catalog.SystemViewRel))
+			mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("d").WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("d", ""))
+			mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?,?)").WithArgs("d", "d", "a_child", parentName).WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("a_child", catalog.SystemViewRel).AddRow(parentName, catalog.SystemViewRel))
 			parent := "CREATE VIEW " + quoteIdentifier(parentName) + " AS SELECT 1"
 			if mode == "parse error" {
 				child = "CREATE VIEW a_child AS SELECT * FROM"
@@ -365,7 +365,7 @@ func TestDumpViewDependencies(t *testing.T) {
 				if mode == "ansi quoted" {
 					stored = "ANSI_QUOTES"
 				}
-				mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and relname in (?)").WithArgs("d", v.name).WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow(v.name, viewDefinitionJSON(t, "d", v.ddl, stored)))
+				mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("d", v.name).WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow(v.name, viewDefinitionJSON(t, "d", v.ddl, stored)))
 			}
 			expected := mock.ExpectQuery("select @@lower_case_table_names")
 			injected := errors.New("mode unavailable")
