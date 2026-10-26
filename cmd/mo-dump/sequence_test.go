@@ -372,6 +372,8 @@ func TestDumpDataExternalTableScript(t *testing.T) {
 	opt := Options{dbs: []string{"db"}, emptyTables: true, netBufferLength: 16384}
 	require.NoError(t, opt.dumpData(ctx, sink))
 	expected := "SET foreign_key_checks = 0;\n\n" +
+		"SET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\n" +
+		"SET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n" +
 		"DROP DATABASE IF EXISTS `db`;\n" +
 		"CREATE DATABASE db ;\n" +
 		"USE `db`;\n\n\n" +

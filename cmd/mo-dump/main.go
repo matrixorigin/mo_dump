@@ -24,8 +24,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -151,7 +154,7 @@ func main() {
 	flag.StringVar(&opt.database, "db", "", "databaseName, must be specified")
 	flag.StringVar(&opt.tbl, "tbl", "", "tableNameList (default all)")
 	flag.BoolVar(&opt.toCsv, "csv", defaultCsv, "set export format to csv (default false)")
-	flag.StringVar(&opt.csvFieldDelimiterStr, "csv-field-delimiter", string(defaultFieldDelimiter), "set csv field delimiter (only one utf8 character). enabled only when the option 'csv' is set.")
+	flag.StringVar(&opt.csvFieldDelimiterStr, "csv-field-delimiter", string(defaultFieldDelimiter), "set csv field delimiter (one utf8 character; no backslash, double quote, CR, LF, or NUL). enabled only when the option 'csv' is set.")
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
 	flag.BoolVar(&opt.noData, "no-data", defaultNoData, "dump database and table definitions only without data (default false)")
 	flag.BoolVar(&opt.enableEscape, "enable-escape", defaultEnableEscape, "enable escape characters in csv output")
@@ -260,6 +263,11 @@ func main() {
 // never leaves a script whose final complete marker costs the operator a
 // restore that cannot find its files (matrixorigin/matrixone#30577).
 func writeSuccessFootnotes(w io.Writer, cost time.Duration, csvNote bool) error {
+	// Restore the script-level mode before the final success marker. A failed
+	// write follows the same checked-error and CSV revocation path as the notes.
+	if _, err := fmt.Fprint(w, "SET SESSION sql_mode=@MODUMP_SCRIPT_SAVED_SQL_MODE;\n\n\n"); err != nil {
+		return err
+	}
 	if csvNote {
 		if _, err := fmt.Fprintf(w, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"); err != nil {
 			return err
@@ -288,6 +296,16 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 
 	// add foreign_key_checks variable to dump file
 	out.printf("SET foreign_key_checks = 0;\n\n")
+
+	// String literals in this script were quoted assuming backslash escapes.
+	// Pin the restore session's sql_mode correspondingly even when it runs
+	// under NO_BACKSLASH_ESCAPES, and restore it at the end of the script
+	// (matrixorigin/matrixone#30587). NO_BACKSLASH_ESCAPES is removed from a
+	// comma-wrapped copy of the mode list so stripping it can never leave an
+	// empty token, whatever its position.
+	// Keep this variable distinct from the per-view saved mode: SQL user
+	// variable names are case-insensitive.
+	out.printf("SET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n")
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
@@ -880,15 +898,40 @@ func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl stri
 		out.abortCsv(f)
 		return err
 	}
-	pwd := os.Getenv("PWD")
-	quotedPath := quoteString(fmt.Sprintf("%s/%s", pwd, publishedName))
-	quotedDelim := quoteString(string(csvConf.fieldDelimiter))
+	// LOCAL paths follow the importing client's working directory; non-LOCAL
+	// paths must be absolute for the server. Always reference the reserved final
+	// name, not the staged file, and escape using the script's pinned SQL mode.
+	path := publishedName
+	if !localInfile {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+	}
+	quotedPath := sqlStringLiteral(path)
+	quotedDelim := sqlStringLiteral(string(csvConf.fieldDelimiter))
 	if localInfile {
 		out.printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	} else {
 		out.printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	}
 	return out.Err()
+}
+
+// sqlStringLiteral renders s as a backslash-escaped SQL string literal. The
+// dump script pins a backslash-escapes sql_mode at restore time
+// (matrixorigin/matrixone#30587), so \' and \\ are always valid there.
+func sqlStringLiteral(s string) string {
+	var b strings.Builder
+	b.WriteByte('\'')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' || s[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // toCsv converts the result from mo to csv file
@@ -1092,13 +1135,29 @@ func convertValue(v any, typ string) string {
 	}
 
 	switch typ {
-	case "float":
+	case "float", "double":
 		retStr := string(ret)
 		if (retStr[0] >= '0' && retStr[0] <= '9') || (retStr[0] == '-' && retStr[1] >= '0' && retStr[1] <= '9') {
+			// The wire text of a finite FLOAT that overflows the float32
+			// lexical range (e.g. its max finite value) cannot be re-inserted
+			// as a bare numeric literal; CAST parses it back losslessly
+			// (matrixorigin/matrixone#30598).
+			if typ == "float" {
+				if f, err := strconv.ParseFloat(retStr, 64); err == nil && math.Abs(f) > math.MaxFloat32 {
+					return "cast('" + retStr + "' as float)"
+				}
+			}
+			// A bare -0 loses the negative-zero sign when re-inserted as a
+			// numeric literal; CAST preserves it (matrixorigin/matrixone#30598).
+			if retStr == "-0" {
+				return "cast('-0' as " + typ + ")"
+			}
 			return retStr
 		}
-		return "'" + retStr + "'" // NaN, +Inf, -Inf, maybe no hacking need in the future
-	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "double", "bool", "boolean":
+		return "'" + retStr + "'" // NaN, +Inf, -Inf: quoted so the server converts
+		// the literal on insert. Applies to DOUBLE as well
+		// (matrixorigin/matrixone#30596).
+	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "bool", "boolean":
 		return string(ret)
 	case "vecf32", "vecf64":
 		return string(ret)
@@ -1137,10 +1196,10 @@ func convertValue2(v any, typ string) (sql.RawBytes, string) {
 	}
 }
 
-// validFieldDelimiter mirrors encoding/csv's delimiter rule: the delimiter
-// cannot be '"', '\r', '\n', or an invalid rune.
+// validFieldDelimiter follows encoding/csv's delimiter rule, additionally
+// excluding backslash: LOAD DATA uses it for escapes and the NULL marker \N.
 func validFieldDelimiter(r rune) bool {
-	return r != 0 && r != '"' && r != '\r' && r != '\n' && utf8.ValidRune(r) && r != utf8.RuneError
+	return r != 0 && r != '\\' && r != '"' && r != '\r' && r != '\n' && utf8.ValidRune(r) && r != utf8.RuneError
 }
 
 // checkFieldDelimiter checks string is valid utf8 character and returns rune
@@ -1151,6 +1210,9 @@ func checkFieldDelimiter(ctx context.Context, s string) (rune, error) {
 		}
 		runCh, _ := utf8.DecodeRuneInString(s)
 		if !validFieldDelimiter(runCh) {
+			if runCh == '\\' {
+				return 0, moerr.NewInvalidInput(ctx, "csv field delimiter cannot be backslash: conflicts with LOAD DATA escapes and NULL markers")
+			}
 			return rune(0), moerr.NewInvalidInput(ctx, "csv field delimiter is invalid utf8 character")
 		}
 		return runCh, nil

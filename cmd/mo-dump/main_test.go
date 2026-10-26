@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -89,6 +90,11 @@ func TestMoDumpDbOptionValidation(t *testing.T) {
 		{name: "single comma", args: []string{"-db", ","}, wantErr: "contains no valid database name"},
 		{name: "commas and spaces", args: []string{"-db", " , , "}, wantErr: "contains no valid database name"},
 		{name: "empty option", args: []string{"-db", ""}, wantErr: "database must be specified"},
+		{
+			name:    "backslash csv delimiter",
+			args:    []string{"-db", "testdb", "-csv", "-csv-field-delimiter", "\\", "-P", "0"},
+			wantErr: "csv field delimiter cannot be backslash",
+		},
 		{
 			// A list with at least one valid name must pass argument validation.
 			// The host check runs after -db parsing and before any connection,
@@ -387,17 +393,21 @@ func TestDumpExitStatus(t *testing.T) {
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
 		kind := "r"
-		if mode == "empty_default" {
+		if mode == "empty_default" || mode == "view" {
 			kind = "v"
 		}
 		mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
 			tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("db", "db", "t").
 			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("t", kind))
-		if mode == "empty_default" {
-			// Inject incomplete persisted metadata at the catalog boundary,
-			// then exercise the real CLI's error/exit/success-marker contract.
+		if mode == "empty_default" || mode == "view" {
+			// Exercise view output and incomplete persisted metadata through
+			// the real CLI's exit and success-marker contract.
+			definition := `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`
+			if mode == "view" {
+				definition = viewDefinitionJSON(t, "db", "CREATE VIEW t AS SELECT 1", "")
+			}
 			mock.ExpectQuery("select relname,viewdef from mo_catalog.mo_tables where reldatabase = ? and relkind = 'v' and account_id = current_account_id() and relname in (?)").WithArgs("db", "t").
-				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", `{"Stmt":"CREATE VIEW t AS SELECT * FROM missing"}`)).RowsWillBeClosed()
+				WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("t", definition)).RowsWillBeClosed()
 			mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 		} else {
 			mock.ExpectQuery("show create table `db`.`t`").
@@ -418,7 +428,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs"} {
+	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs", "view"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -436,6 +446,22 @@ func TestDumpExitStatus(t *testing.T) {
 				// The dump is staged until it completes, so the failed view
 				// analysis leaves stdout completely unpublished.
 				require.Empty(t, stdout.String(), "a failed dump must publish nothing")
+				return
+			}
+			if mode == "view" {
+				require.NoError(t, err, stderr.String())
+				require.Empty(t, stderr.String())
+				text := stdout.String()
+				require.Contains(t, text, "CREATE VIEW t AS SELECT 1;")
+				require.Contains(t, text, "MODUMP SUCCESS")
+				saves := regexp.MustCompile(`(?im)^SET\s+(@\w+)\s*=\s*@@SESSION\.sql_mode;`).FindAllStringSubmatch(text, -1)
+				restores := regexp.MustCompile(`(?im)^SET\s+SESSION\s+sql_mode\s*=\s*(@\w+);`).FindAllStringSubmatch(text, -1)
+				require.Len(t, saves, 2, "script and view must each save their mode")
+				require.Len(t, restores, 2, "view and script must each restore their mode")
+				require.NotEqual(t, strings.ToLower(saves[0][1]), strings.ToLower(saves[1][1]),
+					"SQL user-variable names are case-insensitive; the view must not overwrite the script's saved mode")
+				require.Equal(t, strings.ToLower(saves[1][1]), strings.ToLower(restores[0][1]))
+				require.Equal(t, strings.ToLower(saves[0][1]), strings.ToLower(restores[1][1]))
 				return
 			}
 			if mode == "cancel" {
@@ -669,7 +695,7 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 	// containing */, so the external-table section must carry no comment at all.
 	require.False(t, strings.Contains(out.String(), "/*"),
 		"external table section must not emit comments, table %q can terminate block comments early", tblName)
-	require.Equal(t, "SET foreign_key_checks = 0;\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
+	require.Equal(t, "SET foreign_key_checks = 0;\n\nSET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\nDROP TABLE IF EXISTS `a*/b`;\n"+createSQL+";\n\n\nSET foreign_key_checks = 1;\n", out.String())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -855,127 +881,35 @@ func Test_showInsertOversizedRow(t *testing.T) {
 }
 
 func Test_checkFieldDelimiter(t *testing.T) {
-	type args struct {
-		ctx context.Context
-		s   string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    rune
-		wantErr assert.ErrorAssertionFunc
+	for _, tt := range []struct {
+		name, value string
+		want        rune
+		wantErr     string
 	}{
-		{
-			name: "t1",
-			args: args{
-				ctx: nil,
-				s:   "",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "csv field delimiter is invalid utf8 character"))
-				return false
-			},
-		},
-		{
-			name: "t2",
-			args: args{
-				ctx: nil,
-				s:   "fdaf",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "there are multiple utf8 characters for csv field delimiter."))
-				return false
-			},
-		},
-		{
-			name: "t3",
-			args: args{
-				ctx: nil,
-				s:   string([]rune{utf8.RuneError}),
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "csv field delimiter is invalid utf8 character"))
-				return false
-			},
-		},
-		{
-			name: "t4",
-			args: args{
-				ctx: nil,
-				s:   " ",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.NoError(t, err)
-				return false
-			},
-		},
-		{
-			name: "double quote",
-			args: args{ctx: nil, s: "\""},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "line feed",
-			args: args{ctx: nil, s: "\n"},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "carriage return",
-			args: args{ctx: nil, s: "\r"},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				return false
-			},
-		},
-		{
-			name: "t5",
-			args: args{
-				ctx: nil,
-				s:   "中文",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.Error(t, err)
-				assert.True(t, strings.Contains(err.Error(), "there are multiple utf8 characters for csv field delimiter."))
-				return false
-			},
-		},
-		{
-			name: "t6",
-			args: args{
-				ctx: nil,
-				s:   "中",
-			},
-			want: defaultFieldDelimiter,
-			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
-				assert.NoError(t, err)
-				return false
-			},
-		},
-	}
-	for _, tt := range tests {
+		{name: "empty", wantErr: "invalid utf8 character"},
+		{name: "multiple ascii", value: "fdaf", wantErr: "multiple utf8 characters"},
+		{name: "replacement rune", value: string(utf8.RuneError), wantErr: "invalid utf8 character"},
+		{name: "invalid utf8", value: string([]byte{0xff}), wantErr: "invalid utf8 character"},
+		{name: "space", value: " ", want: ' '},
+		{name: "comma", value: ",", want: ','},
+		{name: "single quote", value: "'", want: '\''},
+		{name: "double quote", value: "\"", wantErr: "invalid utf8 character"},
+		{name: "line feed", value: "\n", wantErr: "invalid utf8 character"},
+		{name: "carriage return", value: "\r", wantErr: "invalid utf8 character"},
+		{name: "nul", value: "\x00", wantErr: "invalid utf8 character"},
+		{name: "backslash", value: "\\", wantErr: "csv field delimiter cannot be backslash"},
+		{name: "multiple multibyte", value: "中文", wantErr: "multiple utf8 characters"},
+		{name: "multibyte", value: "中", want: '中'},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := checkFieldDelimiter(tt.args.ctx, tt.args.s)
-			if !tt.wantErr(t, err, fmt.Sprintf("checkFieldDelimiter(%v, %v)", tt.args.ctx, tt.args.s)) {
+			got, err := checkFieldDelimiter(context.Background(), tt.value)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Zero(t, got)
 				return
 			}
-			assert.Equalf(t, tt.want, got, "checkFieldDelimiter(%v, %v)", tt.args.ctx, tt.args.s)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -1139,28 +1073,29 @@ func (w *limitingNoteWriter) Write(p []byte) (int, error) {
 	return w.buf.Write(p)
 }
 
-// TestWriteSuccessFootnotes covers both note shapes and both failure stages.
+// TestWriteSuccessFootnotes covers both note shapes and all failure stages.
 // The success marker is always the last byte a reader sees: a failing csv
 // note must not leave a complete MODUMP SUCCESS behind (a consumer would
 // restore a script whose data files were revoked), and a failing marker
 // write must surface instead of a silent exit 0.
 func TestWriteSuccessFootnotes(t *testing.T) {
 	cost := 3 * time.Second
+	restore := "SET SESSION sql_mode=@MODUMP_SCRIPT_SAVED_SQL_MODE;\n\n\n"
 	csvNote := "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"
 
 	t.Run("marker only", func(t *testing.T) {
 		var out bytes.Buffer
 		require.NoError(t, writeSuccessFootnotes(&out, cost, false))
-		require.Equal(t, "/* MODUMP SUCCESS, COST 3s */\n", out.String())
+		require.Equal(t, restore+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
 	})
 
 	t.Run("csv note precedes the marker", func(t *testing.T) {
 		var out bytes.Buffer
 		require.NoError(t, writeSuccessFootnotes(&out, cost, true))
-		require.Equal(t, csvNote+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
+		require.Equal(t, restore+csvNote+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
 	})
 
-	t.Run("marker failure is reported", func(t *testing.T) {
+	t.Run("mode restore failure is reported", func(t *testing.T) {
 		// A writer that fails without touching process signal state: the
 		// footnote write only has to surface the error, SIGPIPE handling
 		// is the main package's concern, not this unit's.
@@ -1169,11 +1104,37 @@ func TestWriteSuccessFootnotes(t *testing.T) {
 	})
 
 	t.Run("csv note failure leaves no marker", func(t *testing.T) {
-		// The csv note is the first write now; failing it must deliver no
-		// complete success marker at all.
+		// The mode restore succeeds; the following CSV reminder fails.
 		w := &limitingNoteWriter{}
 		err := writeSuccessFootnotes(w, cost, true)
 		require.ErrorIs(t, err, io.EOF)
+		require.Equal(t, restore, w.buf.String())
 		require.NotContains(t, w.buf.String(), "MODUMP SUCCESS")
 	})
+
+	for _, csv := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marker failure csv=%v", csv), func(t *testing.T) {
+			// Let every preceding write succeed and fail only the marker.
+			prefix := restore
+			if csv {
+				prefix += csvNote
+			}
+			w := &markerFailureWriter{remaining: len(prefix)}
+			require.ErrorIs(t, writeSuccessFootnotes(w, cost, csv), syscall.EPIPE)
+			require.Equal(t, prefix, w.buf.String())
+		})
+	}
+}
+
+type markerFailureWriter struct {
+	buf       bytes.Buffer
+	remaining int
+}
+
+func (w *markerFailureWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		return 0, syscall.EPIPE
+	}
+	w.remaining -= len(p)
+	return w.buf.Write(p)
 }
