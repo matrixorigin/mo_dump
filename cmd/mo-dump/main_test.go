@@ -640,9 +640,10 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 	conn = db
 	defer func() { conn = oldConn }()
 
-	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?").WithArgs(dbName).
+	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "user"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ? and relname in (?)").WithArgs(dbName, tblName).
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
+		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs(dbName, dbName, tblName).
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tblName, catalog.SystemExternalRel))
 	createSQL := "CREATE EXTERNAL TABLE `a*/b` (id INT) INFILE{'filepath'='/tmp/rows.csv'}"
 	mock.ExpectQuery("show create table `" + dbName + "`.`" + tblName + "`").
