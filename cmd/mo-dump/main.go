@@ -711,12 +711,13 @@ func writeCsvRecord(w io.Writer, fields []string, nulls []bool, delim rune) erro
 }
 
 // csvFieldNeedsQuote reports whether a non-null field must be enclosed in
-// quotes: it contains the delimiter, a quote or a line break, it starts with
+// quotes: it is empty (so a single-field record is not a skipped blank line),
+// it contains the delimiter, a quote or a line break, it starts with
 // whitespace (unquoted whitespace-leading and whitespace-only records are
 // dropped by older loaders), or its content would otherwise be read back as
 // SQL NULL.
 func csvFieldNeedsQuote(field string, delim rune) bool {
-	if strings.EqualFold(field, "NULL") {
+	if field == "" || strings.EqualFold(field, "NULL") {
 		return true
 	}
 	if r1, _ := utf8.DecodeRuneInString(field); unicode.IsSpace(r1) {

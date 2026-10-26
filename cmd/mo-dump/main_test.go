@@ -754,7 +754,7 @@ func Test_toCsvLine(t *testing.T) {
 		{"comma quoted", text("a,b"), varcharCol, false, ',', "\"a,b\"\n"},
 		{"double quote", text("a\"b"), varcharCol, false, ',', "\"a\"\"b\"\n"},
 		{"line feed", text("a\nb"), varcharCol, false, ',', "\"a\nb\"\n"},
-		{"empty string", text(""), varcharCol, false, ',', "\n"},
+		{"empty string", text(""), varcharCol, false, ',', "\"\"\n"},
 		// -enable-escape: ',' escaped once, tab delimiter, no quotes
 		{"comma escaped no quote", text("a,b"), varcharCol, true, '\t', "a\\,b\n"},
 		// alternate field delimiter from -csv-field-delimiter
@@ -782,8 +782,64 @@ func Test_toCsvLine(t *testing.T) {
 	}
 }
 
-// Test_toCsvLine_whitespaceOnlyRows: every whitespace-only record must be
-// written quoted, so an older loader does not skip it as an empty line.
+// Empty fields retain their record framing independently of column position,
+// delimiter, escape mode, type, and the previous row's NULL state.
+func Test_toCsvLine_emptyFields(t *testing.T) {
+	for _, delim := range []rune{',', '|', '界'} {
+		for _, escape := range []bool{false, true} {
+			for _, typ := range []string{"varchar", "varbinary"} {
+				t.Run(fmt.Sprintf("%c/escape=%t/%s", delim, escape, typ), func(t *testing.T) {
+					cols := []*Column{{Name: "v", Type: typ}}
+					line, nulls := make([]string, 1), make([]bool, 1)
+					var out bytes.Buffer
+					for _, value := range []any{makeValue("ordinary"), makeNullValue(), makeValue(""), makeValue(""), makeNullValue()} {
+						require.NoError(t, toCsvLine(&out, delim, []any{value}, cols, line, nulls, escape))
+					}
+					require.Equal(t, "ordinary\n\\N\n\"\"\n\"\"\n\\N\n", out.String())
+					for _, tc := range []struct {
+						name   string
+						values []any
+						want   []string
+					}{
+						{"both_empty", []any{makeValue(""), makeValue("")}, []string{"\"\"", "\"\""}},
+						{"empty_null", []any{makeValue(""), makeNullValue()}, []string{"\"\"", "\\N"}},
+						{"null_empty", []any{makeNullValue(), makeValue("")}, []string{"\\N", "\"\""}},
+						{"positions", []any{makeValue(""), makeValue("x"), makeValue(""), makeValue("y"), makeValue("")}, []string{"\"\"", "x", "\"\"", "y", "\"\""}},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							columns := make([]*Column, len(tc.values))
+							for i := range columns {
+								columns[i] = &Column{Type: typ}
+							}
+							var output bytes.Buffer
+							require.NoError(t, toCsvLine(&output, delim, tc.values, columns, make([]string, len(columns)), make([]bool, len(columns)), escape))
+							require.Equal(t, strings.Join(tc.want, string(delim))+"\n", output.String())
+						})
+					}
+					broken := &csvFlushErrorWriter{}
+					require.ErrorIs(t, toCsvLine(broken, delim, []any{makeValue("")}, cols, line, nulls, escape), io.ErrClosedPipe)
+					require.Equal(t, 1, broken.writes)
+				})
+			}
+		}
+	}
+}
+
+func TestToCsvEmptyRows(t *testing.T) {
+	db, mock := exportTestDB(t)
+	mock.ExpectQuery("select v").WillReturnRows(sqlmock.NewRows([]string{"v"}).
+		AddRow("ordinary").AddRow(nil).AddRow("").AddRow("").AddRow(nil)).RowsWillBeClosed()
+	rows, err := db.Query("select v")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, rows.Close()) })
+	var output bytes.Buffer
+	var value sql.RawBytes
+	require.NoError(t, toCsv(rows, &output, []any{&value}, []*Column{{Name: "v", Type: "VARCHAR"}}, &csvConfig{fieldDelimiter: ','}))
+	require.Equal(t, "ordinary\n\\N\n\"\"\n\"\"\n\\N\n", output.String())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// Every whitespace-only record is quoted so older loaders do not skip it.
 func Test_toCsvLine_whitespaceOnlyRows(t *testing.T) {
 	cols := []*Column{{Name: "col1", Type: "varchar"}}
 	bb := bytes.Buffer{}
