@@ -292,6 +292,85 @@ func TestGetTablesScopedQuery(t *testing.T) {
 		})
 	})
 
+	const shaped = "__mo_tmp_0123456789abcdef0123456789abcdef_user"
+	const other = "__mo_tmp_0123456789abcdef0123456789abcdef_a,b`c"
+	for _, tc := range []struct {
+		name      string
+		confirmed Tables
+		rows      Tables
+		isSys     bool
+		wantError string
+	}{
+		{"confirmation keeps ordinary tables", Tables{{Name: shaped}}, Tables{{Name: "plain", Kind: "r"}, {Name: shaped, Kind: "r"}}, false, ""},
+		{"empty kind and repeated exact names", Tables{{Name: shaped}, {Name: shaped}, {Name: other}}, Tables{{Name: shaped}, {Name: other, Kind: "r"}}, false, ""},
+		{"sys scope unchanged", Tables{{Name: shaped}}, Tables{{Name: shaped, Kind: "r"}}, true, ""},
+		{"unconfirmed ambiguous row", Tables{{Name: shaped}}, Tables{{Name: shaped, Kind: "r"}, {Name: other, Kind: "r"}}, false, "has the legacy temporary name shape"},
+		{"missing or filtered target", Tables{{Name: shaped}}, Tables{{Name: "plain", Kind: "r"}}, false, "confirmed permanent table"},
+		{"ordinary name needs no confirmation", Tables{{Name: "plain"}}, Tables{{Name: "plain", Kind: "r"}}, false, "confirmed permanent table"},
+		{"view is not an ambiguous table", Tables{{Name: shaped}}, Tables{{Name: shaped, Kind: "v"}}, false, "confirmed permanent table"},
+		{"temporary kind cannot be confirmed", Tables{{Name: shaped}}, Tables{{Name: shaped, Kind: "temporary_table"}}, false, "confirmed permanent table"},
+		{"confirmation is not a glob", Tables{{Name: shaped + "*"}}, Tables{{Name: shaped, Kind: "r"}}, false, "has the legacy temporary name shape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newCatalogMock(t)
+			query := defaultSQL
+			if tc.isSys {
+				query = sysSQL
+			}
+			rows := sqlmock.NewRows([]string{"relname", "relkind"})
+			for _, table := range tc.rows {
+				rows.AddRow(table.Name, table.Kind)
+			}
+			mock.ExpectQuery(query).WithArgs("d", "d").WillReturnRows(rows).RowsWillBeClosed()
+			got, err := getTables(context.Background(), "d", nil, Options{confirmedPermanentTables: tc.confirmed, sysAccount: tc.isSys})
+			if tc.wantError != "" {
+				require.ErrorContains(t, err, tc.wantError)
+				require.Nil(t, got)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.rows, got)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+
+	for _, failure := range []string{"query", "scan", "iteration"} {
+		t.Run("confirmation propagates "+failure+" error", func(t *testing.T) {
+			mock := newCatalogMock(t)
+			expect := mock.ExpectQuery(defaultSQL).WithArgs("d", "d")
+			switch failure {
+			case "query":
+				expect.WillReturnError(context.Canceled)
+			case "scan":
+				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(shaped, nil)).RowsWillBeClosed()
+			case "iteration":
+				expect.WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).
+					AddRow(shaped, "r").AddRow("plain", "r").RowError(1, context.Canceled)).RowsWillBeClosed()
+			}
+			got, err := getTables(context.Background(), "d", nil, Options{confirmedPermanentTables: Tables{{Name: shaped}, {Name: other}}})
+			require.Error(t, err)
+			require.Nil(t, got)
+			if failure != "scan" {
+				require.ErrorIs(t, err, context.Canceled, "read errors must precede unmatched-confirmation errors")
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+
+	t.Run("confirmation consumption is local to each read", func(t *testing.T) {
+		mock := newCatalogMock(t)
+		opt := Options{confirmedPermanentTables: Tables{{Name: shaped}}}
+		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(shaped, "r"))
+		_, err := getTables(context.Background(), "d", nil, opt)
+		require.NoError(t, err)
+		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").
+			WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}))
+		_, err = getTables(context.Background(), "d", nil, opt)
+		require.ErrorContains(t, err, "confirmed permanent table")
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
 	t.Run("query error is propagated", func(t *testing.T) {
 		mock := newCatalogMock(t)
 		mock.ExpectQuery(defaultSQL).WithArgs("d", "d").WillReturnError(sql.ErrConnDone)
