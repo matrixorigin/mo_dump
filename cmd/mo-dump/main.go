@@ -42,24 +42,25 @@ import (
 )
 
 type Options struct {
-	username             string
-	password             string
-	host                 string
-	database             string
-	tbl                  string
-	dbs                  []string
-	tables               Tables
-	port                 int
-	netBufferLength      int
-	toCsv                bool
-	localInfile          bool
-	noData               bool
-	emptyTables          bool
-	csvConf              csvConfig
-	csvFieldDelimiterStr string
-	enableEscape         bool
-	where                string
-	sysAccount           bool // used in getDatabaseType, getTables
+	username                 string
+	password                 string
+	host                     string
+	database                 string
+	tbl                      string
+	dbs                      []string
+	tables                   Tables
+	confirmedPermanentTables Tables
+	port                     int
+	netBufferLength          int
+	toCsv                    bool
+	localInfile              bool
+	noData                   bool
+	emptyTables              bool
+	csvConf                  csvConfig
+	csvFieldDelimiterStr     string
+	enableEscape             bool
+	where                    string
+	sysAccount               bool // used in getDatabaseType, getTables
 }
 
 func (t *Tables) String() string {
@@ -72,7 +73,7 @@ func (t *Tables) Set(value string) error {
 }
 
 var usage = func() {
-	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [--enable-escape=false] [-csv] [-tbl <table>...] [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s -u <username> -p <password> -h <host> -P <port> -db <database> [--local-infile=true] [--enable-escape=false] [-csv] [-tbl <table>...] [-confirm-permanent-table <table>]... [-no-data] -net-buffer-length <net-buffer-length>\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
@@ -153,6 +154,7 @@ func main() {
 	flag.IntVar(&opt.netBufferLength, "net-buffer-length", defaultNetBufferLength, "net-buffer-length used to set the buffer size for network connections")
 	flag.StringVar(&opt.database, "db", "", "databaseName, must be specified")
 	flag.StringVar(&opt.tbl, "tbl", "", "tableNameList (default all)")
+	flag.Var(&opt.confirmedPermanentTables, "confirm-permanent-table", "confirm one legacy-temporary-shaped name as a permanent table for a single-database whole dump (repeatable); incorrect confirmation may export legacy temporary data")
 	flag.BoolVar(&opt.toCsv, "csv", defaultCsv, "set export format to csv (default false)")
 	flag.StringVar(&opt.csvFieldDelimiterStr, "csv-field-delimiter", string(defaultFieldDelimiter), "set csv field delimiter (one utf8 character; no backslash, double quote, CR, LF, or NUL). enabled only when the option 'csv' is set.")
 	flag.BoolVar(&opt.localInfile, "local-infile", defaultLocalInfile, "use load data local infile")
@@ -193,6 +195,9 @@ func main() {
 	}
 	if opt.tables == nil {
 		opt.emptyTables = true
+	}
+	if err = opt.validatePermanentTableOptions(ctx); err != nil {
+		return
 	}
 
 	//replace : in username to #, because : is used as separator in dsn.
@@ -314,6 +319,9 @@ func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 			return err
 		}
 
+		if dbStruct.DBType == catalog.SystemDBTypeSubscription && len(opt.confirmedPermanentTables) > 0 {
+			return moerr.NewInvalidInputf(ctx, "-confirm-permanent-table cannot validate subscription database %q", dbStruct.Name)
+		}
 		db = dbStruct.Name // Catalog identity, not the requested spelling.
 		if opt.emptyTables {
 			opt.tables = nil
@@ -591,26 +599,9 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 	// identification were removed across review rounds 2-6: each variant
 	// proved able to silently swallow named or renamed user tables behind a
 	// MODUMP SUCCESS — the exact omission class this change forbids.
-	// Temporary-table rows are classified with the strongest authority the
-	// connected server exposes (review rounds 8-9):
-	//   - relkind 'temporary_table' since the v4.2 catalog rework (always
-	//     applied, current clusters);
-	//   - on current clusters the server-side classification function
-	//     mo_is_legacy_temporary_table (probed once per connection) is
-	//     pushed into the query. It owns every classification subtlety the
-	//     client must not reimplement: rename metadata, batched requests,
-	//     comments decoration, qualified identities, executable comments;
-	//   - clusters without the function (v4.0/v4.1 and older, e.g. v1.2.4)
-	//     fall back to the same shape rule those servers themselves used
-	//     in SHOW TABLES ('__mo_tmp_<32hex>_' physical prefixes, ordinary
-	//     or empty relkind). On those releases the server-illegible rows
-	//     follow the server's own visibility semantics; current clusters
-	//     keep precise per-statement classification via the function or
-	//     the relkind metadata.
-	// The two catalog columns the function touches (rel_createsql,
-	// extra_info) are never selected by this client — v1.2.4 has no
-	// extra_info column at all — they are only referenced inside the
-	// server-executed predicate on clusters that provide the function.
+	// Explicit temporary relkind rows are excluded. Ordinary/empty-kind
+	// legacy temporary shapes require owner confirmation below; neither a
+	// server-version probe nor the historical SQL classifier proves permanence.
 	// Anything that still reaches the export switch with an unsupported
 	// relkind fails loudly there; the empty relkind is exported as an
 	// ordinary table, with getCreateTable rejecting fragments that lack
@@ -637,8 +628,9 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 	// USE-qualified statements, and its relkind gate never inspects the
 	// empty-kind index rows — review round 11). The query therefore flags
 	// nothing here: the rows reach the client, and the dump aborts unless
-	// the user explicitly selected each such row with -tbl, giving the
-	// object's owner the final say instead of a guessed classification.
+	// the user explicitly selected each such row with -tbl or confirmed it
+	// with -confirm-permanent-table. Confirmation does not change these SQL
+	// predicates or narrow a whole-database dump to the confirmed names.
 	args = append(args, db)
 	// mo_increment_columns and __mo_account_lock (the latter has no
 	// matching constant in the pinned matrixone dependency) only exist in
@@ -661,6 +653,10 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 		}
 		sql += ")"
 	}
+	confirmed := make(map[string]bool, len(opt.confirmedPermanentTables))
+	for _, table := range opt.confirmedPermanentTables {
+		confirmed[table.Name] = false
+	}
 	r, err := conn.QueryContext(ctx, sql, args...)
 	if err != nil {
 		return nil, err
@@ -679,11 +675,16 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 			return nil, err
 		}
 		if isLegacyTemporaryShape(table, kind) {
-			if _, explicit := tableNames[table]; !explicit {
+			_, explicit := tableNames[table]
+			_, ownerConfirmed := confirmed[table]
+			if !explicit && !ownerConfirmed {
 				return nil, moerr.NewInvalidInput(ctx, fmt.Sprintf(
 					"table %s has the legacy temporary name shape; its permanent or session-temporary identity is not decidable from catalog metadata or the server classifier, "+
-						"so the dump refuses to guess: export it explicitly with -tbl if it is a permanent table, or clean up expired session temporary backing rows and dump again",
+						"so the dump refuses to guess: if it is a permanent table, confirm it with -confirm-permanent-table for a single-database whole dump or select it with -tbl; otherwise clean up expired session temporary backing rows and dump again",
 					table))
+			}
+			if ownerConfirmed {
+				confirmed[table] = true
 			}
 		}
 		tables = append(tables, Table{table, kind})
@@ -699,6 +700,12 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 		}
 	}
 
+	for _, table := range opt.confirmedPermanentTables {
+		if !confirmed[table.Name] {
+			return nil, moerr.NewInvalidInputf(ctx,
+				"confirmed permanent table %q is not a visible legacy-temporary-shaped ordinary table in database %q", table.Name, db)
+		}
+	}
 	return tables, nil
 }
 

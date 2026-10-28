@@ -374,6 +374,10 @@ func TestGenOutputClosesRows(t *testing.T) {
 
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
+		if strings.HasPrefix(mode, "confirm_") {
+			runPermanentConfirmationCLI(t, mode)
+			return
+		}
 		if mode == "all_system_dbs" {
 			_, mock := exportTestDB(t)
 			mock.ExpectQuery("show databases").
@@ -428,16 +432,49 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs", "view"} {
+	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs", "view",
+		"confirm_success", "confirm_missing", "confirm_all", "confirm_multiple", "confirm_tbl", "confirm_empty"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDumpExitStatus$")
 			cmd.Env = append(os.Environ(), "MO_DUMP_TEST_EXIT_STATUS="+mode)
+			if strings.HasPrefix(mode, "confirm_") {
+				cmd.Dir = t.TempDir()
+				require.NoError(t, os.WriteFile(cmd.Dir+"/existing.csv", []byte("keep"), 0600))
+			}
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
 			err := cmd.Run()
 			require.NoError(t, ctx.Err(), "child process did not terminate")
+			if strings.HasPrefix(mode, "confirm_") {
+				if mode == "confirm_success" {
+					require.NoError(t, err, stderr.String())
+					require.Empty(t, stderr.String())
+					require.Contains(t, stdout.String(), "CREATE TABLE `plain`")
+					require.Contains(t, stdout.String(), "__mo_tmp_0123456789abcdef0123456789abcdef_user")
+					require.Contains(t, stdout.String(), "a,b``c")
+					require.Equal(t, 3, strings.Count(stdout.String(), "INSERT INTO"))
+					require.Contains(t, stdout.String(), "MODUMP SUCCESS")
+				} else {
+					var exitErr *exec.ExitError
+					require.ErrorAs(t, err, &exitErr)
+					require.Equal(t, 1, exitErr.ExitCode())
+					require.Empty(t, stdout.String(), "invalid confirmation must publish nothing")
+					if mode == "confirm_missing" {
+						require.Contains(t, stderr.String(), "confirmed permanent table")
+					} else {
+						require.Contains(t, stderr.String(), "-confirm-permanent-table")
+					}
+				}
+				files, readErr := os.ReadDir(cmd.Dir)
+				require.NoError(t, readErr)
+				require.Len(t, files, 1, "no staged or published files may be left behind")
+				data, readErr := os.ReadFile(cmd.Dir + "/existing.csv")
+				require.NoError(t, readErr)
+				require.Equal(t, "keep", string(data))
+				return
+			}
 			if mode == "empty_default" {
 				var exitErr *exec.ExitError
 				require.ErrorAs(t, err, &exitErr)

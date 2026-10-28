@@ -6,7 +6,7 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 ### 语法结构
 
 ```
-./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [--enable-escape=false] [-csv] [-no-data] [-tbl ${table}...] -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
+./mo-dump -u ${user} -p ${password} -h ${host} -P ${port} -db ${database} [--local-infile=true] [--enable-escape=false] [-csv] [-no-data] [-tbl ${table}...] [-confirm-permanent-table ${table}]... -net-buffer-length ${net-buffer-length} > {dumpfilename.sql}
 ```
 
 **参数释义**
@@ -38,6 +38,8 @@ MatrixOne supports logical backups through the mo_dump utility. mo_dump is a com
 - **--local-infile**：默认值为 true，仅在参数 **-csv** 设置为 true 时生效。为 true 时，恢复脚本按 CSV 文件名从导入客户端的当前目录读取；搬迁备份时将 SQL 和 CSV 一起拷贝，并从 CSV 所在目录执行导入。为 false 时，脚本保留导出 CSV 的绝对路径，恢复服务器必须能访问该路径。
 
 - **-tbl [表名]**：可选参数。如果参数为空，则导出整个数据库。如果要备份指定表，则可以在命令中指定多个 `-tbl` 和表名。
+
+- **-confirm-permanent-table [表名]**：可重复的用户确认选项，允许单库整库导出包含名字具有历史临时表形态的永久表，详见下文。仅允许一个明确的 `-db`；不支持 `-db all`、多库、订阅库或与 `-tbl` 选表组合。
 
 - **-no-data**：默认值为 false。当设置为 true 时表示不导出数据，仅导出表结构。
 
@@ -115,6 +117,22 @@ mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db all > /tm/all-dbs.sql
 ```mysql
 mo-dump -u dump -p xxx -h 127.0.0.1 -P 6001 -db db1 -tbl tbl1,tbl2,tbl3 > /tm/all-dbs.sql
 ```
+
+## 确认历史临时表形态的永久表
+
+普通/空 relkind 的表如果具有 `__mo_tmp_<32 位小写十六进制>_...` 名字，现有元数据无法可靠区分其是永久表还是历史会话临时表。因此默认整库导出会拒绝猜测。确认它们确为永久表后，可以逐个声明，并继续导出整个数据库：
+
+```sh
+./mo-dump -u root -p 111 -db example \
+  -confirm-permanent-table '__mo_tmp_0123456789abcdef0123456789abcdef_orders' \
+  -confirm-permanent-table '__mo_tmp_0123456789abcdef0123456789abcdef_items' > example.sql
+```
+
+- **这是用户对表身份的确认，不是服务端的证明。错误确认可能导出历史临时表残留数据；不确定时不要使用。** 不需要升级或修改 MatrixOne。
+- 名单不是导出白名单：未列入名单的普通表、视图等仍按原规则随整库导出。每个有歧义的候选表都必须确认；缺少任何一项仍拒绝整个导出。
+- 每次选项接收一个目录中的原始表名，精确匹配（包括大小写）；不按逗号拆分、不解析 SQL 引号、不支持通配符。特殊字符用 shell 引号保护，不要额外添加 SQL 反引号。重复名字按同一个确认处理，空字符串报错。
+- 不存在、拼错、无须确认或被过滤的名字都会报错，不会静默忽略。确认不能越过当前租户/库范围、权限检查、明确的临时 relkind、索引登记或内部对象过滤；订阅库无法通过当前库目录验证该名单，也会明确拒绝。
+- SQL、`-csv`、`-no-data` 使用相同的确认规则。确认/读取失败时，进程非零退出，不向 stdout 发布脚本，不发布本次 CSV，也不会改动已有 CSV 文件。与其他导出一样，shell 的 `>` 重定向可能在程序启动前就截断已有 SQL 文件，应使用新的输出文件名。
 
 ## 导出范围与完整性语义
 
