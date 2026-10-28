@@ -1155,9 +1155,22 @@ func convertValue(v any, typ string) string {
 			}
 			return retStr
 		}
-		return "'" + retStr + "'" // NaN, +Inf, -Inf: quoted so the server converts
-		// the literal on insert. Applies to DOUBLE as well
-		// (matrixorigin/matrixone#30596).
+		// IEEE NaN/±Inf have no numeric SQL literal. Quoting them made INSERT
+		// fail at the first row when the tokens were bare (the original
+		// matrixorigin/matrixone#30596 symptom), and default MySQL-compatible
+		// strict sessions additionally reject the quoted form with 1265
+		// "Data truncated" since matrixorigin/matrixone#31191, so quoted
+		// values cannot round-trip there either (matrixorigin/matrixone#30596).
+		// A bit_cast expression rebuilds the canonical IEEE word from raw
+		// bytes, so the sql_mode text rule does not apply; restore is
+		// verified under the default strict, MATRIXONE_NATIVE and
+		// NO_BACKSLASH_ESCAPES sessions. bit_cast itself exists in
+		// MatrixOne since matrixorigin/matrixone#11441 (2023-09).
+		if expr, ok := ieeeSpecialSQL(retStr, typ); ok {
+			return expr
+		}
+		// Unknown non-numeric wire text keeps the legacy quoted form.
+		return "'" + retStr + "'"
 	case "int", "tinyint", "smallint", "bigint", "unsigned bigint", "unsigned int", "unsigned tinyint", "unsigned smallint", "bool", "boolean":
 		return string(ret)
 	case "vecf32", "vecf64":
@@ -1171,6 +1184,29 @@ func convertValue(v any, typ string) string {
 		str := strings.Replace(string(ret), "\\", "\\\\", -1)
 		return "'" + strings.Replace(str, "'", "\\'", -1) + "'"
 	}
+}
+
+// ieeeSpecialSQL maps the FLOAT/DOUBLE wire text of NaN/+Inf/-Inf to a
+// bit_cast(unhex(..)) expression that reproduces the canonical IEEE
+// NaN/+Inf/-Inf words on restore, using the little-endian hex patterns
+// of the server's own special-value fixtures. The text wire carries no
+// NaN payload bits, so the canonical quiet-NaN word is emitted — the
+// same canonical value the CSV roundtrip restores
+// (matrixorigin/matrixone#30596).
+func ieeeSpecialSQL(s, typ string) (string, bool) {
+	ieeeHex := map[string][2]string{
+		"NaN":  {"0000c07f", "000000000000f87f"}, // 0x7FC00000 / 0x7FF8000000000000
+		"+Inf": {"0000807f", "000000000000f07f"}, // 0x7F800000 / 0x7FF0000000000000
+		"-Inf": {"000080ff", "000000000000f0ff"}, // 0xFF800000 / 0xFFF0000000000000
+	}
+	pair, ok := ieeeHex[s]
+	if !ok {
+		return "", false
+	}
+	if typ == "float" {
+		return "bit_cast(unhex('" + pair[0] + "') as float)", true
+	}
+	return "bit_cast(unhex('" + pair[1] + "') as double)", true
 }
 
 func convertValue2(v any, typ string) (sql.RawBytes, string) {
