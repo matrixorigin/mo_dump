@@ -567,6 +567,45 @@ func TestConvertValue(t *testing.T) {
 	}
 }
 
+// TestConvertValueFloatSpecials pins the #30596 restore contract: FLOAT/DOUBLE
+// NaN/±Inf serialize to the bit_cast(unhex(..)) expression that rebuilds the
+// same IEEE word under the default strict MySQL-compatible session (textual
+// specials are rejected there with 1265 since matrixorigin/matrixone#31191),
+// while unknown non-numeric wire text, special spellings in string columns, -0
+// and float32-overflow wire text keep their documented forms (#30598 regressions).
+func TestConvertValueFloatSpecials(t *testing.T) {
+	kase := []struct {
+		name string
+		val  string
+		typ  string
+		want string
+	}{
+		{"float_nan", "NaN", "float", "bit_cast(unhex('0000c07f') as float)"},
+		{"float_pos_inf", "+Inf", "float", "bit_cast(unhex('0000807f') as float)"},
+		{"float_neg_inf", "-Inf", "float", "bit_cast(unhex('000080ff') as float)"},
+		{"double_nan", "NaN", "double", "bit_cast(unhex('000000000000f87f') as double)"},
+		{"double_pos_inf", "+Inf", "double", "bit_cast(unhex('000000000000f07f') as double)"},
+		{"double_neg_inf", "-Inf", "double", "bit_cast(unhex('000000000000f0ff') as double)"},
+		{"float_unknown_text", "Infinity", "float", "'Infinity'"},
+		{"double_lower_nan", "nan", "double", "'nan'"},
+		{"varchar_nan_stays_string", "NaN", "varchar", "'NaN'"},
+		{"float_neg_zero", "-0", "float", "cast('-0' as float)"},
+		{"double_neg_zero", "-0", "double", "cast('-0' as double)"},
+		{"float_max32_overflow", "3.4028235e+38", "float", "cast('3.4028235e+38' as float)"},
+		{"double_finite_passthrough", "1.7976931348623157e+308", "double", "1.7976931348623157e+308"},
+		{"float_finite_passthrough", "1.25", "float", "1.25"},
+	}
+	for _, tc := range kase {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, convertValue(makeValue(tc.val), tc.typ))
+		})
+	}
+
+	t.Run("null_stays_null", func(t *testing.T) {
+		require.Equal(t, "NULL", convertValue(makeNullValue(), "double"))
+	})
+}
+
 func TestConvertValueBit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
