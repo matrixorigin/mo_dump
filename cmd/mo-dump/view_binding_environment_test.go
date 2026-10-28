@@ -80,7 +80,7 @@ func TestDumpStoredViewSQLMode(t *testing.T) {
 	mock.ExpectQuery(query).WithArgs("db", "z_source").WillReturnRows(sqlmock.NewRows([]string{"relname", "viewdef"}).AddRow("z_source", viewDefinitionJSON(t, "db", "CREATE VIEW z_source AS SELECT 7 AS x", "")))
 	mock.ExpectQuery("select @@lower_case_table_names").WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 	opt := Options{dbs: []string{"db"}, emptyTables: true, noData: true}
-	require.NoError(t, opt.dumpData(context.Background()))
+	require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background()))
 	require.NoError(t, mock.ExpectationsWereMet())
 	content, err := os.ReadFile(output.Name())
 	require.NoError(t, err)

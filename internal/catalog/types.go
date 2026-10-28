@@ -21,6 +21,7 @@ const (
 	SystemOrdinaryRel        = "r"
 	SystemExternalRel        = "e"
 	SystemViewRel            = "v"
+	SystemSequenceRel        = "S"
 	SystemDBTypeSubscription = "subscription"
 
 	// MO_CATALOG is the durable name of the system catalog database.

@@ -23,10 +23,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -165,15 +165,29 @@ func exportTestDB(t *testing.T) (*sql.DB, sqlmock.Sqlmock) {
 	return db, mock
 }
 
+// exportTestSink returns a sink over a fresh temp file. Closing the file
+// turns stream writes into write-error injections.
+// exportTestStdout swaps real stdout for a fresh temp file and returns it;
+// mo/main-era tests read the captured script from it after acting on the
+// swapped stdout, which still works in this branch because runDumpDataOverStdout
+// and sinkOver(os.Stdout) write to whatever os.Stdout points at.
 func exportTestStdout(t *testing.T) *os.File {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "stdout")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = f.Close() })
 	oldStdout := os.Stdout
 	os.Stdout = f
-	t.Cleanup(func() { os.Stdout = oldStdout })
+	t.Cleanup(func() { os.Stdout = oldStdout; _ = f.Close() })
 	return f
+}
+
+func exportTestSink(t *testing.T) (*dumpSink, *os.File) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stdout")
+	require.NoError(t, err)
+	sink := sinkOver(f)
+	t.Cleanup(func() { _ = f.Close() })
+	return sink, f
 }
 
 func exportTestRows(n int, rowErr error, errorRow int) *sqlmock.Rows {
@@ -211,7 +225,7 @@ func TestShowInsertRows(t *testing.T) {
 			rows, err := db.Query("select id")
 			require.NoError(t, err)
 			defer rows.Close()
-			out := exportTestStdout(t)
+			out, expectFile := exportTestSink(t)
 			var buffers []*bytes.Buffer
 			pool := &sync.Pool{New: func() any {
 				buf := &bytes.Buffer{}
@@ -219,12 +233,12 @@ func TestShowInsertRows(t *testing.T) {
 				return buf
 			}}
 			var id sql.RawBytes
-			err = showInsert(rows, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, "t", pool, tc.bufferSize)
+			err = showInsert(rows, []any{&id}, []*Column{{Name: "id", Type: "INT"}}, "t", pool, tc.bufferSize, out)
 			require.ErrorIs(t, err, tc.err)
 			for _, buf := range buffers {
 				require.Zero(t, buf.Len(), "pooled buffers must be reset on every return path")
 			}
-			data, err := os.ReadFile(out.Name())
+			data, err := os.ReadFile(expectFile.Name())
 			require.NoError(t, err)
 			require.Equal(t, tc.want, string(data))
 			require.NoError(t, mock.ExpectationsWereMet())
@@ -244,7 +258,7 @@ func TestShowInsertScanError(t *testing.T) {
 		buffers = append(buffers, buf)
 		return buf
 	}}
-	err = showInsert(rows, nil, nil, "t", pool, 1024)
+	err = showInsert(rows, nil, nil, "t", pool, 1024, sinkOver(&bytes.Buffer{}))
 	require.ErrorContains(t, err, "expected 1 destination arguments")
 	for _, buf := range buffers {
 		require.Zero(t, buf.Len())
@@ -320,10 +334,10 @@ func TestToCsvFlushError(t *testing.T) {
 }
 
 func TestGenOutputClosesRows(t *testing.T) {
-	for _, mode := range []string{"sql_cancel", "sql_write_error", "csv_create_error"} {
+	for _, mode := range []string{"sql_cancel", "sql_write_error", "csv_row_error"} {
 		t.Run(mode, func(t *testing.T) {
 			_, mock := exportTestDB(t)
-			out := exportTestStdout(t)
+			out, expectFile := exportTestSink(t)
 			rows := exportTestRows(3, nil, 0)
 			conf := csvConfig{fieldDelimiter: ','}
 			database := "db"
@@ -331,22 +345,27 @@ func TestGenOutputClosesRows(t *testing.T) {
 			case "sql_cancel":
 				rows.RowError(2, context.Canceled)
 			case "sql_write_error":
-				require.NoError(t, out.Close())
-			case "csv_create_error":
+				require.NoError(t, expectFile.Close())
+			case "csv_row_error":
+				chdirToTemp(t)
 				conf.enable = true
-				database = filepath.Join(t.TempDir(), "missing", "db")
+				rows.RowError(1, io.ErrUnexpectedEOF)
 			}
 			mock.ExpectQuery("select * from `" + database + "`.`t`").WillReturnRows(rows).RowsWillBeClosed()
 			mock.ExpectClose()
 			pool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
-			err := genOutput(database, "t", pool, 29, true, &conf, "")
+			err := genOutput(database, "t", out, pool, 29, true, &conf, "")
 			switch mode {
 			case "sql_cancel":
 				require.ErrorIs(t, err, context.Canceled)
 			case "sql_write_error":
 				require.ErrorIs(t, err, os.ErrClosed)
-			case "csv_create_error":
-				require.ErrorIs(t, err, os.ErrNotExist)
+			case "csv_row_error":
+				// A failed table removes its staged csv data file.
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+				for name := range readDirSnapshot(t) {
+					require.NotContains(t, name, ".mo-dump-", "staged csv must be cleaned")
+				}
 			}
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
@@ -355,6 +374,21 @@ func TestGenOutputClosesRows(t *testing.T) {
 
 func TestDumpExitStatus(t *testing.T) {
 	if mode := os.Getenv("MO_DUMP_TEST_EXIT_STATUS"); mode != "" {
+		if mode == "all_system_dbs" {
+			_, mock := exportTestDB(t)
+			mock.ExpectQuery("show databases").
+				WillReturnRows(sqlmock.NewRows([]string{"Database"}).
+					AddRow("information_schema").
+					AddRow("mo_catalog").
+					AddRow("mysql").
+					AddRow("system").
+					AddRow("system_metrics"))
+			flag.CommandLine = flag.NewFlagSet("mo-dump", flag.ExitOnError)
+			os.Args = []string{"mo-dump", "-db", "all"}
+			main()
+			require.NoError(t, mock.ExpectationsWereMet())
+			return
+		}
 		_, mock := exportTestDB(t)
 		mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs("db").
 			WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow("db", ""))
@@ -394,7 +428,7 @@ func TestDumpExitStatus(t *testing.T) {
 		return
 	}
 
-	for _, mode := range []string{"success", "cancel", "empty_default", "view"} {
+	for _, mode := range []string{"success", "cancel", "empty_default", "all_system_dbs", "view"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -409,9 +443,9 @@ func TestDumpExitStatus(t *testing.T) {
 				require.ErrorAs(t, err, &exitErr)
 				require.Equal(t, 1, exitErr.ExitCode())
 				require.Contains(t, stderr.String(), "modump error: analyze view db.t: empty default database")
-				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
-				require.NotContains(t, stdout.String(), "CREATE VIEW")
-				require.NotContains(t, stdout.String(), "SET @modump_saved_sql_mode")
+				// The dump is staged until it completes, so the failed view
+				// analysis leaves stdout completely unpublished.
+				require.Empty(t, stdout.String(), "a failed dump must publish nothing")
 				return
 			}
 			if mode == "view" {
@@ -430,17 +464,25 @@ func TestDumpExitStatus(t *testing.T) {
 				require.Equal(t, strings.ToLower(saves[0][1]), strings.ToLower(restores[1][1]))
 				return
 			}
-			require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "must reach streaming output before termination")
 			if mode == "cancel" {
 				var exitErr *exec.ExitError
 				require.ErrorAs(t, err, &exitErr)
 				require.Equal(t, 1, exitErr.ExitCode())
+				// The dump is staged until it completes: a canceled dump must
+				// leave stdout completely empty instead of a partial script.
+				require.Empty(t, stdout.String())
 				require.Contains(t, stderr.String(), "modump error: context canceled")
-				require.NotContains(t, stdout.String(), "MODUMP SUCCESS")
-				require.NotContains(t, stdout.String(), "SET foreign_key_checks = 1;")
+			} else if mode == "all_system_dbs" {
+				var exitErr *exec.ExitError
+				require.ErrorAs(t, err, &exitErr)
+				require.Equal(t, 1, exitErr.ExitCode())
+				require.Empty(t, stdout.String())
+				require.Contains(t, stderr.String(), "modump error")
+				require.Contains(t, stderr.String(), "only system databases")
 			} else {
 				require.NoError(t, err, stderr.String())
 				require.Empty(t, stderr.String())
+				require.Contains(t, stdout.String(), "INSERT INTO `t` VALUES", "successful dump publishes its script")
 				require.Contains(t, stdout.String(), "MODUMP SUCCESS")
 				require.Contains(t, stdout.String(), "SET foreign_key_checks = 1;")
 			}
@@ -544,19 +586,14 @@ func TestShowInsertBit(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, rows.Close()) })
 
-	output, err := os.CreateTemp(t.TempDir(), "insert-*.sql")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, output.Close()) })
-	oldStdout := os.Stdout
-	os.Stdout = output
-	t.Cleanup(func() { os.Stdout = oldStdout })
+	sink, sinkFile := exportTestSink(t)
 
 	var id, bit sql.RawBytes
 	pool := &sync.Pool{New: func() any { return new(bytes.Buffer) }}
-	err = showInsert(rows, []any{&id, &bit}, []*Column{{Name: "id", Type: "INT"}, {Name: "b", Type: "BIT"}}, "t", pool, defaultNetBufferLength)
+	err = showInsert(rows, []any{&id, &bit}, []*Column{{Name: "id", Type: "INT"}, {Name: "b", Type: "BIT"}}, "t", pool, defaultNetBufferLength, sink)
 	require.NoError(t, err)
 	require.NoError(t, rows.Err())
-	got, err := os.ReadFile(output.Name())
+	got, err := os.ReadFile(sinkFile.Name())
 	require.NoError(t, err)
 	require.Equal(t, "INSERT INTO `t` VALUES (1,0x27),(2,0x5C),(3,0x00),(4,NULL),(5,0x0001),(6,0x41);\n\n\n\n", string(got))
 }
@@ -605,20 +642,11 @@ func TestShowCreateTable(t *testing.T) {
 			res:          "create table t1 (a int, b int);\n\n\n",
 		},
 	}
-	old := os.Stdout
 	for _, v := range kases {
-		r, w, _ := os.Pipe()
-		os.Stdout = w
-		showCreateTable(v.sql, v.withNextLine)
-
-		e := w.Close()
-		require.Nil(t, e)
 		var buf bytes.Buffer
-		_, e = buf.ReadFrom(r)
-		require.Nil(t, e)
+		showCreateTable(sinkOver(&buf), v.sql, v.withNextLine)
 		require.Equal(t, v.res, buf.String())
 	}
-	os.Stdout = old
 }
 
 // TestDumpDataExternalTableCommentInjection guards the restore contract: an
@@ -642,8 +670,7 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 
 	mock.ExpectQuery("select datname, dat_type from mo_catalog.mo_database where datname = ?" + dbScopePredicate).WithArgs(dbName).
 		WillReturnRows(sqlmock.NewRows([]string{"datname", "dat_type"}).AddRow(dbName, "user"))
-	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+
-		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs(dbName, dbName, tblName).
+	mock.ExpectQuery("select relname,relkind from mo_catalog.mo_tables where reldatabase = ?"+tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs(dbName, dbName, tblName).
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow(tblName, catalog.SystemExternalRel))
 	createSQL := "CREATE EXTERNAL TABLE `a*/b` (id INT) INFILE{'filepath'='/tmp/rows.csv'}"
 	mock.ExpectQuery("show create table `" + dbName + "`.`" + tblName + "`").
@@ -653,7 +680,7 @@ func TestDumpDataExternalTableCommentInjection(t *testing.T) {
 
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	err = opt.dumpData(context.Background())
+	err = runDumpDataOverStdout(t, opt, context.Background())
 
 	e := w.Close()
 	require.Nil(t, e)
@@ -900,14 +927,8 @@ func Test_showInsertOversizedRow(t *testing.T) {
 	cols := []*Column{{Name: "id", Type: "int"}, {Name: "payload", Type: "varchar"}}
 	bufPool := &sync.Pool{New: func() any { return &bytes.Buffer{} }}
 
-	old := os.Stdout
-	pr, pw, _ := os.Pipe()
-	os.Stdout = pw
-	err = showInsert(r, args, cols, "t", bufPool, 1024)
-	os.Stdout = old
-	_ = pw.Close()
 	var bb bytes.Buffer
-	_, _ = bb.ReadFrom(pr)
+	err = showInsert(r, args, cols, "t", bufPool, 1024, sinkOver(&bb))
 	out := bb.String()
 
 	require.Nil(t, err)
@@ -1062,4 +1083,114 @@ func TestGetDumpView(t *testing.T) {
 	require.NotNil(t, view.definition.SQLMode)
 	require.Empty(t, *view.definition.SQLMode)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// runDumpDataOverStdout executes dumpData on a buffered sink and mirrors the
+// produced script to real stdout whether or not the dump succeeded. The CLI
+// itself stages the script and only publishes complete dumps; this helper
+// keeps the merged view tests' "capture stdout" fixtures meaningful by
+// reproducing the old streaming observation points for assertions, including
+// the partial prefix a failed dump produced before its error.
+func runDumpDataOverStdout(t *testing.T, opt *Options, ctx context.Context) error {
+	t.Helper()
+	var buf bytes.Buffer
+	sink := sinkOver(&buf)
+	err := opt.dumpData(ctx, sink)
+	if err == nil {
+		err = sink.Err()
+	}
+	_, werr := os.Stdout.WriteString(buf.String())
+	if err == nil {
+		err = werr
+	}
+	return err
+}
+
+// epipeWriter fails every write with EPIPE without any process-level
+// signal machinery: SIGPIPE disposition belongs to the real CLI, tests
+// only need the error path itself.
+type epipeWriter struct{}
+
+func (epipeWriter) Write([]byte) (int, error) { return 0, syscall.EPIPE }
+
+// limitingNoteWriter takes the first note write and fails the second
+// (EOF): used to pin that the failing closing note still surfaces while
+// the already delivered prefix stays visible (matrixorigin/matrixone#30577).
+type limitingNoteWriter struct {
+	buf        bytes.Buffer
+	failSecond bool
+}
+
+func (w *limitingNoteWriter) Write(p []byte) (int, error) {
+	if w.failSecond {
+		return 0, io.EOF
+	}
+	w.failSecond = true
+	return w.buf.Write(p)
+}
+
+// TestWriteSuccessFootnotes covers both note shapes and all failure stages.
+// The success marker is always the last byte a reader sees: a failing csv
+// note must not leave a complete MODUMP SUCCESS behind (a consumer would
+// restore a script whose data files were revoked), and a failing marker
+// write must surface instead of a silent exit 0.
+func TestWriteSuccessFootnotes(t *testing.T) {
+	cost := 3 * time.Second
+	restore := "SET SESSION sql_mode=@MODUMP_SCRIPT_SAVED_SQL_MODE;\n\n\n"
+	csvNote := "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"
+
+	t.Run("marker only", func(t *testing.T) {
+		var out bytes.Buffer
+		require.NoError(t, writeSuccessFootnotes(&out, cost, false))
+		require.Equal(t, restore+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
+	})
+
+	t.Run("csv note precedes the marker", func(t *testing.T) {
+		var out bytes.Buffer
+		require.NoError(t, writeSuccessFootnotes(&out, cost, true))
+		require.Equal(t, restore+csvNote+"/* MODUMP SUCCESS, COST 3s */\n", out.String())
+	})
+
+	t.Run("mode restore failure is reported", func(t *testing.T) {
+		// A writer that fails without touching process signal state: the
+		// footnote write only has to surface the error, SIGPIPE handling
+		// is the main package's concern, not this unit's.
+		err := writeSuccessFootnotes(epipeWriter{}, cost, false)
+		require.ErrorIs(t, err, syscall.EPIPE)
+	})
+
+	t.Run("csv note failure leaves no marker", func(t *testing.T) {
+		// The mode restore succeeds; the following CSV reminder fails.
+		w := &limitingNoteWriter{}
+		err := writeSuccessFootnotes(w, cost, true)
+		require.ErrorIs(t, err, io.EOF)
+		require.Equal(t, restore, w.buf.String())
+		require.NotContains(t, w.buf.String(), "MODUMP SUCCESS")
+	})
+
+	for _, csv := range []bool{false, true} {
+		t.Run(fmt.Sprintf("marker failure csv=%v", csv), func(t *testing.T) {
+			// Let every preceding write succeed and fail only the marker.
+			prefix := restore
+			if csv {
+				prefix += csvNote
+			}
+			w := &markerFailureWriter{remaining: len(prefix)}
+			require.ErrorIs(t, writeSuccessFootnotes(w, cost, csv), syscall.EPIPE)
+			require.Equal(t, prefix, w.buf.String())
+		})
+	}
+}
+
+type markerFailureWriter struct {
+	buf       bytes.Buffer
+	remaining int
+}
+
+func (w *markerFailureWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		return 0, syscall.EPIPE
+	}
+	w.remaining -= len(p)
+	return w.buf.Write(p)
 }

@@ -375,7 +375,7 @@ func TestDumpViewDependencies(t *testing.T) {
 				expected.WillReturnRows(sqlmock.NewRows([]string{"lower_case_table_names"}).AddRow(1))
 			}
 			var err error
-			output := captureIdentifierOutput(t, func() { err = opt.dumpData(context.Background()) })
+			output := captureIdentifierOutput(t, func() { err = runDumpDataOverStdout(t, &opt, context.Background()) })
 			if mode == "ordered" || mode == "nested forward shadow" || mode == "ansi quoted" {
 				require.NoError(t, err)
 				require.Contains(t, output, "DROP VIEW IF EXISTS `d`."+quoteIdentifier(parentName)+";\n"+parent+";")

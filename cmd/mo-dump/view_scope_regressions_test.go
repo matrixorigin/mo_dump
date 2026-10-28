@@ -105,7 +105,7 @@ func TestViewDefaultContextUsage(t *testing.T) {
 
 func TestViewRenderAnalysisFailure(t *testing.T) {
 	_, output := mockDumpOutput(t)
-	err := showDumpView(dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT FROM"}, viewSQLMode{})
+	err := showDumpView(sinkOver(os.Stdout), dumpView{name: viewName{"db", "v"}, create: "CREATE VIEW v AS SELECT FROM"}, viewSQLMode{})
 	require.Error(t, err)
 	data, readErr := os.ReadFile(output.Name())
 	require.NoError(t, readErr)
@@ -118,7 +118,7 @@ func TestViewUnusedDefaultDatabase(t *testing.T) {
 			_, output := mockDumpOutput(t)
 			var definition viewDefinition
 			require.NoError(t, json.Unmarshal([]byte(`{"DefaultDatabase":"deleted","lower_case_table_names":1}`), &definition))
-			require.NoError(t, showDumpView(dumpView{name: viewName{"owned", "v"}, create: "CREATE VIEW owned.v AS " + query, definition: &definition}, viewSQLMode{lowerCaseTableNames: 1}))
+			require.NoError(t, showDumpView(sinkOver(os.Stdout), dumpView{name: viewName{"owned", "v"}, create: "CREATE VIEW owned.v AS " + query, definition: &definition}, viewSQLMode{lowerCaseTableNames: 1}))
 			data, err := os.ReadFile(output.Name())
 			require.NoError(t, err)
 			require.NotContains(t, string(data), "USE `deleted`;")

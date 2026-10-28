@@ -53,7 +53,7 @@ func TestViewDefaultDatabase(t *testing.T) {
 				require.ErrorContains(t, err, "empty default database")
 				require.Nil(t, ordered)
 				require.Equal(t, before, views)
-				require.ErrorContains(t, showDumpView(view, viewSQLMode{lowerCaseTableNames: 1}), "empty default database")
+				require.ErrorContains(t, showDumpView(sinkOver(os.Stdout), view, viewSQLMode{lowerCaseTableNames: 1}), "empty default database")
 				data, err := os.ReadFile(output.Name())
 				require.NoError(t, err)
 				require.Empty(t, data, "reject before emitting session changes or view DDL")
@@ -70,7 +70,7 @@ func TestViewDefaultDatabase(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, []dumpView{decoy, source, view}, ordered)
 			}
-			require.NoError(t, showDumpView(view, viewSQLMode{lowerCaseTableNames: 1}))
+			require.NoError(t, showDumpView(sinkOver(os.Stdout), view, viewSQLMode{lowerCaseTableNames: 1}))
 			data, err := os.ReadFile(output.Name())
 			require.NoError(t, err)
 			text := string(data)
@@ -101,7 +101,7 @@ func TestViewEmptyDefaultLookupBoundary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, output := mockDumpOutput(t)
 			view := dumpView{name: viewName{"owned", "v"}, create: "CREATE VIEW owned.v AS " + tc.query, definition: &viewDefinition{}}
-			err := showDumpView(view, viewSQLMode{lowerCaseTableNames: 1})
+			err := showDumpView(sinkOver(os.Stdout), view, viewSQLMode{lowerCaseTableNames: 1})
 			text, readErr := os.ReadFile(output.Name())
 			require.NoError(t, readErr)
 			if tc.needsLookup {

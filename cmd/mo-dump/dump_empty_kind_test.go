@@ -55,7 +55,7 @@ func TestDumpDataEmptyRelKind(t *testing.T) {
 		WillReturnRows(sqlmock.NewRowsWithColumnDefinition(
 			sqlmock.NewColumn("id").OfType("INT", int64(0))).AddRow(int64(1)))
 
-	require.NoError(t, opt.dumpData(context.Background()))
+	require.NoError(t, runDumpDataOverStdout(t, &opt, context.Background()))
 	require.NoError(t, mock.ExpectationsWereMet())
 
 	data, err := os.ReadFile(out.Name())
@@ -84,7 +84,7 @@ func TestDumpDataEmptyRelKindNotSilent(t *testing.T) {
 		tablesScopePredicate+hiddenHelpersFor(false)+" and relname in (?)").WithArgs("d", "d", "whatever").
 		WillReturnRows(sqlmock.NewRows([]string{"relname", "relkind"}).AddRow("whatever", "somefuturekind"))
 
-	err := opt.dumpData(context.Background())
+	err := runDumpDataOverStdout(t, &opt, context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not supported")
 	require.NoError(t, mock.ExpectationsWereMet())

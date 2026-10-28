@@ -26,10 +26,12 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -96,8 +98,10 @@ func parseDatabases(ctx context.Context, raw string) ([]string, error) {
 
 func main() {
 	var (
-		err error
-		opt Options
+		err     error
+		opt     Options
+		sink    *dumpSink
+		sinkErr error
 	)
 	dumpStart := time.Now()
 	defer func() {
@@ -113,17 +117,35 @@ func main() {
 			}
 		}
 		if err == nil && flag.NFlag() != 0 {
-			// Restore the session sql_mode pinned at the top of the script
-			// (matrixorigin/matrixone#30587).
-			fmt.Fprintf(os.Stdout, "SET SESSION sql_mode=@MODUMP_SCRIPT_SAVED_SQL_MODE;\n\n\n")
-			fmt.Fprintf(os.Stdout, "/* MODUMP SUCCESS, COST %v */\n", time.Since(dumpStart))
-			if opt.toCsv {
-				fmt.Fprintf(os.Stdout, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n")
+			// The success notes are the last piece of output their reader can
+			// rely on; ignoring their write failure would report a completed
+			// backup from a dying pipe as a silent exit 0
+			// (matrixorigin/matrixone#30577).
+			if noteErr := writeSuccessFootnotes(os.Stdout, time.Since(dumpStart), opt.toCsv); noteErr != nil {
+				// os.Exit below skips the remaining defers, and publish already
+				// flagged the sink fully published — revoke takes the csv files
+				// back explicitly so a tail-note failure still leaves nothing
+				// of this run behind (matrixorigin/matrixone#30577).
+				if sink != nil {
+					sink.revoke()
+				}
+				fmt.Fprintf(os.Stderr, "modump error: %v\n", noteErr)
+				os.Exit(1)
 			}
 		}
 	}()
 
 	ctx := context.Background()
+	// A reader closing stdout early (a broken pipe) must surface as a write
+	// error instead of the default SIGPIPE death: dying at fd 1 would skip
+	// the deferred cleanup and leave the staged spool and csv files behind.
+	// Go escalates SIGPIPE on fd 1/2 to a kill only while the signal is
+	// unhandled, so ignoring it turns the write into EPIPE
+	// (matrixorigin/matrixone#30577).
+	signal.Ignore(syscall.SIGPIPE)
+	// The published csv mode follows the process umask; probing mutates the
+	// process umask, so it must happen before any other file creation.
+	probeFileMode()
 	flag.StringVar(&opt.username, "u", defaultUsername, "username")
 	flag.StringVar(&opt.password, "p", defaultPassword, "password")
 	flag.StringVar(&opt.host, "h", defaultHost, "hostname")
@@ -193,28 +215,73 @@ func main() {
 	}
 
 	if opt.database == "all" {
-		conn, err = opt.openDBConnection(ctx, "")
-		if err != nil {
-			return
+		if conn == nil {
+			conn, err = opt.openDBConnection(ctx, "")
+			if err != nil {
+				return
+			}
+			defer conn.Close()
 		}
-		defer conn.Close()
 
-		opt.dbs, err = getDatabases(ctx)
+		var dbs []string
+		dbs, err = getDatabases(ctx)
 		if err != nil {
 			return
 		}
+		dbs = filterUserDatabases(dbs)
+		if len(dbs) == 0 {
+			err = moerr.NewInvalidInput(ctx, "-db all found only system databases, nothing to dump")
+			return
+		}
+		opt.dbs = dbs
 	}
 
-	err = opt.dumpData(ctx)
+	// The whole dump is staged before anything reaches stdout: a failed run
+	// must not publish a truncated script whose DROP statements then destroy
+	// a target database (matrixorigin/matrixone#30577).
+	sink, sinkErr = newDumpSink()
+	if sinkErr != nil {
+		err = sinkErr
+		return
+	}
+	defer sink.discard()
+
+	err = opt.dumpData(ctx, sink)
+	if err != nil {
+		return
+	}
+	err = sink.publish()
 	if err != nil {
 		return
 	}
 }
 
-func (opt *Options) dumpData(ctx context.Context) error {
+// writeSuccessFootnotes writes the closing notes. The csv reminder goes
+// first and the success marker is the very last output a reader sees: a
+// visible MODUMP SUCCESS must guarantee that everything — script, csv
+// files and their reminder — was already delivered, so a failing note
+// never leaves a script whose final complete marker costs the operator a
+// restore that cannot find its files (matrixorigin/matrixone#30577).
+func writeSuccessFootnotes(w io.Writer, cost time.Duration, csvNote bool) error {
+	// Restore the script-level mode before the final success marker. A failed
+	// write follows the same checked-error and CSV revocation path as the notes.
+	if _, err := fmt.Fprint(w, "SET SESSION sql_mode=@MODUMP_SCRIPT_SAVED_SQL_MODE;\n\n\n"); err != nil {
+		return err
+	}
+	if csvNote {
+		if _, err := fmt.Fprintf(w, "/* !!!MUST KEEP FILE IN CURRENT DIRECTORY, OR YOU SHOULD CHANGE THE PATH IN LOAD DATA STMT!!! */ \n"); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(w, "/* MODUMP SUCCESS, COST %v */\n", cost)
+	return err
+}
+
+func (opt *Options) dumpData(ctx context.Context, out *dumpSink) error {
 	var (
 		createDb    string
 		createTable []string
+		stateSQL    []string
 		views       []dumpView
 		err         error
 	)
@@ -228,7 +295,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	}
 
 	// add foreign_key_checks variable to dump file
-	fmt.Printf("SET foreign_key_checks = 0;\n\n")
+	out.printf("SET foreign_key_checks = 0;\n\n")
 
 	// String literals in this script were quoted assuming backslash escapes.
 	// Pin the restore session's sql_mode correspondingly even when it runs
@@ -238,7 +305,7 @@ func (opt *Options) dumpData(ctx context.Context) error {
 	// empty token, whatever its position.
 	// Keep this variable distinct from the per-view saved mode: SQL user
 	// variable names are case-insensitive.
-	fmt.Printf("SET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n")
+	out.printf("SET @MODUMP_SCRIPT_SAVED_SQL_MODE=@@SESSION.sql_mode;\nSET SESSION sql_mode=(SELECT TRIM(BOTH ',' FROM REPLACE(CONCAT(',',@@session.sql_mode,','),',NO_BACKSLASH_ESCAPES,',',')));\n\n\n")
 
 	for _, db := range opt.dbs {
 		var dbStruct Db
@@ -260,9 +327,9 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 			}
-			fmt.Printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
-			fmt.Println(createDb, ";")
-			fmt.Printf("USE %s;\n\n\n", quoteIdentifier(db))
+			out.printf("DROP DATABASE IF EXISTS %s;\n", quoteIdentifier(db))
+			out.printf("%s ;\n", createDb)
+			out.printf("USE %s;\n\n\n", quoteIdentifier(db))
 		}
 
 		if dbStruct.DBType == catalog.SystemDBTypeSubscription {
@@ -277,16 +344,11 @@ func (opt *Options) dumpData(ctx context.Context) error {
 			}
 		}
 		createTable = make([]string, len(opt.tables))
+		stateSQL = make([]string, len(opt.tables))
 		for i, tbl := range opt.tables {
-			var createTableSql string
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel, emptyRelKind:
-				createTableSql, err = getCreateTable(db, tbl.Name)
-				if err != nil {
-					return err
-				}
-			case catalog.SystemExternalRel:
-				createTableSql, err = getCreateTable(db, tbl.Name)
+			case catalog.SystemOrdinaryRel, catalog.SystemExternalRel, emptyRelKind:
+				createTable[i], err = getCreateTable(db, tbl.Name)
 				if err != nil {
 					return err
 				}
@@ -296,13 +358,29 @@ func (opt *Options) dumpData(ctx context.Context) error {
 					return err
 				}
 				views = append(views, view)
-				createTableSql = view.create
+				createTable[i] = view.create
+			case catalog.SystemSequenceRel:
+				// A sequence's current definition and allocation state live in
+				// its backing row, not in SHOW CREATE TABLE
+				// (matrixorigin/matrixone#30577). isSys scopes the catalog
+				// metadata query to the sys account, where mo_catalog is not
+				// tenant-isolated; a state-carrying dump exports the allocation
+				// replay, while -no-data exports the legal definition only.
+				var state string
+				createTable[i], state, err = getCreateSequence(ctx, db, tbl.Name, opt.sysAccount, !opt.noData)
+				if err != nil {
+					return err
+				}
+				stateSQL[i] = state
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
 			}
-			createTable[i] = createTableSql
 		}
+		// Sequences must be created before the tables whose DEFAULT nextval
+		// references them; views are collected and emitted after everything
+		// they can select from.
+		reorderDumpObjects(createTable, opt.tables, stateSQL)
 		bufPool := &sync.Pool{
 			New: func() any {
 				return &bytes.Buffer{}
@@ -311,24 +389,44 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		for i, create := range createTable {
 			tbl := opt.tables[i]
 			switch tbl.Kind {
-			case catalog.SystemOrdinaryRel, emptyRelKind:
-				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
-				showCreateTable(create, false)
+			case catalog.SystemSequenceRel:
+				out.printf("DROP SEQUENCE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, false)
 				if !opt.noData {
-					err = genOutput(db, tbl.Name, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
+					// Replay the allocation state so a restored sequence does
+					// not hand out values the source already consumed.
+					out.printf("%s;\n\n\n", stateSQL[i])
+				} else {
+					// -no-data exports definitions only: the restored sequence
+					// starts handing out values from its START value.
+					out.printf("\n\n")
+				}
+			case catalog.SystemOrdinaryRel, emptyRelKind:
+				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, false)
+				if !opt.noData {
+					err = genOutput(db, tbl.Name, out, bufPool, opt.netBufferLength, opt.localInfile, &opt.csvConf, opt.where)
 					if err != nil {
 						return err
 					}
 				}
 			case catalog.SystemExternalRel:
-				fmt.Printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
-				showCreateTable(create, true)
+				// issue-30559: a regular mysql client executes /*! ... */ content on
+				// restore, and a table name containing */ would terminate the
+				// block early — the external-table section emits no marker
+				// comment at all, and the CREATE TABLE text is the same SQL the
+				// server accepted.
+				out.printf("DROP TABLE IF EXISTS %s;\n", quoteIdentifier(tbl.Name))
+				showCreateTable(out, create, true)
 			case catalog.SystemViewRel:
 				// The definition and its creation mode were captured together above.
 				continue
 			default:
 				err = moerr.NewNotSupported(ctx, fmt.Sprintf("table: %s table type: %s", tbl.Name, tbl.Kind))
 				return err
+			}
+			if e := out.Err(); e != nil {
+				return e
 			}
 		}
 	}
@@ -344,13 +442,58 @@ func (opt *Options) dumpData(ctx context.Context) error {
 		return err
 	}
 	for _, view := range orderedViews {
-		if err := showDumpView(view, mode); err != nil {
+		if err := showDumpView(out, view, mode); err != nil {
 			return err
+		}
+		if e := out.Err(); e != nil {
+			return e
 		}
 	}
 	// reset foreign_key_checks variable to dump file
-	fmt.Println("SET foreign_key_checks = 1;")
-	return err
+	if e := out.Err(); e != nil {
+		return e
+	}
+	out.printf("SET foreign_key_checks = 1;\n")
+	return out.Err()
+}
+
+// reorderDumpObjects stably partitions one database's objects for restore:
+// sequences first — a table DEFAULT nextval requires the sequence to exist at
+// create time — while every other entry keeps its registry order; collected
+// views produce no per-object output in this loop and are emitted globally
+// after all selected databases. The parallel slices are reordered in place.
+func reorderDumpObjects(createTable []string, tables Tables, stateSQL []string) {
+	n := len(tables)
+	counts := [2]int{}
+	ranks := make([]int, n)
+	for i, tbl := range tables {
+		r := 1
+		if tbl.Kind == catalog.SystemSequenceRel {
+			r = 0
+		}
+		ranks[i] = r
+		counts[r]++
+	}
+	starts := [2]int{}
+	// starts[r] is the write cursor for partition r: sequences write from 0,
+	// every other entry from counts[0]. next walks them in one stable pass.
+	for r := 1; r < 2; r++ {
+		starts[r] = starts[r-1] + counts[r-1]
+	}
+	next := starts
+	newCreate := make([]string, n)
+	newState := make([]string, n)
+	newTables := make(Tables, n)
+	for i := 0; i < n; i++ {
+		j := next[ranks[i]]
+		next[ranks[i]]++
+		newCreate[j] = createTable[i]
+		newState[j] = stateSQL[i]
+		newTables[j] = tables[i]
+	}
+	copy(createTable, newCreate)
+	copy(stateSQL, newState)
+	copy(tables, newTables)
 }
 
 func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql.DB, error) {
@@ -379,7 +522,7 @@ func (opt *Options) openDBConnection(ctx context.Context, database string) (*sql
 	return conn, nil
 }
 
-func showCreateTable(createSql string, withNextLine bool) {
+func showCreateTable(out *dumpSink, createSql string, withNextLine bool) {
 	var suffix string
 	if !strings.HasSuffix(createSql, ";") {
 		suffix = ";"
@@ -387,7 +530,7 @@ func showCreateTable(createSql string, withNextLine bool) {
 	if withNextLine {
 		suffix += "\n\n"
 	}
-	fmt.Printf("%s%s\n", createSql, suffix)
+	out.printf("%s%s\n", createSql, suffix)
 }
 
 func getDatabaseType(ctx context.Context, db string, isSys bool) (Db, error) {
@@ -559,6 +702,36 @@ func getTables(ctx context.Context, db string, tables Tables, opt Options) (Tabl
 	return tables, nil
 }
 
+// systemDatabases are the databases the MatrixOne platform itself creates
+// in every account. -db all is a whole user backup, and these relations are
+// engine internals: mo_catalog alone contains every relkind, and sending
+// them through the ordinary-table dispatcher fails a clean tenant's export
+// (matrixorigin/matrixone#30601). The list mirrors catalog.SystemDatabases
+// from the MatrixOne server.
+var systemDatabases = map[string]struct{}{
+	"information_schema": {},
+	"mo_catalog":         {},
+	"mo_debug":           {},
+	"mo_task":            {},
+	"mysql":              {},
+	"system":             {},
+	"system_metrics":     {},
+}
+
+// filterUserDatabases removes built-in system databases from a SHOW
+// DATABASES result. Matching is exact: a user database whose name merely
+// starts like a system name is kept.
+func filterUserDatabases(dbs []string) []string {
+	kept := make([]string, 0, len(dbs))
+	for _, db := range dbs {
+		if _, isSystem := systemDatabases[db]; isSystem {
+			continue
+		}
+		kept = append(kept, db)
+	}
+	return kept
+}
+
 func getCreateDB(db string) (string, error) {
 	r := conn.QueryRow("show create database " + quoteIdentifier(db))
 	var create string
@@ -614,7 +787,7 @@ func getCreateTable(db, tbl string) (string, error) {
 	return create, nil
 }
 
-func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int) error {
+func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sync.Pool, netBufferLength int, out *dumpSink) error {
 	var err error
 	buf := bufPool.Get().(*bytes.Buffer)
 	defer func() {
@@ -685,7 +858,7 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		}
 		if buf.Len() > preLen {
 			buf.WriteString(";\n")
-			_, err = buf.WriteTo(os.Stdout)
+			_, err = buf.WriteTo(out)
 			if err != nil {
 				return err
 			}
@@ -700,47 +873,49 @@ func showInsert(r *sql.Rows, args []any, cols []*Column, tbl string, bufPool *sy
 		}
 		break
 	}
-	fmt.Printf("\n\n\n")
-	return nil
+	out.printf("\n\n\n")
+	return out.Err()
 }
 
-func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig) error {
-	fname := fmt.Sprintf("%s_%s.%s", db, tbl, "csv")
-	f, err := os.Create(fname)
+func showLoad(r *sql.Rows, rowResults []any, cols []*Column, db string, tbl string, localInfile bool, csvConf *csvConfig, out *dumpSink) error {
+	// The csv data file is staged under a name unique to this run and is
+	// renamed to its published name only after the whole dump succeeded, so
+	// a failed run cannot replace the files of a previous dump.
+	f, publishedName, err := out.startCsv(db, tbl)
 	if err != nil {
 		return err
 	}
-
 	err = toCsv(r, f, rowResults, cols, csvConf)
+	if err == nil {
+		// A failed final close must fail the dump: a silently truncated csv
+		// restores as corrupted data (same class as
+		// matrixorigin/matrixone#30628).
+		err = f.Close()
+	} else {
+		_ = f.Close()
+	}
 	if err != nil {
-		f.Close()
+		out.abortCsv(f)
 		return err
 	}
-	// A failed final flush/close must fail the dump: silently truncated CSV
-	// restores as corrupted data (matrixorigin/matrixone#30628).
-	if cerr := f.Close(); cerr != nil {
-		return fmt.Errorf("close csv file %s: %w", fname, cerr)
-	}
-	// LOCAL paths are relative to the importing client's working directory,
-	// so the CSV and script can be moved together (matrixorigin/matrixone#30481).
-	// Non-LOCAL paths are resolved by the server; retain the absolute path to
-	// the exported file rather than depending on the server's working directory.
-	path := fname
+	// LOCAL paths follow the importing client's working directory; non-LOCAL
+	// paths must be absolute for the server. Always reference the reserved final
+	// name, not the staged file, and escape using the script's pinned SQL mode.
+	path := publishedName
 	if !localInfile {
-		path, err = filepath.Abs(fname)
+		path, err = filepath.Abs(path)
 		if err != nil {
 			return err
 		}
 	}
-	// Escape both paths and delimiters as SQL literals (matrixorigin/matrixone#30590).
-	path = sqlStringLiteral(path)
-	delim := sqlStringLiteral(string(csvConf.fieldDelimiter))
+	quotedPath := sqlStringLiteral(path)
+	quotedDelim := sqlStringLiteral(string(csvConf.fieldDelimiter))
 	if localInfile {
-		fmt.Printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", path, quoteIdentifier(tbl), delim)
+		out.printf("LOAD DATA LOCAL INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	} else {
-		fmt.Printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", path, quoteIdentifier(tbl), delim)
+		out.printf("LOAD DATA INFILE %s INTO TABLE %s FIELDS TERMINATED BY %s ENCLOSED BY '\"' LINES TERMINATED BY '\\n' PARALLEL 'FALSE';\n", quotedPath, quoteIdentifier(tbl), quotedDelim)
 	}
-	return nil
+	return out.Err()
 }
 
 // sqlStringLiteral renders s as a backslash-escaped SQL string literal. The
@@ -871,7 +1046,7 @@ func csvFieldNeedsQuote(field string, delim rune) bool {
 	return strings.ContainsRune(field, delim) || strings.ContainsAny(field, "\"\r\n")
 }
 
-func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
+func genOutput(db string, tbl string, out *dumpSink, bufPool *sync.Pool, netBufferLength int, localInfile bool, csvConf *csvConfig, condition string) (err error) {
 	querySql := "select * from " + quoteIdentifier(db) + "." + quoteIdentifier(tbl)
 	if condition != "" {
 		querySql += " where " + condition
@@ -930,9 +1105,9 @@ func genOutput(db string, tbl string, bufPool *sync.Pool, netBufferLength int, l
 		rowResults = append(rowResults, &v)
 	}
 	if !csvConf.enable {
-		return showInsert(r, rowResults, cols, tbl, bufPool, netBufferLength)
+		return showInsert(r, rowResults, cols, tbl, bufPool, netBufferLength, out)
 	}
-	return showLoad(r, rowResults, cols, db, tbl, localInfile, csvConf)
+	return showLoad(r, rowResults, cols, db, tbl, localInfile, csvConf, out)
 }
 
 func convertValue(v any, typ string) string {

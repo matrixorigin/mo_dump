@@ -66,13 +66,13 @@ func viewParserMode(mode string) string {
 	return strings.Join(flags, ",")
 }
 
-func showDumpView(view dumpView, mode viewSQLMode) error {
+func showDumpView(out *dumpSink, view dumpView, mode viewSQLMode) error {
 	analysis, err := analyzeDumpView(context.Background(), view, mode)
 	if err != nil {
 		return err
 	}
 	if view.definition != nil {
-		fmt.Println("SET @modump_saved_sql_mode = @@SESSION.sql_mode;")
+		out.printf("SET @modump_saved_sql_mode = @@SESSION.sql_mode;\n")
 		// Remove only parser flags from the target; preserve its non-parser policy.
 		// All literals in this expression are ASCII without backslash escapes.
 		target := "CONCAT(',', @modump_saved_sql_mode, ',')"
@@ -80,7 +80,7 @@ func showDumpView(view dumpView, mode viewSQLMode) error {
 			target = fmt.Sprintf("REPLACE(%s, ',%s,', ',')", target, flag)
 		}
 		flags := viewParserMode(view.definition.parserSQLMode())
-		fmt.Printf("SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH ',' FROM %s), ''), NULLIF(X'%x', ''));\n", target, flags)
+		out.printf("SET SESSION sql_mode = CONCAT_WS(',', NULLIF(TRIM(BOTH ',' FROM %s), ''), NULLIF(X'%x', ''));\n", target, flags)
 	}
 	// An unused saved default is not a prerequisite. Select the owner even
 	// for legacy empty defaults, so unqualified CREATE targets remain stable.
@@ -89,12 +89,12 @@ func showDumpView(view dumpView, mode viewSQLMode) error {
 		database = view.defaultDatabase()
 	}
 	if database != "" {
-		fmt.Printf("USE %s;\n\n", quoteIdentifier(database))
+		out.printf("USE %s;\n\n", quoteIdentifier(database))
 	}
-	fmt.Printf("DROP VIEW IF EXISTS %s.%s;\n", quoteIdentifier(view.name.database), quoteIdentifier(view.name.name))
-	showCreateTable(analysis.create, true)
+	out.printf("DROP VIEW IF EXISTS %s.%s;\n", quoteIdentifier(view.name.database), quoteIdentifier(view.name.name))
+	showCreateTable(out, analysis.create, true)
 	if view.definition != nil {
-		fmt.Println("SET SESSION sql_mode = @modump_saved_sql_mode;")
+		out.printf("SET SESSION sql_mode = @modump_saved_sql_mode;\n")
 	}
 	return nil
 }
